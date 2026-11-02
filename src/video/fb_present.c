@@ -149,6 +149,11 @@ static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
 {
     switch (m) {
     case WM_CLOSE:
+        /* The title keeps running without the window, and the next flip
+         * would open it again: closing it ends the game. */
+        fprintf(stderr, "  [FBWIN] window closed, exiting\n");
+        fflush(stderr);
+        ExitProcess(0);
     case WM_DESTROY:
         InterlockedExchange(&s_fb_running, 0);
         return 0;
