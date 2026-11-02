@@ -196,10 +196,10 @@ static int surface_write_refused(uint32_t base, uint32_t bytes, const char *what
  * asks for a flip, and waits for it in a loop that makes no kernel calls
  * and burns no dispatch, which reads as a hang with no cause.
  *
- * ponytail: the flip completes the moment it is asked for, because there is
- * no scanout to be in the middle of. That makes every frame land instantly
- * and a title that paces itself on the flip runs as fast as it can draw.
- * Pacing wants the vblank clock in the kernel, not a sleep in here. */
+ * There is no scanout to be in the middle of, so the flip completes on the
+ * next tick of flip_pace (RECOMP_FPS_LIMIT, 60 Hz by default); with the limit
+ * off it completes at once and a title that paces itself on the flip runs as
+ * fast as it can draw. */
 #define NV097_SET_FLIP_READ               0x0120
 #define NV097_SET_FLIP_WRITE              0x0124
 #define NV097_SET_FLIP_MODULO             0x0128
@@ -3250,6 +3250,56 @@ static void raster_batch(void)
     }
 }
 
+/* RECOMP_FPS_LIMIT=<hz> (default 60, 0 = off): the flip stall waits for the
+ * next 1/hz tick, standing in for the vblank a real scanout would wait for.
+ * Without it a flip completes at once, and a title that paces itself on the
+ * flip -- menus, loading screens -- runs at whatever rate it can draw, which
+ * reaches 1000 fps and breaks menu input timing. A late frame does not bank
+ * time: the clock restarts from now rather than bursting to catch up. */
+static void flip_pace(void)
+{
+#if defined(_WIN32)
+    static int hz = -1;
+    static LARGE_INTEGER freq, next;
+    static HANDLE timer;
+    LARGE_INTEGER now;
+    LONGLONG period;
+
+    if (hz < 0) {
+        const char *e = getenv("RECOMP_FPS_LIMIT");
+        hz = e ? atoi(e) : 60;
+        QueryPerformanceFrequency(&freq);
+        /* 0x2 = CREATE_WAITABLE_TIMER_HIGH_RESOLUTION (Windows 10 1803+);
+         * an older system gets a plain timer and the spin below. */
+        timer = CreateWaitableTimerExW(NULL, NULL, 0x2, TIMER_ALL_ACCESS);
+        if (!timer)
+            timer = CreateWaitableTimerExW(NULL, NULL, 0, TIMER_ALL_ACCESS);
+    }
+    if (hz <= 0)
+        return;
+    period = freq.QuadPart / hz;
+    QueryPerformanceCounter(&now);
+    if (next.QuadPart == 0 || now.QuadPart > next.QuadPart + period) {
+        next.QuadPart = now.QuadPart + period;
+        return;
+    }
+    if (timer) {
+        LONGLONG left = next.QuadPart - now.QuadPart - freq.QuadPart / 1000;
+        if (left > 0) {
+            LARGE_INTEGER due;
+            due.QuadPart = -(left * 10000000 / freq.QuadPart);   /* 100 ns, relative */
+            if (SetWaitableTimer(timer, &due, 0, NULL, NULL, FALSE))
+                WaitForSingleObject(timer, INFINITE);
+        }
+    }
+    do {
+        YieldProcessor();
+        QueryPerformanceCounter(&now);
+    } while (now.QuadPart < next.QuadPart);
+    next.QuadPart += period;
+#endif
+}
+
 /* What a batch actually contains. Before anything can be rasterised, the
  * question is what space attribute 0 arrives in: a title running a vertex
  * program hands over object-space positions that mean nothing without running
@@ -4049,7 +4099,9 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
             fprintf(stderr, "[FTRACE] FLIP_STALL presenting %08X (color now %08X)%c",
                     s_gpu.drawn_offset, s_gpu.color_offset, 10);
         /* The stall ends when the buffer being read is the one just finished.
-         * There is no scanout here to wait for, so that is now. */
+         * There is no scanout here to wait for, so that is the next pacing
+         * tick (flip_pace). */
+        flip_pace();
         s_gpu.flip_read = s_gpu.flip_write;
         /* And this is a completed swap, which is what a title's own swap
          * counter counts -- see xbox_Nv2aFrameCounterFlip. */
