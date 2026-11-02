@@ -1898,7 +1898,10 @@ class Lifter:
             r = ops[1].reg
             if r in ("al", "bl", "cl", "dl", "ah", "bh", "ch", "dh"):
                 src = f"SX8({src})"
-            elif r in ("ax", "bx", "cx", "dx", "si", "di"):
+            # bp and sp too: without them `movsx ebp, bp` read as a plain
+            # 16-bit value, a zero-extension, and Bink's IDCT turned every
+            # negative row-6 coefficient positive (test_movsx_regs.py).
+            elif r in ("ax", "bx", "cx", "dx", "si", "di", "bp", "sp"):
                 src = f"SX16({src})"
         return [_fmt_operand_write(ops[0], src)]
 
