@@ -305,8 +305,12 @@ static uint8_t synthetic_buttons(void)
  * how long a screen takes to appear depends on how much the software
  * rasteriser has to draw.
  *
+ * A line "replay" plays back the RECOMP_PAD_RECORD recording (see below).
+ *
  * Like RECOMP_PAD_PRESS this is a bring-up tool, off unless set. */
 #define PAD_SCRIPT_MAX 256
+
+static void pad_replay_start(void);     /* the recorder, below */
 
 typedef struct {
     unsigned long at_ms, hold_ms;
@@ -477,7 +481,10 @@ static void pad_live_poll(unsigned long t)
     while ((c = fgetc(f)) != EOF) {
         consumed++;
         if (c == '\n' || c == '\r') {
-            if (npending) {
+            if (npending == 6 && same_word(pending, "replay", 6)) {
+                pad_replay_start();
+                npending = 0;
+            } else if (npending) {
                 char line[560];
                 /* Several lines in one read go one after another, with a
                  * 200 ms release between: a title polling its pad a few times
@@ -556,6 +563,185 @@ static void pad_script_apply(int pad, uint8_t *out)
     }
 }
 
+/* Record what a player does on pad 1 and play it back, to repeat a route
+ * through a level without a script written by hand.
+ *
+ * RECOMP_PAD_RECORD=<file> names the recording. In the window, F9 starts and
+ * stops recording into it, F10 plays it back from that moment; a line
+ * "replay" appended to RECOMP_PAD_LIVE does the same as F10.
+ * RECOMP_PAD_RECORD_FROM_START=1 records from the first report, =play plays
+ * from there: a whole run from the title screen on, menus included.
+ *
+ * Time is kept in flips (xbox_Nv2aFlipCount), not milliseconds: a recording
+ * started at the same place replays the same number of frames per press
+ * however fast those frames come. Each line is "<flips since start> <bytes 2..19
+ * of the report in hex>", written only when the report changes. Playback
+ * overlays the recorded report on the live one -- buttons OR'ed, a stick the
+ * recording deflects replaces the live one -- so a pad or the keyboard can
+ * still take over, and the last line (everything released, F9 pressed with
+ * nothing held) ends it. */
+#define PAD_REC_BYTES 18                 /* report bytes 2..19 */
+
+typedef struct {
+    uint32_t flip;
+    uint8_t  r[PAD_REC_BYTES];
+} PadRecStep;
+
+extern uint32_t xbox_Nv2aFlipCount(void);   /* src/kernel/xbox_memory_layout.c */
+extern int xbox_FramebufferKeyDown(int vk); /* src/video/fb_present.c */
+
+static FILE       *s_rec;
+static uint32_t    s_rec_f0;
+static uint8_t     s_rec_last[PAD_REC_BYTES];
+static PadRecStep *s_play;
+static int         s_play_len, s_play_on;
+static uint32_t    s_play_f0;
+
+static void pad_replay_start(void)
+{
+    const char *path = getenv("RECOMP_PAD_RECORD");
+    FILE *f;
+    char line[128];
+    int cap = 0;
+
+    if (s_rec || !path || !*path)
+        return;
+    f = fopen(path, "rb");
+    if (!f) {
+        fprintf(stderr, "  PAD: no recording at %s\n", path);
+        fflush(stderr);
+        return;
+    }
+    s_play_len = 0;
+    while (fgets(line, sizeof line, f)) {
+        PadRecStep st;
+        char *p = line, *end;
+        int i;
+        if (*p == '#')
+            continue;
+        st.flip = (uint32_t)strtoul(p, &end, 10);
+        if (end == p)
+            continue;
+        p = end;
+        while (*p == ' ')
+            p++;
+        for (i = 0; i < PAD_REC_BYTES; i++) {
+            char hex[3] = { p[0], p[1], 0 };
+            if (!isxdigit((unsigned char)p[0]) || !isxdigit((unsigned char)p[1]))
+                break;
+            st.r[i] = (uint8_t)strtoul(hex, NULL, 16);
+            p += 2;
+        }
+        if (i != PAD_REC_BYTES)
+            continue;
+        if (s_play_len == cap) {
+            PadRecStep *n;
+            cap = cap ? cap * 2 : 256;
+            n = (PadRecStep *)realloc(s_play, (size_t)cap * sizeof *n);
+            if (!n)
+                break;
+            s_play = n;
+        }
+        s_play[s_play_len++] = st;
+    }
+    fclose(f);
+    s_play_f0 = xbox_Nv2aFlipCount();
+    s_play_on = s_play_len > 0;
+    fprintf(stderr, "  PAD: playing %d step(s) from %s, %u flip(s) long\n",
+            s_play_len, path, s_play_len ? s_play[s_play_len - 1].flip : 0u);
+    fflush(stderr);
+}
+
+static void pad_record_toggle(void)
+{
+    const char *path = getenv("RECOMP_PAD_RECORD");
+
+    if (s_rec) {
+        fprintf(s_rec, "%u", xbox_Nv2aFlipCount() - s_rec_f0);
+        {
+            int i;
+            fputc(' ', s_rec);
+            for (i = 0; i < PAD_REC_BYTES; i++)
+                fputs("00", s_rec);
+            fputc('\n', s_rec);
+        }
+        fclose(s_rec);
+        s_rec = NULL;
+        fprintf(stderr, "  PAD: recording stopped (%s)\n", path);
+        fflush(stderr);
+        return;
+    }
+    if (!path || !*path || s_play_on)
+        return;
+    s_rec = fopen(path, "wb");
+    if (!s_rec) {
+        fprintf(stderr, "  PAD: cannot write %s\n", path);
+        fflush(stderr);
+        return;
+    }
+    s_rec_f0 = xbox_Nv2aFlipCount();
+    memset(s_rec_last, 0xFF, sizeof s_rec_last);   /* the first report is a change */
+    fprintf(s_rec, "# pad 1, <flips> <report bytes 2..19>; RECOMP_PAD_RECORD, F10 replays\n");
+    fflush(s_rec);
+    fprintf(stderr, "  PAD: recording into %s (F9 stops)\n", path);
+    fflush(stderr);
+}
+
+static void pad_record_apply(uint8_t *out)
+{
+    static int f9, f10, started;
+    int k9 = xbox_FramebufferKeyDown(0x78), k10 = xbox_FramebufferKeyDown(0x79);
+
+    /* RECOMP_PAD_RECORD_FROM_START=1: record from the first report on, as
+     * if F9 were pressed then; =play plays the recording from there. */
+    if (!started) {
+        const char *e = getenv("RECOMP_PAD_RECORD_FROM_START");
+        started = 1;
+        if (e && strcmp(e, "play") == 0)
+            pad_replay_start();
+        else if (e && *e && strcmp(e, "0") != 0)
+            pad_record_toggle();
+    }
+
+    if (k9 && !f9)
+        pad_record_toggle();
+    if (k10 && !f10)
+        pad_replay_start();
+    f9 = k9;
+    f10 = k10;
+
+    if (s_play_on) {
+        uint32_t t = xbox_Nv2aFlipCount() - s_play_f0;
+        int i, j = -1;
+        for (i = 0; i < s_play_len && s_play[i].flip <= t; i++)
+            j = i;
+        if (j >= 0) {
+            const uint8_t *r = s_play[j].r;
+            for (i = 0; i < 10; i++)              /* digital, analog buttons */
+                out[2 + i] |= r[i];
+            for (i = 0; i < 4; i++) {             /* sticks */
+                int16_t v;
+                memcpy(&v, &r[10 + 2 * i], 2);
+                if (v)
+                    memcpy(&out[12 + 2 * i], &v, 2);
+            }
+        }
+        if (j == s_play_len - 1) {
+            s_play_on = 0;
+            fprintf(stderr, "  PAD: playback done\n");
+            fflush(stderr);
+        }
+    } else if (s_rec && memcmp(s_rec_last, out + 2, PAD_REC_BYTES) != 0) {
+        int i;
+        memcpy(s_rec_last, out + 2, PAD_REC_BYTES);
+        fprintf(s_rec, "%u ", xbox_Nv2aFlipCount() - s_rec_f0);
+        for (i = 0; i < PAD_REC_BYTES; i++)
+            fprintf(s_rec, "%02X", out[2 + i]);
+        fputc('\n', s_rec);
+        fflush(s_rec);
+    }
+}
+
 int usb_gamepad_report(int pad, uint8_t *out, int max)
 {
     XBOX_INPUT_STATE state;
@@ -611,6 +797,8 @@ int usb_gamepad_report(int pad, uint8_t *out, int max)
     if (xbox_InputGetState((DWORD)pad, &state) != 0) {
         out[2] = synth;
         pad_script_apply(pad, out);
+        if (pad == 0)
+            pad_record_apply(out);
         return 20;
     }
 
@@ -628,5 +816,7 @@ int usb_gamepad_report(int pad, uint8_t *out, int max)
     out[18] = (uint8_t)(g->sThumbRY & 0xFF);
     out[19] = (uint8_t)((g->sThumbRY >> 8) & 0xFF);
     pad_script_apply(pad, out);
+    if (pad == 0)
+        pad_record_apply(out);
     return 20;
 }

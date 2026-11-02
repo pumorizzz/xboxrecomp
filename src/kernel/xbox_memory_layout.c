@@ -1173,11 +1173,19 @@ int xbox_Nv2aFrameCounter(uint32_t device_ptr_va, uint32_t counter_off)
  * stalling, blocky video rather than a clock running away.
  */
 static DWORD g_frame_counter_flip_ms;
+static volatile LONG g_flip_count;
+
+/* Swaps so far: the clock the pad recorder (usb_gamepad.c) keeps time by. */
+uint32_t xbox_Nv2aFlipCount(void)
+{
+    return (uint32_t)g_flip_count;
+}
 
 void xbox_Nv2aFrameCounterFlip(void)
 {
     int i;
 
+    InterlockedIncrement(&g_flip_count);
     g_frame_counter_flip_ms = GetTickCount();
     if (!g_frame_counter_flip_ms)
         g_frame_counter_flip_ms = 1;          /* 0 means "never" */

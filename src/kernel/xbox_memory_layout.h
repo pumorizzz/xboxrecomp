@@ -178,6 +178,8 @@ int xbox_Nv2aFrameCounter(uint32_t device_ptr_va, uint32_t counter_off);
  * pushbuffer executor on FLIP_STALL; while these arrive the 60 Hz fallback
  * stands down, so the count follows what was actually drawn. */
 void xbox_Nv2aFrameCounterFlip(void);
+/* How many times xbox_Nv2aFrameCounterFlip ran: swaps since start. */
+uint32_t xbox_Nv2aFlipCount(void);
 /* A word of the NV2A register file (offset from the register base); NULL until
  * the aperture is mapped. */
 volatile uint32_t *xbox_Nv2aRegPtr(uint32_t offset);
