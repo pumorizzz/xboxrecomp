@@ -1,5 +1,14 @@
 # xboxrecomp
 
+> **Fork.** This is [pumorizzz/xboxrecomp](https://github.com/pumorizzz/xboxrecomp),
+> maintained by [pumorizzz](https://github.com/pumorizzz) and forked from
+> [sp00nznet/xboxrecomp](https://github.com/sp00nznet/xboxrecomp), the
+> original toolkit by [sp00nznet](https://github.com/sp00nznet). The fork's
+> work is on the `gpu-rastr` branch: the D3D11 render back end for the NV2A
+> executor (`RECOMP_GPU_RASTER`), presenting from a swap chain, the 60 fps
+> flip cap (`RECOMP_FPS_LIMIT`) and a lifter fix (`movsx` from `bp`/`sp`),
+> made for [falloutbos-recomp](https://github.com/pumorizzz/falloutbos-recomp).
+
 ```
  #   #  ####    ###   #   #         #####   ###    ###   #       ###
  #   #  #   #  #   #  #   #           #    #   #  #   #  #      #
