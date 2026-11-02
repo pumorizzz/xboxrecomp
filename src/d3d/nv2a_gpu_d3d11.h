@@ -6,14 +6,18 @@
  * on the CPU, and hands this back end triangles in surface pixels; this
  * rasterises them on the GPU -- depth and stencil, blending, the register
  * combiners in one ubershader -- and writes the colour surfaces back into
- * guest RAM at every point the executor syncs, so the presenter, the frame
- * dumps and render-to-texture keep reading guest RAM as before.
+ * guest RAM when they are read there (the flip's present, the frame dumps,
+ * a texture decoded from guest RAM); a texture that is a live render
+ * target is sampled from the target on the GPU.
  *
  * RECOMP_GPU_RASTER: unset, empty or 0 -- off, nothing is registered;
  *   1       -- a hardware adapter (WARP if none can be created);
  *   warp    -- the WARP software adapter;
  *   compare -- the software path draws as usual and the GPU draws alongside
  *              without writing back; each flip prints how far they differ.
+ * RECOMP_GPU_RASTER_SYNC=all -- write back at every executor sync (for a
+ *   title whose CPU reads what the GPU drew); RECOMP_GPU_RASTER_RTTEX=0 --
+ *   read every texture through guest RAM.
  * Needs RECOMP_PB_EXEC=1 to have any effect.
  */
 #ifndef NV2A_GPU_D3D11_H

@@ -215,14 +215,19 @@ reads, so a back end can shade exactly as the CPU rasteriser does:
 
 The surface carries its clip origin (`clip_x`, `clip_y`) as well as its size.
 
-Three optional members let a back end draw somewhere other than guest RAM:
+Four optional members let a back end draw somewhere other than guest RAM:
 
 - `sync(reason)`: make guest RAM hold what was drawn. Called at every method
   that drains the executor's pipeline (surfaces, flips — so before a flip is
   presented — reports, semaphores, clears, other subchannels), at the end of
   every pushbuffer scan before `DMA_GET` is published, and before the
-  executor's own surface dumps. `nv2a_backend_surface_ok` says whether a range
-  may be written.
+  executor's own surface dumps (`NV2A_BACKEND_SYNC_READ`).
+  `nv2a_backend_surface_ok` says whether a range may be written. A back end
+  may treat the method and scan-end reasons as ordering points only and write
+  back lazily, as the toolkit's does.
+- `sync_surface(va, bytes)`: at `FLIP_STALL`, just before the presenter reads
+  guest RAM, the surface it presents. Without it the executor calls
+  `sync(NV2A_BACKEND_SYNC_PRESENT)`.
 - `report()`: the visibility-test pixel count since the previous call, added
   to what `GET_REPORT` writes; `CLEAR_REPORT_VALUE` discards it.
 - `shadow`: the executor keeps rasterising in software as well, into guest RAM,
@@ -250,10 +255,43 @@ of the code here:
   projected screen positions and draw with the rasteriser's culling off.
 
 The toolkit's own back end is `src/d3d/nv2a_gpu_d3d11.c` (`RECOMP_GPU_RASTER`):
-it rasterises on the GPU, runs the combiners in one ubershader, keeps depth and
-stencil on the GPU and writes the colour surfaces back from `sync`. A game
-project registers it by calling `nv2a_gpu_d3d11_install()` before the title
-starts.
+it rasterises on the GPU, runs the combiners in one ubershader and keeps depth
+and stencil on the GPU. A game project registers it by calling
+`nv2a_gpu_d3d11_install()` before the title starts.
+
+Its colour surfaces go back to guest RAM only when something reads them there:
+the presented surface at a flip, every target before the executor's dumps, a
+target a texture has to be decoded from, and a target being dropped. A texture
+that is a live render target's pixels (linear 32-bit, the target's pitch) is
+sampled from the target on the GPU, with no writeback and no CPU decode — the
+same idea as xemu binding a surface as a texture and Dolphin's EFB copies to
+texture. Fallout: Brotherhood of Steel draws its scene into one 1280x480
+surface and filters it into the presented one that way. In Carbon on an
+RTX 3080 Ti that took the back end from 46 to 66-67 fps (software path
+17.7-18.6), each step measured on its own:
+
+| Step | fps | writebacks / 10 s | readback stall / 10 s |
+|---|---|---|---|
+| write back at every sync, every texture through guest RAM | 46 | 6,170 (3.6 GB) | 1.8 s |
+| live targets sampled as textures | 58 | 7,780 (4.5 GB) | 2.2 s |
+| and lazy writeback (all dirty targets at a flip) | 66 | 1,980 (2.5 GB) | 1.9 s |
+| and only the presented surface at a flip | 67 | 1,340 (1.7 GB) | 1.8 s |
+
+What is left is the presented frame itself: about 1.3 ms of `Map` per
+writeback. Reading it a flip later from a ring of staging textures did not
+change that (1.6 s per 10 s, same fps), so it is not in the tree.
+
+**Compare and far-reaching triangles.** The executor clips at the near plane
+at w = 1e-3 and hands over screen positions, so a triangle that crosses the
+near plane can have a vertex millions of pixels away. The software rasteriser's
+float edge functions and barycentrics lose such a triangle: in Fallout's
+"camera wedge" frames (the camera inside geometry, which happens on the
+software path alone too) about a quarter of a million pixels per frame are
+covered differently than the same arithmetic in double gives, and depth is off
+by more than 1000 units on more. The GPU clips in clip space. So
+`RECOMP_GPU_RASTER=compare` prints `far-reaching triangles N` with each flip: a
+frame that differs while N is not 0 is that, not a GPU fault. Outside those
+frames Carbon compares at 0.00–0.02%.
 
 ## Switches
 
@@ -264,7 +302,9 @@ starts.
 | `RECOMP_PB_WALK=dma` | walk the pushbuffer like the DMA engine (JUMPs, wraps, GET per command, the `0x0310` latch) instead of scanning each submitted segment; see [The DMA Walk Is Opt-In](#the-dma-walk-is-opt-in) |
 | `RECOMP_PB_EXEC_VERBOSE` | per-batch trace |
 | `RECOMP_FFP_TRACE` | composite matrix and sample vertices of the first fixed-function batches |
-| `RECOMP_GPU_RASTER` | rasterise on the GPU through the D3D11 back end (`src/d3d/nv2a_gpu_d3d11.c`), once the game project calls `nv2a_gpu_d3d11_install()`: `1` a hardware adapter (WARP if none), `warp` the WARP adapter, `compare` the software path draws and the GPU draws alongside, printing per flip how far they differ (`<RECOMP_FB_DUMP>gpu_/sw_<flip>_<surface>.bmp` for the first frames that differ by more than 1%). Unset or `0`: off |
+| `RECOMP_GPU_RASTER` | rasterise on the GPU through the D3D11 back end (`src/d3d/nv2a_gpu_d3d11.c`), once the game project calls `nv2a_gpu_d3d11_install()`: `1` a hardware adapter (WARP if none), `warp` the WARP adapter, `compare` the software path draws and the GPU draws alongside, printing per flip how far they differ and how many far-reaching triangles the frame had (`<RECOMP_FB_DUMP>gpu_/sw_<flip>_<surface>.bmp` for the first frames that differ by more than 1%). Unset or `0`: off |
+| `RECOMP_GPU_RASTER_SYNC=all` | the D3D11 back end writes its surfaces back at every executor sync, not only when they are read (for a title whose CPU reads what the GPU drew) |
+| `RECOMP_GPU_RASTER_RTTEX=0` | the D3D11 back end reads every texture through guest RAM, render targets included |
 | `RECOMP_FFP_FLIP_NORMALS` | light the side of a fixed-function mesh that faces the viewer, even when the title left two-sided lighting off. Not hardware behaviour: a compatibility option for a game project to turn on, off by default |
 
 ## The DMA Walk Is Opt-In

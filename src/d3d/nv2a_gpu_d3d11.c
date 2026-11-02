@@ -12,9 +12,15 @@
  * held when the target last matched it. The first time a target is used in
  * an epoch -- epochs end at every executor sync and every flip -- the guest
  * rows are compared with the shadow and the rows the title (or the CPU) has
- * changed are uploaded. sync() writes every target's dirty rectangle back
- * into guest RAM and into the shadow. 16-bit surfaces are R5G6B5 in guest
- * RAM and expanded in the target, the way the software path reads them.
+ * changed are uploaded. A target goes back into guest RAM (and the shadow)
+ * only when something reads it there: the flip's present (sync_surface, the
+ * presented surface only), the executor's dumps (sync READ), a texture that
+ * must be decoded from guest RAM, or a target being dropped. A texture that
+ * is a live target's pixels is sampled from the target itself. 16-bit
+ * surfaces are R5G6B5 in guest RAM and expanded in the target, the way the
+ * software path reads them. RECOMP_GPU_RASTER_SYNC=all writes back at every
+ * executor sync instead; RECOMP_GPU_RASTER_RTTEX=0 reads every texture
+ * through guest RAM.
  *
  * Depth and stencil live only here, one D32_FLOAT_S8X24 buffer per zeta
  * address; guest zeta memory is never read or written (nor is it on the
@@ -82,7 +88,7 @@ static const char s_hlsl[] =
 "    uint4 ctl;\n"            /* control, stage_program, clip_plane_mode, flags */
 "    uint4 at;\n"             /* alpha_func, alpha_ref, stage_valid, kind */
 "    float4 fogc;\n"
-"    uint4 tex[4];\n"         /* w | h<<16, addr_u | addr_v<<8, flags, 0 */
+"    uint4 tex[4];\n"         /* w | h<<16, addr_u | addr_v<<8, flags, origin x | y<<16 */
 "};\n"
 "Texture2DArray<float4> T0 : register(t0);\n"
 "Texture2DArray<float4> T1 : register(t1);\n"
@@ -138,7 +144,10 @@ static const char s_hlsl[] =
 "float4 texel_at(uint st, int x, int y, uint face) {\n"
 "    uint4 p = tex[st];\n"
 "    int w = (int)(p.x & 0xFFFF), h = (int)(p.x >> 16);\n"
-"    return load_st(st, wrapc(x, w, p.y & 0xFF), wrapc(y, h, (p.y >> 8) & 0xFF), face);\n"
+"    float4 c = load_st(st, wrapc(x, w, p.y & 0xFF) + (int)(p.w & 0xFFFF),\n"
+"                       wrapc(y, h, (p.y >> 8) & 0xFF) + (int)(p.w >> 16), face);\n"
+"    if (p.z & 16) c.a = 1.0;\n"   /* X8R8G8B8 read from a render target */
+"    return c;\n"
 "}\n"
 /* rc_texel: normalised (swizzled/DXT) or texel coordinates; an unusable
  * stage reads white; bilinear taps at floor(u - 0.5). */
@@ -362,12 +371,14 @@ typedef struct {
 #define TXF_BILIN  2u
 #define TXF_CUBE   4u
 #define TXF_VALID  8u
+#define TXF_OPAQUE 16u                  /* alpha reads 1 (X8R8G8B8) */
 
 typedef struct {
     int used;
     uint32_t va, pitch, bpp, W, H;
     ID3D11Texture2D *tex;
     ID3D11RenderTargetView *rtv;
+    ID3D11ShaderResourceView *srv;      /* the target sampled as a texture */
     uint8_t *shadow;                    /* RT_H rows of W*bpp bytes */
     int dirty, need_full;
     uint32_t dx0, dy0, dx1, dy1;        /* dirty rectangle, half-open */
@@ -419,6 +430,16 @@ static int s_nds;
 static BlendEntry s_bl[MAX_BLEND_STATES];
 static int s_nbl;
 
+/* compare: triangles this frame with a vertex beyond +-FAR_COORD pixels.
+ * The near-plane clip (w = 1e-3) puts such vertices millions of pixels out,
+ * and the software rasteriser's float edge functions and barycentrics lose
+ * the triangle there: in Fallout's "camera wedge" frames it misplaces about
+ * a quarter of a million pixels per frame against the same arithmetic in
+ * double, where the GPU clips in clip space. A frame that differs with these
+ * present is that, not a GPU fault. */
+#define FAR_COORD 1e5f
+static uint32_t s_far_tris;
+
 static ID3D11Query *s_qpool[MAX_QUERIES];
 static int s_qfree;                     /* entries [0, s_qfree) are free */
 static int s_qmade;
@@ -431,7 +452,7 @@ static uint32_t *s_scratch;             /* RT_W*RT_H texels: conversions, decode
 static size_t s_scratch_n;
 
 static struct {
-    uint32_t flips, draws, writebacks, uploads, decodes;
+    uint32_t flips, draws, writebacks, uploads, decodes, rt_tex;
     uint64_t wb_bytes, up_bytes;
     double stall_ms;
     DWORD last_tick;
@@ -557,38 +578,17 @@ static int rt_check(GpuRt *r)
 
 static void tex_invalidate_range(uint32_t lo, uint32_t hi);
 
-/* The dirty rectangle into guest RAM and the shadow. */
-static void rt_writeback(GpuRt *r)
+/* A mapped copy of rectangle (x0,y0)-(x1,y1) of target r into guest RAM and
+ * the shadow; then everything that mirrors those bytes looks again. */
+static void rt_store(GpuRt *r, const D3D11_MAPPED_SUBRESOURCE *m, uint32_t x0,
+                     uint32_t y0, uint32_t x1, uint32_t y1)
 {
-    D3D11_BOX box;
-    D3D11_MAPPED_SUBRESOURCE m;
-    uint32_t x0, x1, y0, y1, y, x, rb = rt_row_bytes(r);
-    double t0;
+    uint32_t y, x, rb = rt_row_bytes(r);
     int i;
 
-    if (!r->dirty)
-        return;
-    r->dirty = 0;
-    x0 = r->dx0; y0 = r->dy0;
-    x1 = r->dx1 < r->W ? r->dx1 : r->W;
-    y1 = r->dy1 < r->H ? r->dy1 : r->H;
-    if (x0 >= x1 || y0 >= y1)
-        return;
-    if (!nv2a_backend_surface_ok(r->va + y0 * r->pitch, (y1 - y0) * r->pitch))
-        return;
-    box.left = x0; box.right = x1; box.top = y0; box.bottom = y1;
-    box.front = 0; box.back = 1;
-    ID3D11DeviceContext_CopySubresourceRegion(s_ctx, (ID3D11Resource *)s_staging, 0,
-                                              x0, y0, 0, (ID3D11Resource *)r->tex,
-                                              0, &box);
-    t0 = now_ms();
-    if (FAILED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)s_staging, 0,
-                                       D3D11_MAP_READ, 0, &m)))
-        return;
-    s_st.stall_ms += now_ms() - t0;
     for (y = y0; y < y1; y++) {
-        const uint32_t *src = (const uint32_t *)((const uint8_t *)m.pData
-                                                 + (size_t)y * m.RowPitch);
+        const uint32_t *src = (const uint32_t *)((const uint8_t *)m->pData
+                                                 + (size_t)y * m->RowPitch);
         uint8_t *dst = guest(r->va) + (size_t)y * r->pitch;
         uint8_t *sh = r->shadow + (size_t)y * rb;
         if (r->bpp == 4) {
@@ -600,10 +600,8 @@ static void rt_writeback(GpuRt *r)
                 d16[x] = s16[x] = (uint16_t)pack565(src[x]);
         }
     }
-    ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)s_staging, 0);
     s_st.writebacks++;
     s_st.wb_bytes += (uint64_t)(y1 - y0) * (x1 - x0) * r->bpp;
-    /* Whatever else mirrors these bytes has to look again. */
     tex_invalidate_range(r->va, rt_end(r));
     for (i = 0; i < MAX_RTS; i++)
         if (&s_rt[i] != r && s_rt[i].used
@@ -611,8 +609,49 @@ static void rt_writeback(GpuRt *r)
             s_rt[i].epoch_checked = EPOCH_NONE;
 }
 
+/* The dirty rectangle, clipped to the target; 0 when there is nothing to
+ * write or it is not memory a surface may use. Clears dirty. */
+static int rt_take_dirty(GpuRt *r, uint32_t *x0, uint32_t *y0, uint32_t *x1,
+                         uint32_t *y1)
+{
+    if (!r->dirty)
+        return 0;
+    r->dirty = 0;
+    *x0 = r->dx0; *y0 = r->dy0;
+    *x1 = r->dx1 < r->W ? r->dx1 : r->W;
+    *y1 = r->dy1 < r->H ? r->dy1 : r->H;
+    if (*x0 >= *x1 || *y0 >= *y1)
+        return 0;
+    return nv2a_backend_surface_ok(r->va + *y0 * r->pitch, (*y1 - *y0) * r->pitch);
+}
+
+/* The dirty rectangle into guest RAM and the shadow, now. */
+static void rt_writeback(GpuRt *r)
+{
+    D3D11_BOX box;
+    D3D11_MAPPED_SUBRESOURCE m;
+    uint32_t x0, x1, y0, y1;
+    double t0;
+
+    if (!rt_take_dirty(r, &x0, &y0, &x1, &y1))
+        return;
+    box.left = x0; box.right = x1; box.top = y0; box.bottom = y1;
+    box.front = 0; box.back = 1;
+    ID3D11DeviceContext_CopySubresourceRegion(s_ctx, (ID3D11Resource *)s_staging, 0,
+                                              x0, y0, 0, (ID3D11Resource *)r->tex,
+                                              0, &box);
+    t0 = now_ms();
+    if (FAILED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)s_staging, 0,
+                                       D3D11_MAP_READ, 0, &m)))
+        return;
+    s_st.stall_ms += now_ms() - t0;
+    rt_store(r, &m, x0, y0, x1, y1);
+    ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)s_staging, 0);
+}
+
 static void rt_release(GpuRt *r)
 {
+    REL(r->srv);
     REL(r->rtv);
     REL(r->tex);
     free(r->shadow);
@@ -675,6 +714,7 @@ static GpuRt *rt_acquire(const Nv2aSurface *s)
     }
     if (!r) {
         D3D11_TEXTURE2D_DESC d;
+        D3D11_SHADER_RESOURCE_VIEW_DESC vd;
         for (i = 0; i < MAX_RTS; i++)
             if (!s_rt[i].used) { victim = &s_rt[i]; break; }
         if (!victim) {
@@ -692,12 +732,19 @@ static GpuRt *rt_acquire(const Nv2aSurface *s)
         d.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
         d.SampleDesc.Count = 1;
         d.Usage = D3D11_USAGE_DEFAULT;
-        d.BindFlags = D3D11_BIND_RENDER_TARGET;
+        d.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+        memset(&vd, 0, sizeof vd);
+        vd.Format = d.Format;
+        vd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2DARRAY;
+        vd.Texture2DArray.MipLevels = 1;
+        vd.Texture2DArray.ArraySize = 1;
         r->shadow = (uint8_t *)malloc((size_t)RT_H * RT_W * 4);
         if (!r->shadow
             || FAILED(ID3D11Device_CreateTexture2D(s_dev, &d, NULL, &r->tex))
             || FAILED(ID3D11Device_CreateRenderTargetView(s_dev, (ID3D11Resource *)r->tex,
-                                                          NULL, &r->rtv))) {
+                                                          NULL, &r->rtv))
+            || FAILED(ID3D11Device_CreateShaderResourceView(s_dev, (ID3D11Resource *)r->tex,
+                                                            &vd, &r->srv))) {
             rt_release(r);
             return NULL;
         }
@@ -1278,6 +1325,45 @@ static void gpu_clear(const Nv2aSurface *s, const Nv2aRenderState *rs,
     }
 }
 
+static int s_rt_tex = 1;                /* RECOMP_GPU_RASTER_RTTEX=0: always via guest RAM */
+static int s_sync_all;                  /* RECOMP_GPU_RASTER_SYNC=all: write back at every sync */
+
+/* A texture that is a live render target's pixels: the title drew a surface
+ * and now samples it (Fallout draws its scene into 0x80778000 at 1280x480 and
+ * then reads it as a LIN_A8R8G8B8 texture to filter it down into 0x809D0000).
+ * The target is sampled on the GPU as it is, with no writeback to guest RAM
+ * and no CPU decode. Linear 32-bit formats with the target's own pitch only;
+ * not the surface being drawn (a target cannot be read and written at once).
+ * `ox`/`oy`: where texel (0,0) sits in the target. */
+static GpuRt *rt_as_texture(const Nv2aTexture *t, const Nv2aSurface *dst,
+                            uint32_t *ox, uint32_t *oy)
+{
+    uint32_t i, off;
+
+    if (!s_rt_tex || (t->color != 0x12 && t->color != 0x1E) || !t->pitch || t->cube)
+        return NULL;
+    for (i = 0; i < MAX_RTS; i++) {
+        GpuRt *r = &s_rt[i];
+        if (!r->used || r->bpp != 4 || r->pitch != t->pitch || t->offset < r->va
+            || t->offset >= rt_end(r))
+            continue;
+        off = t->offset - r->va;
+        if ((off % r->pitch) % 4)
+            continue;
+        *oy = off / r->pitch;
+        *ox = (off % r->pitch) / 4;
+        if (*ox + t->width > r->W || *oy + t->height > r->H)
+            continue;
+        if (ranges_overlap(r->va, rt_end(r), dst->color_va,
+                           dst->color_va + (dst->clip_y + dst->height) * dst->pitch))
+            return NULL;                /* the surface being drawn: via guest RAM */
+        if (!rt_check(r))               /* clean: catch up with CPU writes first */
+            return NULL;
+        return r;
+    }
+    return NULL;
+}
+
 /* The stages a batch actually samples. */
 static uint32_t stages_needed(const Nv2aBatch *b)
 {
@@ -1313,20 +1399,6 @@ static void gpu_draw(const Nv2aSurface *s, const Nv2aBatch *b)
         || b->count < 3)
         return;
     need = stages_needed(b);
-    /* A texture drawn earlier into a target goes back to guest RAM before
-     * the stage is decoded from there. */
-    if (!s_compare)
-        for (st = 0; st < 4; st++) {
-            uint32_t lo, hi;
-            if (!(need & (1u << st)))
-                continue;
-            lo = b->stages[st].offset;
-            hi = lo + nv2a_backend_texture_bytes(&b->stages[st]);
-            for (i = 0; i < MAX_RTS; i++)
-                if (s_rt[i].used && s_rt[i].dirty
-                    && ranges_overlap(s_rt[i].va, rt_end(&s_rt[i]), lo, hi))
-                    rt_writeback(&s_rt[i]);
-        }
     r = rt_acquire(s);
     if (!r)
         return;
@@ -1342,9 +1414,28 @@ static void gpu_draw(const Nv2aSurface *s, const Nv2aBatch *b)
     for (st = 0; st < 4; st++) {
         const Nv2aTexture *t = &b->stages[st];
         uint32_t mag = (t->filter >> 24) & 0xF, min = (t->filter >> 16) & 0xFF, fl = 0;
+        uint32_t ox = 0, oy = 0;
+        GpuRt *src = NULL;
         srv[st] = NULL;
-        if (need & (1u << st))
-            srv[st] = tex_resolve(t);
+        if (need & (1u << st)) {
+            src = rt_as_texture(t, s, &ox, &oy);
+            if (src) {
+                srv[st] = src->srv;
+                if (t->color == 0x1E)
+                    fl |= TXF_OPAQUE;
+                s_st.rt_tex++;
+            } else {
+                /* A texture drawn earlier into a target goes back to guest
+                 * RAM before the stage is decoded from there. */
+                uint32_t lo = t->offset, hi = lo + nv2a_backend_texture_bytes(t);
+                if (!s_compare)
+                    for (i = 0; i < MAX_RTS; i++)
+                        if (s_rt[i].used && s_rt[i].dirty
+                            && ranges_overlap(s_rt[i].va, rt_end(&s_rt[i]), lo, hi))
+                            rt_writeback(&s_rt[i]);
+                srv[st] = tex_resolve(t);
+            }
+        }
         if (srv[st])
             fl |= TXF_VALID;
         else
@@ -1358,6 +1449,7 @@ static void gpu_draw(const Nv2aSurface *s, const Nv2aBatch *b)
         pc.tex[st][0] = (t->width & 0xFFFF) | ((t->height & 0xFFFF) << 16);
         pc.tex[st][1] = (t->addr_u & 0xFF) | ((t->addr_v & 0xFF) << 8);
         pc.tex[st][2] = fl;
+        pc.tex[st][3] = (ox & 0xFFFF) | ((oy & 0xFFFF) << 16);
     }
     if (b->rc) {
         memcpy(pc.cicw, b->rc->color_icw, sizeof pc.cicw);
@@ -1408,8 +1500,10 @@ static void gpu_draw(const Nv2aSurface *s, const Nv2aBatch *b)
     if (r->bpp == 2)
         mask &= (UINT8)~D3D11_COLOR_WRITE_ENABLE_ALPHA;
 
-    ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 4, srv);
+    /* Target first: a view of a resource still bound as the render target
+     * would be dropped by the runtime. */
     ID3D11DeviceContext_OMSetRenderTargets(s_ctx, 1, &r->rtv, z ? z->dsv : NULL);
+    ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 4, srv);
     ID3D11DeviceContext_OMSetBlendState(s_ctx,
         blend_state((int)blend_on, rs->blend_src, rs->blend_dst, rs->blend_eq,
                     mask), bf, 0xFFFFFFFFu);
@@ -1446,6 +1540,17 @@ static void gpu_draw(const Nv2aSurface *s, const Nv2aBatch *b)
         rt_grow(r, (uint32_t)gx0, (uint32_t)gy0, (uint32_t)gx1, (uint32_t)gy1);
     }
     s_st.draws++;
+    if (s_compare)
+        for (i = 0; i + 2 < b->count; i += 3) {
+            uint32_t k;
+            for (k = 0; k < 3; k++) {
+                const Nv2aVertexEx *v = &b->vertices_ex[i + k];
+                if (fabsf(v->x) > FAR_COORD || fabsf(v->y) > FAR_COORD)
+                    break;
+            }
+            if (k < 3)
+                s_far_tris++;
+        }
 }
 
 /* ---- sync, reports, flips ----------------------------------------------- */
@@ -1456,11 +1561,32 @@ static void gpu_sync(uint32_t reason)
 
     if (s_compare)
         return;
-    for (i = 0; i < MAX_RTS; i++)
-        if (s_rt[i].used && s_rt[i].dirty)
-            rt_writeback(&s_rt[i]);
+    /* Lazily: guest RAM gets the targets when something reads them there --
+     * the presenter at a flip, the executor's dumps -- and, in gpu_draw, when
+     * a stage samples one through guest RAM. The scan ends and the methods
+     * that drain the executor only end the epoch. RECOMP_GPU_RASTER_SYNC=all
+     * writes back at every one of them, for a title whose CPU reads what the
+     * GPU drew. */
+    if (s_sync_all || reason == NV2A_BACKEND_SYNC_READ
+        || reason == NV2A_BACKEND_SYNC_PRESENT)
+        for (i = 0; i < MAX_RTS; i++)
+            if (s_rt[i].used && s_rt[i].dirty)
+                rt_writeback(&s_rt[i]);
     if (reason == NV2A_BACKEND_SYNC_SCAN_END || reason == NV2A_BACKEND_SYNC_METHOD)
         s_epoch++;
+}
+
+/* The flip's present: only the targets over the surface it reads. */
+static void gpu_sync_surface(uint32_t va, uint32_t bytes)
+{
+    int i;
+
+    if (s_compare)
+        return;
+    for (i = 0; i < MAX_RTS; i++)
+        if (s_rt[i].used && s_rt[i].dirty
+            && ranges_overlap(s_rt[i].va, rt_end(&s_rt[i]), va, va + bytes))
+            rt_writeback(&s_rt[i]);
 }
 
 static uint32_t gpu_report(void)
@@ -1580,9 +1706,9 @@ static void compare_flip(void)
         ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)s_staging, 0);
         total = (uint64_t)w * h;
         fprintf(stderr, "[GPURAST] compare flip %u: surface 0x%08X %.2f%% pixels"
-                        " differ >4, max delta %u\n",
+                        " differ >4, max delta %u, far-reaching triangles %u\n",
                 s_flip_no, r->va, total ? 100.0 * (double)differ / (double)total : 0.0,
-                maxd);
+                maxd, s_far_tris);
         if (gbuf && sbuf && total && differ * 100 > total) {
             char path[512];
             snprintf(path, sizeof path, "%sgpu_%05u_%08X.bmp", prefix, s_flip_no, r->va);
@@ -1594,6 +1720,7 @@ static void compare_flip(void)
         free(gbuf);
         free(sbuf);
     }
+    s_far_tris = 0;
     /* Start the next frame from what the software path drew. */
     for (i = 0; i < MAX_RTS; i++)
         if (s_rt[i].used) {
@@ -1625,11 +1752,11 @@ static void gpu_flip(void)
     if (now - s_st.last_tick >= 10000) {
         fprintf(stderr, "[GPURAST] %.1fs: flips %u, draws %u, writebacks %u (%.1f MB),"
                         " guest->rt uploads %u (%.1f MB), tex decodes %u,"
-                        " readback stall ms %.1f\n",
+                        " rt as texture %u, readback stall ms %.1f\n",
                 (double)(now - s_st.last_tick) / 1000.0, s_st.flips, s_st.draws,
                 s_st.writebacks, (double)s_st.wb_bytes / 1048576.0,
                 s_st.uploads, (double)s_st.up_bytes / 1048576.0,
-                s_st.decodes, s_st.stall_ms);
+                s_st.decodes, s_st.rt_tex, s_st.stall_ms);
         memset(&s_st, 0, sizeof s_st);
         s_st.last_tick = now;
     }
@@ -1760,6 +1887,7 @@ static int create_pipeline(void)
     if (FAILED(ID3D11Device_CreateTexture2D(s_dev, &td, NULL, &s_staging)))
         goto done;
 
+
     td.Width = td.Height = 1;
     td.Usage = D3D11_USAGE_IMMUTABLE;
     td.CPUAccessFlags = 0;
@@ -1816,6 +1944,12 @@ int nv2a_gpu_d3d11_install(void)
     if (!e || !*e || strcmp(e, "0") == 0)
         return 0;
     s_compare = strcmp(e, "compare") == 0;
+    {
+        const char *rt = getenv("RECOMP_GPU_RASTER_RTTEX");
+        const char *sy = getenv("RECOMP_GPU_RASTER_SYNC");
+        s_rt_tex = !(rt && strcmp(rt, "0") == 0);
+        s_sync_all = sy && strcmp(sy, "all") == 0;
+    }
     type = strcmp(e, "warp") == 0 ? D3D_DRIVER_TYPE_WARP : D3D_DRIVER_TYPE_HARDWARE;
     QueryPerformanceFrequency(&f);
     s_qpc_ms = 1000.0 / (double)f.QuadPart;
@@ -1856,6 +1990,7 @@ int nv2a_gpu_d3d11_install(void)
     s_be.sync = gpu_sync;
     s_be.report = gpu_report;
     s_be.shadow = s_compare;
+    s_be.sync_surface = s_sync_all ? NULL : gpu_sync_surface;
     nv2a_backend_register(&s_be);
     fprintf(stderr, "[GPURAST] D3D11 back end on: %ls, FL %u_%u%s\n", ad.Description,
             ((unsigned)fl >> 12) & 0xF, ((unsigned)fl >> 8) & 0xF,

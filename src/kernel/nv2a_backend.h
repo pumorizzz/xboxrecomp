@@ -133,6 +133,7 @@ typedef struct {
 #define NV2A_BACKEND_SYNC_METHOD   0   /* a method that reads or orders the GPU */
 #define NV2A_BACKEND_SYNC_SCAN_END 1   /* a pushbuffer scan ends (before DMA_GET) */
 #define NV2A_BACKEND_SYNC_READ     2   /* the executor reads a surface (dumps) */
+#define NV2A_BACKEND_SYNC_PRESENT  3   /* FLIP_STALL: the frame is presented from guest RAM */
 
 typedef struct {
     /* flags: CLEAR_SURFACE bits (Z 0x1, stencil 0x2, colour 0xF0).
@@ -148,6 +149,10 @@ typedef struct {
     uint32_t (*report)(void);
     /* Non-zero: the executor also rasterises in software, into guest RAM. */
     int shadow;
+    /* Optional, narrower than sync(): make guest RAM hold what was drawn
+     * into [va, va+bytes) -- the surface a flip is about to present. Without
+     * it the executor calls sync(NV2A_BACKEND_SYNC_PRESENT). */
+    void (*sync_surface)(uint32_t va, uint32_t bytes);
 } Nv2aBackend;
 
 /* Register (or, with NULL, remove) the back end. Call before the title starts

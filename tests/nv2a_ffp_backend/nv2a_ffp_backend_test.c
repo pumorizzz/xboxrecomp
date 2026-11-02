@@ -64,6 +64,7 @@ static struct {
     Nv2aVertexEx ex0;
     int syncs, reports;
     int flips_at_sync;          /* flips counted when sync() was first called */
+    uint32_t present_va;        /* what sync_surface() was asked for last */
 } s_be;
 
 static void be_clear(const Nv2aSurface *s, const Nv2aRenderState *rs,
@@ -105,8 +106,10 @@ static void be_sync(uint32_t reason)
  * should have discarded shows in the report. */
 static uint32_t be_report(void) { return 7u * (uint32_t)++s_be.reports; }
 
+static void be_sync_surface(uint32_t va, uint32_t bytes) { (void)bytes; s_be.present_va = va; }
+
 static const Nv2aBackend s_backend = { be_clear, be_draw, be_flip,
-                                       be_sync, be_report, 0 };
+                                       be_sync, be_report, 0, be_sync_surface };
 
 /* ---- driving the executor ---------------------------------------------- */
 extern void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param);
@@ -329,6 +332,11 @@ int main(void)
         /* Written back before the flip reaches the back end (and before the
          * executor presents guest RAM): the first sync saw no flip yet. */
         int expected = 0, actual = s_be.syncs ? s_be.flips_at_sync : -1;
+        CHECK(actual == expected);
+    }
+    {
+        /* The surface the flip presents is the one written back for it. */
+        uint32_t expected = 0x8000, actual = s_be.present_va;
         CHECK(actual == expected);
     }
 

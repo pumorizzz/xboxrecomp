@@ -4054,6 +4054,19 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         /* And this is a completed swap, which is what a title's own swap
          * counter counts -- see xbox_Nv2aFrameCounterFlip. */
         xbox_Nv2aFrameCounterFlip();
+        /* A back end that draws elsewhere puts the frame into guest RAM now:
+         * the presenter and the flip dumps below read it from there -- the
+         * surface the last batches drew into, as they choose it. */
+        if (s_backend && s_backend->sync_surface) {
+            uint32_t done = s_gpu.drawn_offset ? s_gpu.drawn_offset : s_gpu.color_offset;
+            uint32_t rows = s_gpu.drawn_offset ? s_gpu.drawn_y + s_gpu.drawn_h
+                                               : RS.clip_y + RS.clip_h;
+            uint32_t pitch = s_gpu.drawn_offset ? s_gpu.drawn_pitch : RS.pitch;
+            if (done && pitch)
+                s_backend->sync_surface(dma_resolve(done), rows * pitch);
+        } else if (s_backend && s_backend->sync) {
+            s_backend->sync(NV2A_BACKEND_SYNC_PRESENT);
+        }
         /* Hand the window a copy of the frame just finished.
          *
          * The buffer the title has finished is the one the last batch drew
