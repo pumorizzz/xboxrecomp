@@ -10,7 +10,10 @@
  *     reset values until the title writes them;
  *   - the semaphore release lands where the title said, method 0x0310 on
  *     subchannel 5 is latched into PGRAPH 0x400B10, and clears and flips reach
- *     the back end.
+ *     the back end;
+ *   - a batch carries every interpolant (Nv2aVertexEx) and the combiner
+ *     words, the back end is asked to sync before a flip is presented, and
+ *     a visibility test reports the back end's pixel count.
  *
  * Guest memory is a buffer, addressed by the offsets the title would use
  * (the executor treats a DMA offset below the image as a plain address when
@@ -56,6 +59,11 @@ static struct {
     Nv2aVertex v[8];
     int textured;
     uint32_t clear_flags, clear_argb;
+    uint32_t kind;
+    int has_ex, has_rc;
+    Nv2aVertexEx ex0;
+    int syncs, reports;
+    int flips_at_sync;          /* flips counted when sync() was first called */
 } s_be;
 
 static void be_clear(const Nv2aSurface *s, const Nv2aRenderState *rs,
@@ -78,11 +86,27 @@ static void be_draw(const Nv2aSurface *s, const Nv2aBatch *b)
     s_be.textured = b->texture != NULL;
     for (i = 0; i < b->count && i < 8; i++)
         s_be.v[i] = b->vertices[i];
+    s_be.kind = b->kind;
+    s_be.has_ex = b->vertices_ex != NULL;
+    s_be.has_rc = b->rc != NULL;
+    if (b->vertices_ex)
+        s_be.ex0 = b->vertices_ex[0];
 }
 
 static void be_flip(void) { s_be.flips++; }
+static void be_sync(uint32_t reason)
+{
+    (void)reason;
+    if (!s_be.syncs++)
+        s_be.flips_at_sync = s_be.flips;
+}
+/* A count the executor cannot produce itself (it draws nothing here), and a
+ * different one each call -- 7, 14, ... -- so a count CLEAR_REPORT_VALUE
+ * should have discarded shows in the report. */
+static uint32_t be_report(void) { return 7u * (uint32_t)++s_be.reports; }
 
-static const Nv2aBackend s_backend = { be_clear, be_draw, be_flip };
+static const Nv2aBackend s_backend = { be_clear, be_draw, be_flip,
+                                       be_sync, be_report, 0 };
 
 /* ---- driving the executor ---------------------------------------------- */
 extern void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param);
@@ -157,6 +181,12 @@ int main(void)
     CHECK(s_be.rs.stencil_fail == 0x1E00 && s_be.rs.stencil_zfail == 0x1E00
        && s_be.rs.stencil_zpass == 0x1E00);
     CHECK(s_be.rs.stencil_enable == 0);
+    /* Every interpolant arrives alongside: a transformed batch, with the
+     * combiner words and the unclamped diffuse colour as floats. */
+    CHECK(s_be.kind == NV2A_BATCH_XF);
+    CHECK(s_be.has_ex && s_be.has_rc);
+    CHECK(near_(s_be.ex0.d0[0], 128.0f / 255.0f) && near_(s_be.ex0.d0[1], 64.0f / 255.0f)
+       && near_(s_be.ex0.d0[2], 32.0f / 255.0f) && near_(s_be.ex0.d0[3], 1.0f));
 
     /* The viewport offset (c[59]) is added after the divide, then scaled. */
     mf(0x0A20, 10.0f);
@@ -214,6 +244,37 @@ int main(void)
     CHECK(s_be.surf.aa_sx == 1 && s_be.surf.width == 640);
     CHECK(near_(s_be.v[1].x, 640.0f) && near_(s_be.v[1].y, 480.0f));
 
+    /* A screen-space batch (immediate mode: pre-transformed positions) is
+     * handed over as NV2A_BATCH_SCREEN, its Ex vertices carrying the vertex
+     * colour unpacked and the texel UVs as (u, v, 0, 1). Linear A8R8G8B8 on
+     * stage 0, so the UVs are not scaled by a texture size. */
+    m(0x1B04, 0x12u << 8);                            /* SET_TEXTURE_FORMAT: LIN_A8R8G8B8 */
+    m(0x17FC, 5);
+    {
+        static const float pos[3][2] = { { 10, 10 }, { 200, 10 }, { 10, 200 } };
+        for (i = 0; i < 3; i++) {
+            mf(0x1A30, 0.5f); mf(0x1A34, 0.25f);      /* attr 3 (diffuse), r g */
+            mf(0x1A38, 0.125f); mf(0x1A3C, 1.0f);     /* b a */
+            mf(0x18C8, 3.0f + (float)i);              /* attr 9 (texcoord) u */
+            mf(0x18CC, 4.0f);                         /* v */
+            mf(0x1518, pos[i][0]); mf(0x151C, pos[i][1]);
+            mf(0x1520, 0.0f); mf(0x1524, 1.0f);       /* w: the vertex is complete */
+        }
+    }
+    m(0x17FC, 0);
+    {
+        /* vertex_color truncates: 0.5 -> 127, 0.25 -> 63, 0.125 -> 31. */
+        Nv2aVertexEx expected, actual = s_be.ex0;
+        memset(&expected, 0, sizeof expected);
+        expected.x = 10.0f; expected.y = 10.0f; expected.z = 0.0f; expected.rhw = 1.0f;
+        expected.d0[0] = 127.0f / 255.0f; expected.d0[1] = 63.0f / 255.0f;
+        expected.d0[2] = 31.0f / 255.0f;  expected.d0[3] = 1.0f;
+        expected.fog = 1.0f;
+        expected.tex[0][0] = 3.0f; expected.tex[0][1] = 4.0f; expected.tex[0][3] = 1.0f;
+        CHECK(s_be.kind == NV2A_BATCH_SCREEN);
+        CHECK(memcmp(&expected, &actual, sizeof expected) == 0);
+    }
+
     /* A garbage index (the walk is 32 bits wide now) must not reach outside
      * guest memory: start 0xFFFFFF at a 12-byte stride is 200 MB past the
      * array, and the batch is dropped instead of read. The test buffer is
@@ -261,8 +322,26 @@ int main(void)
     m(0x1D94, 0xF3);                                  /* CLEAR_SURFACE */
     CHECK(s_be.clears == 1 && s_be.clear_flags == 0xF3 && s_be.clear_argb == 0xFF102030u);
     CHECK(s_be.flips == 0);
+    s_be.syncs = 0;
     m(0x0130, 0);                                     /* FLIP_STALL */
     CHECK(s_be.flips == 1);
+    {
+        /* Written back before the flip reaches the back end (and before the
+         * executor presents guest RAM): the first sync saw no flip yet. */
+        int expected = 0, actual = s_be.syncs ? s_be.flips_at_sync : -1;
+        CHECK(actual == expected);
+    }
+
+    /* A visibility test's pixel count comes from the back end: what it
+     * counted before CLEAR_REPORT_VALUE (7) is dropped, the next call's 14
+     * is reported. */
+    m(0x17C8, 0);                                     /* CLEAR_REPORT_VALUE */
+    m(0x17D0, 0x7000);                                /* GET_REPORT */
+    {
+        uint32_t expected = 14, actual;
+        memcpy(&actual, s_mem + 0x7000 + 8, 4);
+        CHECK(actual == expected);
+    }
 
     if (!s_fail)
         printf("nv2a fixed-function path through a back end: ok\n");

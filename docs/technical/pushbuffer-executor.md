@@ -196,7 +196,37 @@ contiguous window); a read outside it returns no vertex and the batch is dropped
 - the texture the batch samples (`nv2a_backend_decode_texture` decodes every
   format the executor can sample), with its mip level count and filter word;
 - blend, alpha, depth, colour-mask, cull and stencil state in the NV2A's own
-  enum values.
+  enum values, plus the zeta format and whether visibility-test counting is on.
+
+Next to those, `Nv2aBatch` carries everything the executor's own pixel path
+reads, so a back end can shade exactly as the CPU rasteriser does:
+
+- `vertices_ex`: the same triangles with every interpolant (`Nv2aVertexEx`):
+  diffuse and specular colours unclamped, the fog factor already through the
+  fog unit, and all four stages' texture coordinates as the program left them
+  (not divided by w; texel UVs in `tex[0]` on the screen-space path);
+- `kind`: `NV2A_BATCH_SCREEN` (flat colour, the texel replaces it, no depth) or
+  `NV2A_BATCH_XF` (program or fixed-function: depth, alpha test, combiners);
+- `use_rc` and `rc`, the raw register-combiner words; `textured`;
+- `stages[4]` / `stage_valid`, each stage's texture with its palette and cube
+  flag (`nv2a_backend_decode_texture_face` decodes one face, P8 included;
+  `nv2a_backend_texture_bytes` gives the guest span for a cache);
+- `clip_plane_mode` and the fog colour.
+
+The surface carries its clip origin (`clip_x`, `clip_y`) as well as its size.
+
+Three optional members let a back end draw somewhere other than guest RAM:
+
+- `sync(reason)`: make guest RAM hold what was drawn. Called at every method
+  that drains the executor's pipeline (surfaces, flips — so before a flip is
+  presented — reports, semaphores, clears, other subchannels), at the end of
+  every pushbuffer scan before `DMA_GET` is published, and before the
+  executor's own surface dumps. `nv2a_backend_surface_ok` says whether a range
+  may be written.
+- `report()`: the visibility-test pixel count since the previous call, added
+  to what `GET_REPORT` writes; `CLEAR_REPORT_VALUE` discards it.
+- `shadow`: the executor keeps rasterising in software as well, into guest RAM,
+  as if no back end were registered — for comparing the two.
 
 All calls come from the NV2A poll thread, one at a time, so a back end can
 create its window and device lazily and pump messages from `flip`.
@@ -219,10 +249,11 @@ of the code here:
   from the projected, mirrored one. Decide culling per triangle from the
   projected screen positions and draw with the rasteriser's culling off.
 
-Not passed on yet: the register-combiner state, and texture stages 1–3 (a back
-end sees stage 0 and the diffuse colour), so effects that need a second stage
-or a combiner program only appear on the CPU rasteriser. Extend `Nv2aBatch`
-when it matters rather than adding callbacks.
+The toolkit's own back end is `src/d3d/nv2a_gpu_d3d11.c` (`RECOMP_GPU_RASTER`):
+it rasterises on the GPU, runs the combiners in one ubershader, keeps depth and
+stencil on the GPU and writes the colour surfaces back from `sync`. A game
+project registers it by calling `nv2a_gpu_d3d11_install()` before the title
+starts.
 
 ## Switches
 
@@ -233,6 +264,7 @@ when it matters rather than adding callbacks.
 | `RECOMP_PB_WALK=dma` | walk the pushbuffer like the DMA engine (JUMPs, wraps, GET per command, the `0x0310` latch) instead of scanning each submitted segment; see [The DMA Walk Is Opt-In](#the-dma-walk-is-opt-in) |
 | `RECOMP_PB_EXEC_VERBOSE` | per-batch trace |
 | `RECOMP_FFP_TRACE` | composite matrix and sample vertices of the first fixed-function batches |
+| `RECOMP_GPU_RASTER` | rasterise on the GPU through the D3D11 back end (`src/d3d/nv2a_gpu_d3d11.c`), once the game project calls `nv2a_gpu_d3d11_install()`: `1` a hardware adapter (WARP if none), `warp` the WARP adapter, `compare` the software path draws and the GPU draws alongside, printing per flip how far they differ (`<RECOMP_FB_DUMP>gpu_/sw_<flip>_<surface>.bmp` for the first frames that differ by more than 1%). Unset or `0`: off |
 | `RECOMP_FFP_FLIP_NORMALS` | light the side of a fixed-function mesh that faces the viewer, even when the title left two-sided lighting off. Not hardware behaviour: a compatibility option for a game project to turn on, off by default |
 
 ## The DMA Walk Is Opt-In

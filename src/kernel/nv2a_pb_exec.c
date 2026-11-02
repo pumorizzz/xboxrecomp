@@ -787,6 +787,24 @@ static int backend_draws(void)
     return s_backend && s_backend->draw;
 }
 
+/* A back end that draws alongside the software path, for comparison: the
+ * executor keeps rasterising into guest RAM as if there were none. */
+static int backend_shadow(void)
+{
+    return s_backend && s_backend->shadow;
+}
+
+/* The combiners decide pixel colour once the title has programmed them,
+ * unless RECOMP_NO_COMBINERS asks for the old stage-0 modulate. */
+static int rc_enabled(void)
+{
+    static int no_rc = -1;
+
+    if (no_rc < 0)
+        no_rc = getenv("RECOMP_NO_COMBINERS") != NULL;
+    return s_gpu.rc_seen && !no_rc;
+}
+
 static void current_surface(Nv2aSurface *out)
 {
     out->color_va        = dma_resolve(s_gpu.color_offset);
@@ -796,6 +814,8 @@ static void current_surface(Nv2aSurface *out)
     out->bytes_per_pixel = surface_bpp();
     out->aa_sx           = s_gpu.aa_sx > 1.5f ? 2 : 1;
     out->aa_sy           = s_gpu.aa_sy > 1.5f ? 2 : 1;
+    out->clip_x          = RS.clip_x;
+    out->clip_y          = RS.clip_y;
 }
 
 /* Render state in the NV2A's own values, gathered from what the executor
@@ -829,36 +849,56 @@ static void current_render_state(Nv2aRenderState *r)
     r->stencil_fail      = s_reg[0x0370 / 4];        /* SET_STENCIL_OP_FAIL */
     r->stencil_zfail     = s_reg[0x0374 / 4];        /* SET_STENCIL_OP_ZFAIL */
     r->stencil_zpass     = s_reg[0x0378 / 4];        /* SET_STENCIL_OP_ZPASS */
+    r->zpass_enable      = RS.zpass_enable;
+    r->zeta_format       = (s_gpu.format >> 4) & 0xF;
 }
 
-static int sample_texture(uint32_t u, uint32_t v, uint32_t *argb);
+static int sample_tex(const Texture *t, uint32_t face_offset,
+                      uint32_t u, uint32_t v, uint32_t *argb);
+static uint32_t tex_face_stride(const Texture *t);
+
+/* The executor's own Texture for a back end's description of one. */
+static void backend_texture(const Nv2aTexture *tex, Texture *t)
+{
+    memset(t, 0, sizeof *t);
+    t->offset  = tex->offset;
+    t->width   = tex->width;
+    t->height  = tex->height;
+    t->pitch   = tex->pitch;
+    t->color   = tex->color;
+    t->addr_u  = 3;
+    t->addr_v  = 3;
+    t->palette = tex->palette;
+    t->levels  = tex->levels ? tex->levels : 1;
+    t->filter  = 0;
+    t->cube    = tex->cube ? 1 : 0;
+    t->valid   = 1;
+}
+
+int nv2a_backend_decode_texture_face(const Nv2aTexture *tex, uint32_t face,
+                                     uint32_t *argb_out)
+{
+    Texture t;
+    uint32_t x, y, face_offset;
+
+    backend_texture(tex, &t);
+    face_offset = t.cube ? face * tex_face_stride(&t) : 0;
+    for (y = 0; y < tex->height; y++)
+        for (x = 0; x < tex->width; x++)
+            if (!sample_tex(&t, face_offset, x, y,
+                            &argb_out[(size_t)y * tex->width + x]))
+                return 0;
+    return 1;
+}
 
 int nv2a_backend_decode_texture(const Nv2aTexture *tex, uint32_t *argb_out)
 {
-    Texture saved = RS.texs[0];
-    uint32_t x, y;
-    int ok = 1;
+    return nv2a_backend_decode_texture_face(tex, 0, argb_out);
+}
 
-    RS.texs[0].offset = tex->offset;
-    RS.texs[0].width  = tex->width;
-    RS.texs[0].height = tex->height;
-    RS.texs[0].pitch  = tex->pitch;
-    RS.texs[0].color  = tex->color;
-    RS.texs[0].addr_u = 3;
-    RS.texs[0].addr_v = 3;
-    RS.texs[0].palette = 0;          /* ponytail: no palettised formats */
-    RS.texs[0].levels = 1;
-    RS.texs[0].filter = 0;
-    RS.texs[0].cube   = 0;
-    RS.texs[0].valid  = 1;
-    for (y = 0; y < tex->height && ok; y++)
-        for (x = 0; x < tex->width; x++)
-            if (!sample_texture(x, y, &argb_out[(size_t)y * tex->width + x])) {
-                ok = 0;
-                break;
-            }
-    RS.texs[0] = saved;
-    return ok;
+int nv2a_backend_surface_ok(uint32_t va, uint32_t bytes)
+{
+    return !surface_hits_image(va, bytes);
 }
 
 static void clear_surface(uint32_t param)
@@ -879,8 +919,20 @@ static void clear_surface(uint32_t param)
         current_render_state(&rs);
         s_backend->clear(&surf, &rs, param, s_gpu.clear_color,
                          s_gpu.zstencil_clear);
-        s_gpu.clears++;
-        return;
+        if (!backend_shadow()) {
+            s_gpu.clears++;
+            if (!(param & NV097_CLEAR_COLOR_MASK))
+                return;                    /* depth/stencil only, as below */
+            /* The window follows the draw surface until the first flip, as
+             * on the software path below. */
+            if (s_gpu.flips == 0) {
+                xbox_FramebufferWindowSet(dma_resolve(s_gpu.color_offset),
+                                          RS.pitch);
+                xbox_FramebufferWindowSetAA(s_gpu.aa_sy > 1.5f ? 2 : 1);
+            }
+            xbox_FramebufferWindowStart();
+            return;
+        }
     }
     if (!(param & NV097_CLEAR_COLOR_MASK))
         return;                            /* depth/stencil only */
@@ -1908,6 +1960,9 @@ static int s_xf_no_tex;
  * dropped. */
 #define NV_BACKEND_MAX_VERTS (NV_MAX_INDICES * 3)
 static Nv2aVertex *s_bverts;     /* about 5.5 MB: allocated by the first vertex */
+/* The same vertices with every interpolant (Nv2aBatch.vertices_ex), slot for
+ * slot: about 25 MB, allocated with s_bverts. */
+static Nv2aVertexEx *s_bverts_ex;
 static uint32_t   s_bcount;
 
 static Nv2aVertex *backend_slot(void)
@@ -1915,14 +1970,22 @@ static Nv2aVertex *backend_slot(void)
     if (!s_bverts
         && !(s_bverts = (Nv2aVertex *)calloc(NV_BACKEND_MAX_VERTS, sizeof *s_bverts)))
         return NULL;
+    if (!s_bverts_ex
+        && !(s_bverts_ex = (Nv2aVertexEx *)calloc(NV_BACKEND_MAX_VERTS,
+                                                  sizeof *s_bverts_ex)))
+        return NULL;
     if (s_bcount + 3 > NV_BACKEND_MAX_VERTS)
         return NULL;
     return &s_bverts[s_bcount];
 }
 
+static float fog_factor(float d);
+
 static void backend_from_xf(const Nv2aVshOutput *v, Nv2aVertex *o)
 {
+    Nv2aVertexEx *e = &s_bverts_ex[o - s_bverts];
     float su = 1.0f, sv = 1.0f;
+    int st, j;
 
     if (tex_size_from_format(RS.texs[0].color)) {
         su = (float)RS.texs[0].width;
@@ -1935,36 +1998,83 @@ static void backend_from_xf(const Nv2aVshOutput *v, Nv2aVertex *o)
     o->diffuse = pack_color(v->d0);
     o->u = v->tex[0][0] * su;
     o->v = v->tex[0][1] * sv;
+
+    e->x = o->x;
+    e->y = o->y;
+    e->z = o->z;
+    e->rhw = o->rhw;
+    for (j = 0; j < 4; j++) {
+        e->d0[j] = v->d0[j];
+        e->d1[j] = v->d1[j];
+    }
+    e->fog = fog_factor(v->fog[0]);
+    e->pad[0] = e->pad[1] = e->pad[2] = 0.0f;
+    for (st = 0; st < 4; st++)
+        for (j = 0; j < 4; j++)
+            e->tex[st][j] = v->tex[st][j];
+}
+
+/* A back end's view of texture stage `st`. */
+static void backend_stage(int st, Nv2aTexture *tex)
+{
+    const Texture *t = &RS.texs[st];
+
+    tex->offset  = t->offset;
+    tex->width   = t->width;
+    tex->height  = t->height;
+    tex->pitch   = t->pitch;
+    tex->color   = t->color;
+    tex->addr_u  = t->addr_u;
+    tex->addr_v  = t->addr_v;
+    /* A swizzled or DXT texture keeps its levels whatever pitch a linear
+     * texture once left in the stage (a cube's face stride depends on them). */
+    tex->levels  = tex_size_from_format(t->color) ? t->levels : 1;
+    tex->filter  = t->filter;
+    tex->palette = t->palette;
+    tex->cube    = t->cube ? 1u : 0u;
 }
 
 /* `textured`: the batch carried texture coordinates, so the bound texture is
- * part of it. */
-static void backend_flush(int textured)
+ * part of it. `kind`: NV2A_BATCH_XF from the program/fixed-function path,
+ * NV2A_BATCH_SCREEN from the screen-space one. */
+static void backend_flush(int textured, uint32_t kind)
 {
     Nv2aSurface surf;
     Nv2aRenderState rs;
     Nv2aTexture tex;
     Nv2aBatch batch;
+    int st;
 
     if (!s_bcount)
         return;
     current_surface(&surf);
     current_render_state(&rs);
+    memset(&batch, 0, sizeof batch);
     batch.vertices = s_bverts;
     batch.count = s_bcount;
     batch.texture = NULL;
     batch.state = &rs;
     if (textured && RS.texs[0].valid) {
-        tex.offset = RS.texs[0].offset;
-        tex.width  = RS.texs[0].width;
-        tex.height = RS.texs[0].height;
-        tex.pitch  = RS.texs[0].pitch;
-        tex.color  = RS.texs[0].color;
-        tex.addr_u = RS.texs[0].addr_u;
-        tex.addr_v = RS.texs[0].addr_v;
-        tex.levels = RS.texs[0].pitch ? 1 : RS.texs[0].levels;
-        tex.filter = RS.texs[0].filter;
+        backend_stage(0, &tex);
         batch.texture = &tex;
+    }
+    batch.vertices_ex = s_bverts_ex;
+    batch.kind = kind;
+    batch.textured = textured && RS.texs[0].valid;
+    batch.use_rc = (uint32_t)rc_enabled();
+    batch.rc = &RS.rc;
+    batch.clip_plane_mode = RS.clip_plane_mode;
+    /* FOG_COLOR is R in bits 0-7, the reverse of a D3DCOLOR. */
+    nv2a_rc_unpack(s_gpu.fog_color, batch.fog_color);
+    {
+        float r = batch.fog_color[2];
+        batch.fog_color[2] = batch.fog_color[0];
+        batch.fog_color[0] = r;
+    }
+    for (st = 0; st < 4; st++) {
+        backend_stage(st, &batch.stages[st]);
+        if (RS.texs[st].valid)
+            batch.stage_valid |= 1u << st;
     }
     s_backend->draw(&surf, &batch);
     s_gpu.tris_drawn += s_bcount / 3;
@@ -2003,6 +2113,8 @@ static void raster_indexed(uint32_t i0, uint32_t i1, uint32_t i2, uint32_t argb)
         if (!o)
             return;
         for (k = 0; k < 3; k++) {
+            Nv2aVertexEx *e = &s_bverts_ex[s_bcount + k];
+
             o[k].x = p[k][0];
             o[k].y = p[k][1];
             o[k].z = p[k][2];
@@ -2010,9 +2122,20 @@ static void raster_indexed(uint32_t i0, uint32_t i1, uint32_t i2, uint32_t argb)
             o[k].diffuse = vertex_color(ix[k]);
             o[k].u = textured ? uv[k][0] : 0.0f;
             o[k].v = textured ? uv[k][1] : 0.0f;
+            memset(e, 0, sizeof *e);
+            e->x = o[k].x;
+            e->y = o[k].y;
+            e->z = o[k].z;
+            e->rhw = o[k].rhw;
+            nv2a_rc_unpack(o[k].diffuse, e->d0);
+            e->fog = 1.0f;
+            e->tex[0][0] = o[k].u;
+            e->tex[0][1] = o[k].v;
+            e->tex[0][3] = 1.0f;
         }
         s_bcount += 3;
-        return;
+        if (!backend_shadow())
+            return;
     }
     raster_triangle(p[0], p[1], p[2], argb,
                     textured ? (const float (*)[2])uv : NULL);
@@ -2144,6 +2267,25 @@ static uint32_t tex_face_stride(const Texture *t)
                        : lw * lh * tex_texel_bytes(t->color);
     }
     return (total + 127u) & ~127u;
+}
+
+/* For a back end's texture cache: the bytes level 0 spans, over every face. */
+uint32_t nv2a_backend_texture_bytes(const Nv2aTexture *tex)
+{
+    Texture t;
+    uint32_t bytes, block;
+
+    backend_texture(tex, &t);
+    block = d3d8_format_dxt_block_bytes(t.color);
+    if (!tex_size_from_format(t.color))
+        bytes = t.pitch * t.height;
+    else if (block)
+        bytes = ((t.width + 3) / 4) * ((t.height + 3) / 4) * block;
+    else
+        bytes = t.width * t.height * tex_texel_bytes(t.color);
+    if (t.cube)                          /* faces are a whole stride apart */
+        bytes += 5 * tex_face_stride(&t);
+    return bytes;
 }
 
 /* One texel at normalised (swizzled/DXT) or texel (linear) coordinates, as
@@ -2618,6 +2760,8 @@ void nv2a_pb_exec_sync(void)
 {
     xf_queue_flush();
     pipe_drain();
+    if (s_backend && s_backend->sync)
+        s_backend->sync(NV2A_BACKEND_SYNC_SCAN_END);
 }
 
 static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
@@ -2629,15 +2773,12 @@ static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
     const float *a, *b, *c;
     float area, su = 1.0f, sv = 1.0f;
     int k;
-    static int no_rc = -1;
 
-    if (no_rc < 0)
-        no_rc = getenv("RECOMP_NO_COMBINERS") != NULL;
     memset(&T, 0, sizeof T);
     T.mem = (uint8_t *)xbox_GetMemoryOffset();
     T.bpp = surface_bpp();
     T.textured = RS.texs[0].valid && !s_xf_no_tex;
-    T.use_rc = s_gpu.rc_seen && !no_rc;
+    T.use_rc = rc_enabled();
     T.va = va; T.vb = vb; T.vc = vc;
 
     v[0] = va; v[1] = vb; v[2] = vc;
@@ -2662,7 +2803,8 @@ static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
             backend_from_xf(vc, &o[2]);
             s_bcount += 3;
         }
-        return;
+        if (!backend_shadow())
+            return;
     }
     for (k = 0; k < 3; k++) {
         if (!s_gpu.xf_seeded)
@@ -3009,7 +3151,7 @@ static void raster_batch_program(void)
     /* The batch's triangles, all at once (see xf_queue_push). */
     xf_queue_flush();
     if (backend_draws())
-        backend_flush(!s_xf_no_tex);
+        backend_flush(!s_xf_no_tex, NV2A_BATCH_XF);
 }
 
 static void raster_batch(void)
@@ -3087,7 +3229,7 @@ static void raster_batch(void)
         break;                             /* points and lines: not yet */
     }
     if (backend_draws())
-        backend_flush(textured);
+        backend_flush(textured, NV2A_BATCH_SCREEN);
 
     if (s_gpu.tris_drawn && (s_gpu.tris_drawn % 500) == 0)
         fprintf(stderr, "  [GPU] %u triangles rasterised\n", s_gpu.tris_drawn);
@@ -3102,6 +3244,8 @@ static void raster_batch(void)
     if (s_gpu.tris_drawn != before && s_drawn_dumps < FB_DUMP_AFTER_DRAW
         && !s_flip_dumping) {
         s_drawn_dumps++;
+        if (s_backend && s_backend->sync)
+            s_backend->sync(NV2A_BACKEND_SYNC_READ);
         dump_surface_bmp();
     }
 }
@@ -3599,6 +3743,8 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
 
     if (s_pipe.head != s_pipe.drained && pipe_method_syncs(subch, method))
         pipe_drain();
+    if (s_backend && s_backend->sync && pipe_method_syncs(subch, method))
+        s_backend->sync(NV2A_BACKEND_SYNC_METHOD);
     /* BACK_END_WRITE_SEMAPHORE_RELEASE. The title's pointer already names the
      * semaphore word; SET_SEMAPHORE_OFFSET is not added (in X-Men Legends it
      * held 0xFF000000 at times, which put the write outside guest memory). */
@@ -3767,6 +3913,8 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
     case 0x09C0: memcpy(&s_gpu.fog_param[0], &param, 4); break;
     case 0x09C4: memcpy(&s_gpu.fog_param[1], &param, 4); break;
     case 0x17C8:                                  /* CLEAR_REPORT_VALUE */
+        if (s_backend && s_backend->report && !s_backend->shadow)
+            (void)s_backend->report();            /* drop what it counted so far */
         s_gpu.zpass_count = 0;
         break;
     case 0x17CC:                                  /* SET_ZPASS_PIXEL_COUNT_ENABLE */
@@ -3783,6 +3931,8 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         uint8_t *mem = (uint8_t *)xbox_GetMemoryOffset();
         uint32_t at = dma_resolve(param & 0x00FFFFFFu);
         uint64_t stamp = (uint64_t)s_gpu.reports++ * 1000u;
+        if (s_backend && s_backend->report && !s_backend->shadow)
+            s_gpu.zpass_count += s_backend->report();
         memcpy(mem + at, &stamp, 8);
         memcpy(mem + at + 8, &s_gpu.zpass_count, 4);
         memset(mem + at + 12, 0, 4);
@@ -3803,7 +3953,8 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
                     param, s_gpu.color_offset, RS.clip_w, RS.clip_h,
                     s_gpu.clear_color, 10);
         clear_surface(param);
-        if (param & 0x01)                         /* Z */
+        if ((param & 0x01)                        /* Z */
+            && (!backend_draws() || backend_shadow()))
             zbuf_clear();
         break;
 
@@ -4263,8 +4414,11 @@ void nv2a_pb_exec_report(void)
             s_gpu.min_x, s_gpu.max_x, s_gpu.min_y, s_gpu.max_y);
     /* One picture per report rather than per clear: a title clears hundreds of
      * times a second and nobody wants that many files. */
-    if (!s_flip_dumping)
+    if (!s_flip_dumping) {
+        if (s_backend && s_backend->sync)
+            s_backend->sync(NV2A_BACKEND_SYNC_READ);
         dump_surface_bmp();
+    }
 
     /* Drawn and skipped separately: "nothing appeared" and "every batch needed
      * a vertex program we do not run" look identical on screen, and only one

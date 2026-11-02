@@ -11,6 +11,7 @@ if(WIN32)
         d3d8_states.c
         d3d8_combiners.c
         d3d8_vsh.c
+        nv2a_gpu_d3d11.c        # RECOMP_GPU_RASTER: NV2A rasterisation on D3D11
     )
     target_link_libraries(xbox_d3d8 PUBLIC platform d3d11 dxgi dxguid d3dcompiler)
 

@@ -20,14 +20,24 @@
  * so a back end only ever sees surface pixels. Blend, depth, alpha, cull and
  * stencil state arrive in Nv2aRenderState.
  *
- * ponytail: register-combiner state and texture stages 1-3 are not passed on:
- * a back end sees stage 0 and the diffuse colour. Extend Nv2aBatch when that
- * matters rather than adding callbacks.
+ * Register-combiner state, all four texture stages, the specular colour (d1)
+ * and the per-vertex fog factor arrive too: Nv2aBatch.vertices_ex carries every
+ * interpolant the executor's own pixel path reads, Nv2aBatch.rc the raw
+ * combiner words, and Nv2aBatch.stages the four stage textures. A back end
+ * that only needs stage 0 and the diffuse colour keeps reading
+ * Nv2aBatch.vertices and Nv2aBatch.texture as before.
+ *
+ * A back end that draws somewhere other than guest RAM writes its colour
+ * surfaces back from sync(): the executor calls it wherever the title, the
+ * presenter or a dump may read what was drawn. report() hands over the
+ * visibility-test (occlusion) pixel count. shadow asks the executor to keep
+ * rasterising in software as well, for A/B comparison.
  */
 #ifndef NV2A_BACKEND_H
 #define NV2A_BACKEND_H
 
 #include <stdint.h>
+#include "nv2a_combiner.h"
 
 /* The colour surface being drawn into, in real (anti-aliased) pixels.
  * aa_sx/aa_sy give the anti-aliasing factor, so width/aa_sx is the logical
@@ -38,6 +48,7 @@ typedef struct {
     uint32_t pitch;             /* bytes per row */
     uint32_t bytes_per_pixel;   /* 2 or 4 */
     uint32_t aa_sx, aa_sy;      /* 1 or 2 each */
+    uint32_t clip_x, clip_y;    /* clip rectangle origin, real pixels */
 } Nv2aSurface;
 
 /* A texture as the title programmed it. uv in Nv2aVertex are in texels. */
@@ -51,6 +62,8 @@ typedef struct {
      * a linear texture) and the raw SET_TEXTURE_FILTER word (MIN in bits
      * 16-23). A back end that ignores them samples level 0. */
     uint32_t levels, filter;
+    uint32_t palette;           /* guest address of the CLUT (P8, colour 0x0B); 0: none */
+    uint32_t cube;              /* 1: six faces, tex_face_stride bytes apart */
 } Nv2aTexture;
 
 typedef struct {
@@ -80,14 +93,46 @@ typedef struct {
      * that ignores these draws that pass over the whole surface. */
     uint32_t stencil_enable, stencil_func, stencil_ref, stencil_func_mask;
     uint32_t stencil_write_mask, stencil_fail, stencil_zfail, stencil_zpass;
+    uint32_t zpass_enable;      /* SET_ZPASS_PIXEL_COUNT_ENABLE: count for report() */
+    uint32_t zeta_format;       /* (SURFACE_FORMAT>>4)&0xF: 1 Z16, 2 Z24S8 */
 } Nv2aRenderState;
+
+/* Every interpolant of one vertex, 128 bytes. x/y/z/rhw as in Nv2aVertex.
+ * d0/d1 are the diffuse and specular colours, r,g,b,a, not clamped. fog is
+ * the fog factor already through the fog unit (1 = no fog). tex holds each
+ * stage's coordinates as the program or fixed-function unit left them, not
+ * divided by w; on the screen-space path tex[0] holds the texel UVs. */
+typedef struct {
+    float x, y, z, rhw;
+    float d0[4], d1[4];
+    float fog;
+    float pad[3];
+    float tex[4][4];
+} Nv2aVertexEx;
+
+#define NV2A_BATCH_SCREEN 0     /* pre-transformed: flat colour, texel replaces it */
+#define NV2A_BATCH_XF     1     /* program / fixed-function: depth, combiners */
 
 typedef struct {
     const Nv2aVertex  *vertices;    /* triangle list: count is a multiple of 3 */
     uint32_t           count;
     const Nv2aTexture *texture;     /* NULL: untextured */
     const Nv2aRenderState *state;
+    const Nv2aVertexEx *vertices_ex;/* the same triangles, every interpolant */
+    uint32_t           kind;        /* NV2A_BATCH_SCREEN / NV2A_BATCH_XF */
+    uint32_t           use_rc;      /* the combiners decide the colour */
+    uint32_t           textured;    /* stage 0 is sampled (no-combiner paths) */
+    const Nv2aCombiner *rc;         /* raw combiner words */
+    Nv2aTexture        stages[4];   /* each stage's texture ... */
+    uint32_t           stage_valid; /* ... usable when bit i is set */
+    uint32_t           clip_plane_mode; /* SET_SHADER_CLIP_PLANE_MODE */
+    float              fog_color[4];/* r,g,b,a */
 } Nv2aBatch;
+
+/* sync() reasons. */
+#define NV2A_BACKEND_SYNC_METHOD   0   /* a method that reads or orders the GPU */
+#define NV2A_BACKEND_SYNC_SCAN_END 1   /* a pushbuffer scan ends (before DMA_GET) */
+#define NV2A_BACKEND_SYNC_READ     2   /* the executor reads a surface (dumps) */
 
 typedef struct {
     /* flags: CLEAR_SURFACE bits (Z 0x1, stencil 0x2, colour 0xF0).
@@ -96,6 +141,13 @@ typedef struct {
                   uint32_t flags, uint32_t argb, uint32_t zstencil);
     void (*draw)(const Nv2aSurface *s, const Nv2aBatch *b);
     void (*flip)(void);
+    /* Make guest RAM hold what was drawn so far (colour surfaces). */
+    void (*sync)(uint32_t reason);
+    /* Samples that passed the depth test with zpass_enable set, since the
+     * previous call. Blocks until the GPU has them. */
+    uint32_t (*report)(void);
+    /* Non-zero: the executor also rasterises in software, into guest RAM. */
+    int shadow;
 } Nv2aBackend;
 
 /* Register (or, with NULL, remove) the back end. Call before the title starts
@@ -106,6 +158,18 @@ void nv2a_backend_register(const Nv2aBackend *backend);
  * Handles every format the executor can sample (swizzled, linear, DXT).
  * Returns 0 if the format is not supported. */
 int nv2a_backend_decode_texture(const Nv2aTexture *tex, uint32_t *argb_out);
+
+/* The same for one face of a cube (face 0..5; 0 for a plain texture), with the
+ * palette of a P8 texture. */
+int nv2a_backend_decode_texture_face(const Nv2aTexture *tex, uint32_t face,
+                                     uint32_t *argb_out);
+
+/* Bytes level 0 spans in guest memory, over all faces of a cube. */
+uint32_t nv2a_backend_texture_bytes(const Nv2aTexture *tex);
+
+/* Whether [va, va+bytes) is guest memory a surface may be read from and
+ * written to: not the title's image, not a thread stack, not outside RAM. */
+int nv2a_backend_surface_ok(uint32_t va, uint32_t bytes);
 
 /* Where BACK_END_WRITE_SEMAPHORE_RELEASE (0x1D70) values land: the guest VA
  * of the semaphore the title reads GPU progress from (for XDK D3D, the
