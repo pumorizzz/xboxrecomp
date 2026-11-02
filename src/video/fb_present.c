@@ -34,6 +34,21 @@
 extern ptrdiff_t xbox_GetMemoryOffset(void);
 
 static volatile LONG s_fb_running;
+/* The window, once open, for a presenter that draws into it itself (the D3D11
+ * render back end puts a swap chain on it). While s_fb_external is set this
+ * thread keeps the title, keyboard and close button and stops blitting. */
+static HWND          s_fb_hwnd;
+static volatile LONG s_fb_external;
+
+void *xbox_FramebufferWindowHandle(void)
+{
+    return s_fb_running ? (void *)s_fb_hwnd : NULL;
+}
+
+void xbox_FramebufferWindowExternal(int on)
+{
+    InterlockedExchange(&s_fb_external, on ? 1 : 0);
+}
 static uint32_t      s_fb_va, s_fb_pitch, s_fb_width = 640, s_fb_height = 480;
 static uint32_t     *s_rgb;           /* converted 32-bit copy for GDI */
 
@@ -302,6 +317,7 @@ static DWORD WINAPI fb_thread(LPVOID unused)
         InterlockedExchange(&s_fb_running, 0);
         return 0;
     }
+    s_fb_hwnd = hwnd;
     hdc = GetDC(hwnd);
 
     memset(&bi, 0, sizeof(bi));
@@ -323,7 +339,9 @@ static DWORD WINAPI fb_thread(LPVOID unused)
             TranslateMessage(&msg);
             DispatchMessageA(&msg);
         }
-        if (s_present_idx >= 0 && s_rgb) {
+        if (s_fb_external) {
+            /* Somebody else presents into this window. */
+        } else if (s_present_idx >= 0 && s_rgb) {
             /* A finished frame, published by the flip. Copied into s_rgb so
              * the dump path and GDI see one consistent image even if the
              * next flip lands mid-blit. */

@@ -228,6 +228,10 @@ Four optional members let a back end draw somewhere other than guest RAM:
 - `sync_surface(va, bytes)`: at `FLIP_STALL`, just before the presenter reads
   guest RAM, the surface it presents. Without it the executor calls
   `sync(NV2A_BACKEND_SYNC_PRESENT)`.
+- `present(va, pitch, aa_sy)`: at `FLIP_STALL`, show the presented surface
+  without guest RAM. When it returns 1 the executor neither syncs the surface
+  for the presenter nor copies it to the framebuffer window (the flip dumps
+  still get a `NV2A_BACKEND_SYNC_READ` first).
 - `report()`: the visibility-test pixel count since the previous call, added
   to what `GET_REPORT` writes; `CLEAR_REPORT_VALUE` discards it.
 - `shadow`: the executor keeps rasterising in software as well, into guest RAM,
@@ -277,9 +281,33 @@ RTX 3080 Ti that took the back end from 46 to 66-67 fps (software path
 | and lazy writeback (all dirty targets at a flip) | 66 | 1,980 (2.5 GB) | 1.9 s |
 | and only the presented surface at a flip | 67 | 1,340 (1.7 GB) | 1.8 s |
 
-What is left is the presented frame itself: about 1.3 ms of `Map` per
-writeback. Reading it a flip later from a ring of staging textures did not
-change that (1.6 s per 10 s, same fps), so it is not in the tree.
+Two more steps took the readback out of the frame altogether:
+
+- **Presenting from the GPU.** With a framebuffer window (`RECOMP_FB_WINDOW`)
+  the back end puts a swap chain on it and draws the presented target into
+  the back buffer (640x480, every other pixel of a 2x-wide anti-aliased
+  surface, as the GDI path takes them); `fb_present.c` keeps the title bar,
+  the keyboard and the close button and stops blitting
+  (`xbox_FramebufferWindowHandle`, `xbox_FramebufferWindowExternal`).
+  Headless there is nothing to show, so nothing is read back. Reading the
+  frame a flip later from a ring of staging textures had not helped (1.6 s
+  per 10 s, same fps); not reading it at all does.
+- **Swizzled views of a target.** Fallout draws its HUD into a linear
+  512x128 target and samples it as swizzled A8R8G8B8. The back end now reads
+  texel (u,v) as dword `swizzle_offset(u,v)` of the target on the GPU, which is
+  what the software sampler reads from guest RAM; before, every such draw
+  wrote the target back first (two GPU round trips a frame, 1.3 s per 10 s).
+
+| Step | Carbon fps | writebacks / 10 s | readback stall / 10 s |
+|---|---|---|---|
+| presented surface written back at each flip (pass 3) | 66 | 1,330 | 1.8 s |
+| present from the GPU, swizzled HUD target read on the GPU | 71-77 | 5 | 0.07 s |
+
+The fps line counts with `RECOMP_FPS_LIMIT=200` (the cap is 60 by default; a
+completely uncapped run spins the menus at 2,000 flips per second and the
+scripted start press misses them). By the Ruby/bar area in Carbon the back end
+went from 39-41 to 43-45 fps; what remains there is CPU work, not the back
+end (no writebacks, 0.1 s of stall per 10 s).
 
 **Compare and far-reaching triangles.** The executor clips at the near plane
 at w = 1e-3 and hands over screen positions, so a triangle that crosses the
@@ -304,6 +332,8 @@ frames Carbon compares at 0.00–0.02%.
 | `RECOMP_FFP_TRACE` | composite matrix and sample vertices of the first fixed-function batches |
 | `RECOMP_GPU_RASTER` | rasterise on the GPU through the D3D11 back end (`src/d3d/nv2a_gpu_d3d11.c`), once the game project calls `nv2a_gpu_d3d11_install()`: `1` a hardware adapter (WARP if none), `warp` the WARP adapter, `compare` the software path draws and the GPU draws alongside, printing per flip how far they differ and how many far-reaching triangles the frame had (`<RECOMP_FB_DUMP>gpu_/sw_<flip>_<surface>.bmp` for the first frames that differ by more than 1%). Unset or `0`: off |
 | `RECOMP_GPU_RASTER_SYNC=all` | the D3D11 back end writes its surfaces back at every executor sync, not only when they are read (for a title whose CPU reads what the GPU drew) |
+| `RECOMP_GPU_RASTER_PRESENT=0` | the D3D11 back end leaves the framebuffer window to GDI and guest RAM (the presented surface is written back at every flip) |
+| `RECOMP_GPU_RASTER_PRESENT_DUMP=<prefix>` | every `RECOMP_GPU_RASTER_PRESENT_DUMP_EVERY`-th (default 30) presented frame as `<prefix>NNNNNN.bmp`, 640x480 as the window shows it, HUD and menus included |
 | `RECOMP_GPU_RASTER_RTTEX=0` | the D3D11 back end reads every texture through guest RAM, render targets included |
 | `RECOMP_FFP_FLIP_NORMALS` | light the side of a fixed-function mesh that faces the viewer, even when the title left two-sided lighting off. Not hardware behaviour: a compatibility option for a game project to turn on, off by default |
 

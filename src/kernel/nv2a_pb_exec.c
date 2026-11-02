@@ -3790,6 +3790,7 @@ static void tex_stage_method(uint32_t method, uint32_t param)
 void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
 {
     static int inited;
+    int shown;                     /* FLIP_STALL: the back end showed the frame */
 
     if (s_pipe.head != s_pipe.drained && pipe_method_syncs(subch, method))
         pipe_drain();
@@ -4106,18 +4107,27 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         /* And this is a completed swap, which is what a title's own swap
          * counter counts -- see xbox_Nv2aFrameCounterFlip. */
         xbox_Nv2aFrameCounterFlip();
-        /* A back end that draws elsewhere puts the frame into guest RAM now:
-         * the presenter and the flip dumps below read it from there -- the
-         * surface the last batches drew into, as they choose it. */
-        if (s_backend && s_backend->sync_surface) {
+        /* A back end that draws elsewhere either shows the frame itself
+         * (present) or puts it into guest RAM now: the presenter and the flip
+         * dumps below read it from there -- the surface the last batches drew
+         * into, as they choose it. */
+        shown = 0;
+        if (s_backend) {
             uint32_t done = s_gpu.drawn_offset ? s_gpu.drawn_offset : s_gpu.color_offset;
             uint32_t rows = s_gpu.drawn_offset ? s_gpu.drawn_y + s_gpu.drawn_h
                                                : RS.clip_y + RS.clip_h;
             uint32_t pitch = s_gpu.drawn_offset ? s_gpu.drawn_pitch : RS.pitch;
-            if (done && pitch)
-                s_backend->sync_surface(dma_resolve(done), rows * pitch);
-        } else if (s_backend && s_backend->sync) {
-            s_backend->sync(NV2A_BACKEND_SYNC_PRESENT);
+            if (s_backend->present && done && pitch)
+                shown = s_backend->present(dma_resolve(done), pitch,
+                                           s_gpu.aa_sy > 1.5f ? 2 : 1);
+            if (shown)
+                ;
+            else if (s_backend->sync_surface) {
+                if (done && pitch)
+                    s_backend->sync_surface(dma_resolve(done), rows * pitch);
+            } else if (s_backend->sync) {
+                s_backend->sync(NV2A_BACKEND_SYNC_PRESENT);
+            }
         }
         /* Hand the window a copy of the frame just finished.
          *
@@ -4142,7 +4152,8 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
             if (done) {
                 xbox_FramebufferWindowSet(dma_resolve(done), pitch);
                 xbox_FramebufferWindowSetAA(s_gpu.aa_sy > 1.5f ? 2 : 1);
-                xbox_FramebufferWindowPresent(dma_resolve(done), pitch);
+                if (!shown)
+                    xbox_FramebufferWindowPresent(dma_resolve(done), pitch);
             }
         }
         {
@@ -4162,6 +4173,8 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
                     if (f) { fclose(f); on = 1; }
                 }
                 s_flip_dumping = on;
+                if (on && shown && s_backend->sync)
+                    s_backend->sync(NV2A_BACKEND_SYNC_READ);   /* not in guest RAM yet */
                 if (on)
                     dump_surface_bmp();
             }

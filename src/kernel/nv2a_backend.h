@@ -153,6 +153,12 @@ typedef struct {
      * into [va, va+bytes) -- the surface a flip is about to present. Without
      * it the executor calls sync(NV2A_BACKEND_SYNC_PRESENT). */
     void (*sync_surface)(uint32_t va, uint32_t bytes);
+    /* Optional: show the frame a flip presents -- the surface at `va` with
+     * `pitch`, aa_sy 1 or 2 as for xbox_FramebufferWindowSetAA -- without
+     * guest RAM. Returns 1 when the back end took care of it (presented it
+     * itself, or there is nothing to present to); the executor then neither
+     * writes the frame back for the presenter nor copies it to the window. */
+    int (*present)(uint32_t va, uint32_t pitch, uint32_t aa_sy);
 } Nv2aBackend;
 
 /* Register (or, with NULL, remove) the back end. Call before the title starts

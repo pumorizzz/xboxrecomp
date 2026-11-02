@@ -62,6 +62,8 @@
 #include "nv2a_gpu_d3d11.h"
 
 extern ptrdiff_t xbox_GetMemoryOffset(void);
+extern void *xbox_FramebufferWindowHandle(void);       /* src/video/fb_present.c */
+extern void xbox_FramebufferWindowExternal(int on);
 
 #define RT_W 1280                       /* = NV_ZBUF_W in nv2a_pb_exec.c */
 #define RT_H 1024                       /* = NV_ZBUF_H */
@@ -141,11 +143,28 @@ static const char s_hlsl[] =
 "    if (mode == 1) { int r = c - (c / n) * n; return r < 0 ? r + n : r; }\n"
 "    return clamp(c, 0, n - 1);\n"
 "}\n"
+/* swizzle_offset (d3d8_swizzle.h): x and y bits interleaved, the larger
+ * dimension carrying on alone once the smaller one runs out. */
+"uint swz(uint x, uint y, uint w, uint h) {\n"
+"    uint o = 0, bit = 1, mb = 1, k;\n"
+"    [loop] for (k = 0; k < 16 && (bit < w || bit < h); k++) {\n"
+"        if (bit < w) { if (x & bit) o |= mb; mb <<= 1; }\n"
+"        if (bit < h) { if (y & bit) o |= mb; mb <<= 1; }\n"
+"        bit <<= 1;\n"
+"    }\n"
+"    return o;\n"
+"}\n"
 "float4 texel_at(uint st, int x, int y, uint face) {\n"
 "    uint4 p = tex[st];\n"
 "    int w = (int)(p.x & 0xFFFF), h = (int)(p.x >> 16);\n"
-"    float4 c = load_st(st, wrapc(x, w, p.y & 0xFF) + (int)(p.w & 0xFFFF),\n"
-"                       wrapc(y, h, (p.y >> 8) & 0xFF) + (int)(p.w >> 16), face);\n"
+"    int u = wrapc(x, w, p.y & 0xFF), v = wrapc(y, h, (p.y >> 8) & 0xFF);\n"
+"    float4 c;\n"
+"    if (p.z & 32) {\n"           /* a render target read as a swizzled texture */
+"        uint i = swz((uint)u, (uint)v, (uint)w, (uint)h);\n"
+"        c = load_st(st, (int)(i % p.w), (int)(i / p.w), face);\n"
+"    } else {\n"
+"        c = load_st(st, u + (int)(p.w & 0xFFFF), v + (int)(p.w >> 16), face);\n"
+"    }\n"
 "    if (p.z & 16) c.a = 1.0;\n"   /* X8R8G8B8 read from a render target */
 "    return c;\n"
 "}\n"
@@ -372,6 +391,7 @@ typedef struct {
 #define TXF_CUBE   4u
 #define TXF_VALID  8u
 #define TXF_OPAQUE 16u                  /* alpha reads 1 (X8R8G8B8) */
+#define TXF_SWZ    32u                  /* swizzled view of a linear target: .w is its row */
 
 typedef struct {
     int used;
@@ -452,7 +472,8 @@ static uint32_t *s_scratch;             /* RT_W*RT_H texels: conversions, decode
 static size_t s_scratch_n;
 
 static struct {
-    uint32_t flips, draws, writebacks, uploads, decodes, rt_tex;
+    uint32_t flips, draws, writebacks, uploads, decodes, rt_tex, presents;
+    uint32_t wb_why[4];                 /* texture, dropped target, sync, present */
     uint64_t wb_bytes, up_bytes;
     double stall_ms;
     DWORD last_tick;
@@ -505,6 +526,20 @@ static int ranges_overlap(uint32_t a0, uint32_t a1, uint32_t b0, uint32_t b1)
 
 static uint32_t rt_row_bytes(const GpuRt *r) { return r->W * r->bpp; }
 static uint32_t rt_end(const GpuRt *r) { return r->va + r->H * r->pitch; }
+
+/* The guest bytes the dirty rectangle covers. A target's whole span is wider
+ * than what was drawn: Fallout's 512-wide HUD target reaches 464 rows down
+ * (one of its clips does), over the palettised icons it then samples, and
+ * testing the span wrote it back -- a GPU round trip -- for every icon. */
+static uint32_t rt_dirty_lo(const GpuRt *r)
+{
+    return r->va + r->dy0 * r->pitch + r->dx0 * r->bpp;
+}
+
+static uint32_t rt_dirty_hi(const GpuRt *r)
+{
+    return r->dy1 ? r->va + (r->dy1 - 1) * r->pitch + r->dx1 * r->bpp : r->va;
+}
 
 /* Guest rows [y0, y1) into the target and the shadow. */
 static void rt_upload_rows(GpuRt *r, uint32_t y0, uint32_t y1)
@@ -705,8 +740,10 @@ static GpuRt *rt_acquire(const Nv2aSurface *s)
         if (!o->used || o == r || !o->dirty)
             continue;
         if (ranges_overlap(o->va, rt_end(o), s->color_va, s->color_va + H * s->pitch)) {
-            if (!s_compare)             /* compare: guest RAM is the software path's */
+            if (!s_compare) {           /* compare: guest RAM is the software path's */
+                s_st.wb_why[1]++;
                 rt_writeback(o);
+            }
             rt_release(o);
             if (r)
                 r->epoch_checked = EPOCH_NONE;
@@ -722,8 +759,10 @@ static GpuRt *rt_acquire(const Nv2aSurface *s)
             for (i = 1; i < MAX_RTS; i++)
                 if (s_rt[i].last_use < victim->last_use)
                     victim = &s_rt[i];
-            if (!s_compare)
+            if (!s_compare) {
+                s_st.wb_why[1] += victim->dirty != 0;
                 rt_writeback(victim);
+            }
             rt_release(victim);
         }
         r = victim;
@@ -1336,24 +1375,42 @@ static int s_sync_all;                  /* RECOMP_GPU_RASTER_SYNC=all: write bac
  * not the surface being drawn (a target cannot be read and written at once).
  * `ox`/`oy`: where texel (0,0) sits in the target. */
 static GpuRt *rt_as_texture(const Nv2aTexture *t, const Nv2aSurface *dst,
-                            uint32_t *ox, uint32_t *oy)
+                            uint32_t *ox, uint32_t *oy, int *swz)
 {
     uint32_t i, off;
+    int sw = t->color == 0x06 || t->color == 0x07;
 
-    if (!s_rt_tex || (t->color != 0x12 && t->color != 0x1E) || !t->pitch || t->cube)
+    *swz = 0;
+    if (!s_rt_tex || t->cube)
+        return NULL;
+    if (!sw && ((t->color != 0x12 && t->color != 0x1E) || !t->pitch))
         return NULL;
     for (i = 0; i < MAX_RTS; i++) {
         GpuRt *r = &s_rt[i];
-        if (!r->used || r->bpp != 4 || r->pitch != t->pitch || t->offset < r->va
-            || t->offset >= rt_end(r))
+        if (!r->used || r->bpp != 4 || t->offset < r->va || t->offset >= rt_end(r))
             continue;
-        off = t->offset - r->va;
-        if ((off % r->pitch) % 4)
-            continue;
-        *oy = off / r->pitch;
-        *ox = (off % r->pitch) / 4;
-        if (*ox + t->width > r->W || *oy + t->height > r->H)
-            continue;
+        if (sw) {
+            /* A swizzled 32-bit texture over a target the executor draws
+             * linearly (Fallout's 512x128 HUD target, read back as
+             * A8R8G8B8): texel (u,v) is dword swizzle_offset(u,v) from the
+             * base, exactly as the software sampler reads guest RAM. */
+            uint32_t row = r->pitch / 4;
+            if (t->offset != r->va || !row
+                || ((uint64_t)t->width * t->height + row - 1) / row > r->H)
+                continue;
+            *ox = *oy = 0;
+            *swz = 1;
+        } else {
+            if (r->pitch != t->pitch)
+                continue;
+            off = t->offset - r->va;
+            if ((off % r->pitch) % 4)
+                continue;
+            *oy = off / r->pitch;
+            *ox = (off % r->pitch) / 4;
+            if (*ox + t->width > r->W || *oy + t->height > r->H)
+                continue;
+        }
         if (ranges_overlap(r->va, rt_end(r), dst->color_va,
                            dst->color_va + (dst->clip_y + dst->height) * dst->pitch))
             return NULL;                /* the surface being drawn: via guest RAM */
@@ -1415,14 +1472,19 @@ static void gpu_draw(const Nv2aSurface *s, const Nv2aBatch *b)
         const Nv2aTexture *t = &b->stages[st];
         uint32_t mag = (t->filter >> 24) & 0xF, min = (t->filter >> 16) & 0xFF, fl = 0;
         uint32_t ox = 0, oy = 0;
+        int swz = 0;
         GpuRt *src = NULL;
         srv[st] = NULL;
         if (need & (1u << st)) {
-            src = rt_as_texture(t, s, &ox, &oy);
+            src = rt_as_texture(t, s, &ox, &oy, &swz);
             if (src) {
                 srv[st] = src->srv;
-                if (t->color == 0x1E)
+                if (t->color == 0x1E || t->color == 0x07)
                     fl |= TXF_OPAQUE;
+                if (swz) {
+                    fl |= TXF_SWZ;
+                    ox = src->pitch / 4;        /* .w: the target's row, in texels */
+                }
                 s_st.rt_tex++;
             } else {
                 /* A texture drawn earlier into a target goes back to guest
@@ -1431,8 +1493,12 @@ static void gpu_draw(const Nv2aSurface *s, const Nv2aBatch *b)
                 if (!s_compare)
                     for (i = 0; i < MAX_RTS; i++)
                         if (s_rt[i].used && s_rt[i].dirty
-                            && ranges_overlap(s_rt[i].va, rt_end(&s_rt[i]), lo, hi))
+                            && ranges_overlap(rt_dirty_lo(&s_rt[i]), rt_dirty_hi(&s_rt[i]),
+                                              lo, hi))
+                        {
+                            s_st.wb_why[0]++;
                             rt_writeback(&s_rt[i]);
+                        }
                 srv[st] = tex_resolve(t);
             }
         }
@@ -1449,7 +1515,7 @@ static void gpu_draw(const Nv2aSurface *s, const Nv2aBatch *b)
         pc.tex[st][0] = (t->width & 0xFFFF) | ((t->height & 0xFFFF) << 16);
         pc.tex[st][1] = (t->addr_u & 0xFF) | ((t->addr_v & 0xFF) << 8);
         pc.tex[st][2] = fl;
-        pc.tex[st][3] = (ox & 0xFFFF) | ((oy & 0xFFFF) << 16);
+        pc.tex[st][3] = swz ? ox : (ox & 0xFFFF) | ((oy & 0xFFFF) << 16);
     }
     if (b->rc) {
         memcpy(pc.cicw, b->rc->color_icw, sizeof pc.cicw);
@@ -1570,8 +1636,10 @@ static void gpu_sync(uint32_t reason)
     if (s_sync_all || reason == NV2A_BACKEND_SYNC_READ
         || reason == NV2A_BACKEND_SYNC_PRESENT)
         for (i = 0; i < MAX_RTS; i++)
-            if (s_rt[i].used && s_rt[i].dirty)
+            if (s_rt[i].used && s_rt[i].dirty) {
+                s_st.wb_why[2]++;
                 rt_writeback(&s_rt[i]);
+            }
     if (reason == NV2A_BACKEND_SYNC_SCAN_END || reason == NV2A_BACKEND_SYNC_METHOD)
         s_epoch++;
 }
@@ -1585,8 +1653,10 @@ static void gpu_sync_surface(uint32_t va, uint32_t bytes)
         return;
     for (i = 0; i < MAX_RTS; i++)
         if (s_rt[i].used && s_rt[i].dirty
-            && ranges_overlap(s_rt[i].va, rt_end(&s_rt[i]), va, va + bytes))
+            && ranges_overlap(s_rt[i].va, rt_end(&s_rt[i]), va, va + bytes)) {
+            s_st.wb_why[3]++;
             rt_writeback(&s_rt[i]);
+        }
 }
 
 static uint32_t gpu_report(void)
@@ -1752,11 +1822,14 @@ static void gpu_flip(void)
     if (now - s_st.last_tick >= 10000) {
         fprintf(stderr, "[GPURAST] %.1fs: flips %u, draws %u, writebacks %u (%.1f MB),"
                         " guest->rt uploads %u (%.1f MB), tex decodes %u,"
-                        " rt as texture %u, readback stall ms %.1f\n",
+                        " rt as texture %u, GPU presents %u, readback stall ms %.1f"
+                        " (writebacks for: textures %u, dropped targets %u, syncs %u,"
+                        " presents %u)\n",
                 (double)(now - s_st.last_tick) / 1000.0, s_st.flips, s_st.draws,
                 s_st.writebacks, (double)s_st.wb_bytes / 1048576.0,
                 s_st.uploads, (double)s_st.up_bytes / 1048576.0,
-                s_st.decodes, s_st.rt_tex, s_st.stall_ms);
+                s_st.decodes, s_st.rt_tex, s_st.presents, s_st.stall_ms,
+                s_st.wb_why[0], s_st.wb_why[1], s_st.wb_why[2], s_st.wb_why[3]);
         memset(&s_st, 0, sizeof s_st);
         s_st.last_tick = now;
     }
@@ -1765,6 +1838,7 @@ static void gpu_flip(void)
 /* ---- install ------------------------------------------------------------ */
 
 static Nv2aBackend s_be;
+static void present_release(void);
 
 static void release_all(void)
 {
@@ -1789,6 +1863,7 @@ static void release_all(void)
     s_qfree = 0;
     REL(s_white_srv);
     REL(s_white);
+    present_release();
     REL(s_staging);
     REL(s_rast);
     REL(s_cb_ps);
@@ -1801,10 +1876,34 @@ static void release_all(void)
     REL(s_dev);
 }
 
-static ID3DBlob *compile(const char *entry, const char *target)
+/* The state the rasteriser never changes; the presenter puts it back. */
+static void bind_pipeline(void)
+{
+    UINT stride = VTX_BYTES, offset = 0;
+    ID3D11Buffer *cbs[2];
+    D3D11_VIEWPORT vp;
+
+    ID3D11DeviceContext_IASetInputLayout(s_ctx, s_il);
+    ID3D11DeviceContext_IASetPrimitiveTopology(s_ctx, D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    ID3D11DeviceContext_IASetVertexBuffers(s_ctx, 0, 1, &s_vb, &stride, &offset);
+    ID3D11DeviceContext_VSSetShader(s_ctx, s_vs, NULL, 0);
+    ID3D11DeviceContext_PSSetShader(s_ctx, s_ps, NULL, 0);
+    cbs[0] = s_cb_vs;
+    cbs[1] = s_cb_ps;
+    ID3D11DeviceContext_VSSetConstantBuffers(s_ctx, 0, 2, cbs);
+    ID3D11DeviceContext_PSSetConstantBuffers(s_ctx, 0, 2, cbs);
+    ID3D11DeviceContext_RSSetState(s_ctx, s_rast);
+    vp.TopLeftX = 0; vp.TopLeftY = 0;
+    vp.Width = (float)RT_W; vp.Height = (float)RT_H;
+    vp.MinDepth = 0.0f; vp.MaxDepth = 1.0f;
+    ID3D11DeviceContext_RSSetViewports(s_ctx, 1, &vp);
+}
+
+static ID3DBlob *compile_src(const char *src, size_t len, const char *entry,
+                             const char *target)
 {
     ID3DBlob *code = NULL, *err = NULL;
-    HRESULT hr = D3DCompile(s_hlsl, sizeof s_hlsl - 1, "nv2a_gpu_d3d11", NULL, NULL,
+    HRESULT hr = D3DCompile(src, len, "nv2a_gpu_d3d11", NULL, NULL,
                             entry, target, D3DCOMPILE_OPTIMIZATION_LEVEL3, 0,
                             &code, &err);
     if (FAILED(hr)) {
@@ -1815,6 +1914,238 @@ static ID3DBlob *compile(const char *entry, const char *target)
     }
     REL(err);
     return code;
+}
+
+static ID3DBlob *compile(const char *entry, const char *target)
+{
+    return compile_src(s_hlsl, sizeof s_hlsl - 1, entry, target);
+}
+
+/* ---- presenting from the GPU --------------------------------------------
+ *
+ * The framebuffer window (src/video/fb_present.c, RECOMP_FB_WINDOW) shows
+ * frames with GDI from guest RAM, which with this back end meant reading the
+ * presented frame back from the GPU at every flip. Instead a swap chain goes
+ * on that window and the presented target is drawn into its back buffer
+ * directly: 640x480 like the GDI window, every other pixel of a 2x-wide
+ * anti-aliased surface and every aa_sy-th row, as fb_present takes them.
+ * The window thread keeps the title bar, the keyboard and the close button.
+ * Without a window there is nothing to show, so nothing is read back at all.
+ * The frame reaches guest RAM only when something reads it there (the
+ * executor's dumps, a texture decoded from it, a target being dropped).
+ * RECOMP_GPU_RASTER_PRESENT=0 keeps the window on GDI and guest RAM. The
+ * swap chain is created the way upstream gpu_present.c (MIT) creates its
+ * own; Present runs on this thread, the window's messages on its own. */
+#define PRESENT_W 640
+#define PRESENT_H 480
+
+static const char s_present_hlsl[] =
+"Texture2DArray<float4> src : register(t0);\n"
+"cbuffer P : register(b2) { float4 pk; };\n"     /* source pixels per window pixel */
+"float4 pvs(uint i : SV_VertexID) : SV_Position {\n"
+"    float2 q = float2((i << 1) & 2, i & 2);\n"
+"    return float4(q * float2(2, -2) + float2(-1, 1), 0, 1);\n"
+"}\n"
+"float4 pps(float4 p : SV_Position) : SV_Target {\n"
+"    int2 c = int2(floor(p.xy) * pk.xy);\n"
+"    return float4(src.Load(int4(c, 0, 0)).rgb, 1.0);\n"
+"}\n";
+
+static int s_present_on = 1, s_present_failed;
+static void write_bmp(const char *path, const uint32_t *argb, uint32_t w, uint32_t h);
+
+/* RECOMP_GPU_RASTER_PRESENT_DUMP=<prefix>: every RECOMP_GPU_RASTER_PRESENT_DUMP_EVERY-th
+ * present (default 30) as <prefix>NNNNNN.bmp, 640x480 as the window shows it --
+ * HUD, menus and dialogs included, which the executor's own dump (the largest
+ * surface drawn) leaves out when a title composes into a second surface. */
+static void present_dump(GpuRt *r, uint32_t sx, uint32_t sy)
+{
+    static const char *prefix = (const char *)-1;
+    static int every;
+    static uint32_t n;
+    D3D11_BOX box;
+    D3D11_MAPPED_SUBRESOURCE m;
+    uint32_t *buf, x, y, w = PRESENT_W * sx, h = PRESENT_H * sy;
+    char path[512];
+
+    if (prefix == (const char *)-1) {
+        const char *e = getenv("RECOMP_GPU_RASTER_PRESENT_DUMP_EVERY");
+        prefix = getenv("RECOMP_GPU_RASTER_PRESENT_DUMP");
+        every = e ? atoi(e) : 30;
+        if (every < 1)
+            every = 1;
+    }
+    if (!prefix || (n++ % (uint32_t)every) != 0)
+        return;
+    if (w > r->W) w = r->W;
+    if (h > r->H) h = r->H;
+    box.left = 0; box.top = 0; box.right = w; box.bottom = h; box.front = 0; box.back = 1;
+    ID3D11DeviceContext_CopySubresourceRegion(s_ctx, (ID3D11Resource *)s_staging, 0, 0, 0, 0,
+                                              (ID3D11Resource *)r->tex, 0, &box);
+    if (FAILED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)s_staging, 0,
+                                       D3D11_MAP_READ, 0, &m)))
+        return;
+    buf = (uint32_t *)malloc((size_t)PRESENT_W * PRESENT_H * 4);
+    if (buf) {
+        for (y = 0; y < PRESENT_H; y++)
+            for (x = 0; x < PRESENT_W; x++) {
+                uint32_t px = x * sx, py = y * sy;
+                buf[(size_t)y * PRESENT_W + x] = (px < w && py < h)
+                    ? ((const uint32_t *)((const uint8_t *)m.pData + (size_t)py * m.RowPitch))[px]
+                    : 0;
+            }
+        snprintf(path, sizeof path, "%s%06u.bmp", prefix, n - 1);
+        write_bmp(path, buf, PRESENT_W, PRESENT_H);
+        free(buf);
+    }
+    ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)s_staging, 0);
+}
+static IDXGISwapChain *s_chain;
+static ID3D11RenderTargetView *s_bb_rtv;
+static ID3D11VertexShader *s_pvs;
+static ID3D11PixelShader *s_pps;
+static ID3D11Buffer *s_cb_present;
+
+static int present_setup(HWND hwnd)
+{
+    DXGI_SWAP_CHAIN_DESC sd;
+    D3D11_BUFFER_DESC bd;
+    IDXGIDevice *xd = NULL;
+    IDXGIAdapter *xa = NULL;
+    IDXGIFactory *xf = NULL;
+    ID3D11Texture2D *back = NULL;
+    ID3DBlob *vs = NULL, *ps = NULL;
+    int ok = 0;
+
+    if (FAILED(ID3D11Device_QueryInterface(s_dev, &IID_IDXGIDevice, (void **)&xd))
+        || FAILED(IDXGIDevice_GetAdapter(xd, &xa))
+        || FAILED(IDXGIAdapter_GetParent(xa, &IID_IDXGIFactory, (void **)&xf)))
+        goto done;
+    memset(&sd, 0, sizeof sd);
+    sd.BufferDesc.Width = PRESENT_W;
+    sd.BufferDesc.Height = PRESENT_H;
+    sd.BufferDesc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    sd.SampleDesc.Count = 1;
+    sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+    sd.BufferCount = 1;
+    sd.OutputWindow = hwnd;
+    sd.Windowed = TRUE;
+    sd.SwapEffect = DXGI_SWAP_EFFECT_DISCARD;
+    if (FAILED(IDXGIFactory_CreateSwapChain(xf, (IUnknown *)s_dev, &sd, &s_chain)))
+        goto done;
+    IDXGIFactory_MakeWindowAssociation(xf, hwnd, DXGI_MWA_NO_ALT_ENTER);
+    if (FAILED(IDXGISwapChain_GetBuffer(s_chain, 0, &IID_ID3D11Texture2D, (void **)&back))
+        || FAILED(ID3D11Device_CreateRenderTargetView(s_dev, (ID3D11Resource *)back, NULL,
+                                                      &s_bb_rtv)))
+        goto done;
+    vs = compile_src(s_present_hlsl, sizeof s_present_hlsl - 1, "pvs", "vs_4_0");
+    ps = compile_src(s_present_hlsl, sizeof s_present_hlsl - 1, "pps", "ps_4_0");
+    if (!vs || !ps
+        || FAILED(ID3D11Device_CreateVertexShader(s_dev, ID3D10Blob_GetBufferPointer(vs),
+                                                  ID3D10Blob_GetBufferSize(vs), NULL, &s_pvs))
+        || FAILED(ID3D11Device_CreatePixelShader(s_dev, ID3D10Blob_GetBufferPointer(ps),
+                                                 ID3D10Blob_GetBufferSize(ps), NULL, &s_pps)))
+        goto done;
+    memset(&bd, 0, sizeof bd);
+    bd.ByteWidth = 16;
+    bd.Usage = D3D11_USAGE_DYNAMIC;
+    bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+    bd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+    if (FAILED(ID3D11Device_CreateBuffer(s_dev, &bd, NULL, &s_cb_present)))
+        goto done;
+    ok = 1;
+    fprintf(stderr, "[GPURAST] presenting into the framebuffer window from the GPU\n");
+done:
+    REL(back);
+    REL(vs);
+    REL(ps);
+    REL(xf);
+    REL(xa);
+    REL(xd);
+    return ok;
+}
+
+static void present_release(void)
+{
+    REL(s_cb_present);
+    REL(s_pps);
+    REL(s_pvs);
+    REL(s_bb_rtv);
+    REL(s_chain);
+}
+
+static int gpu_present(uint32_t va, uint32_t pitch, uint32_t aa_sy)
+{
+    static const float zero[4] = { 0, 0, 0, 0 };
+    D3D11_MAPPED_SUBRESOURCE m;
+    D3D11_VIEWPORT vp;
+    D3D11_RECT rc;
+    GpuRt *r = NULL;
+    HWND hwnd;
+    float pk[4];
+    int i;
+
+    if (s_compare || !s_present_on || s_present_failed)
+        return 0;
+    for (i = 0; i < MAX_RTS; i++)
+        if (s_rt[i].used && s_rt[i].va == va && s_rt[i].pitch == pitch) {
+            r = &s_rt[i];
+            break;
+        }
+    if (!r) {                           /* not drawn here: the guest RAM path */
+        if (s_chain)
+            xbox_FramebufferWindowExternal(0);
+        return 0;
+    }
+    hwnd = (HWND)xbox_FramebufferWindowHandle();
+    if (!hwnd) {                        /* headless: nothing to show to */
+        if (getenv("RECOMP_FB_WINDOW"))
+            return 0;
+        if (rt_check(r)) {
+            uint32_t sx = pitch / (PRESENT_W * r->bpp);
+            present_dump(r, sx ? sx : 1, aa_sy ? aa_sy : 1);
+        }
+        return 1;
+    }
+    if (!s_chain && !present_setup(hwnd)) {
+        fprintf(stderr, "[GPURAST] no swap chain on the window; presenting through"
+                        " guest RAM\n");
+        present_release();
+        s_present_failed = 1;
+        return 0;
+    }
+    if (!rt_check(r))                   /* clean: catch up with CPU writes first */
+        return 0;
+    xbox_FramebufferWindowExternal(1);
+    pk[0] = (float)(pitch / (PRESENT_W * r->bpp) ? pitch / (PRESENT_W * r->bpp) : 1);
+    pk[1] = (float)(aa_sy ? aa_sy : 1);
+    pk[2] = pk[3] = 0.0f;
+    if (SUCCEEDED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)s_cb_present, 0,
+                                          D3D11_MAP_WRITE_DISCARD, 0, &m))) {
+        memcpy(m.pData, pk, sizeof pk);
+        ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)s_cb_present, 0);
+    }
+    vp.TopLeftX = 0; vp.TopLeftY = 0;
+    vp.Width = (float)PRESENT_W; vp.Height = (float)PRESENT_H;
+    vp.MinDepth = 0.0f; vp.MaxDepth = 1.0f;
+    rc.left = 0; rc.top = 0; rc.right = PRESENT_W; rc.bottom = PRESENT_H;
+    ID3D11DeviceContext_OMSetRenderTargets(s_ctx, 1, &s_bb_rtv, NULL);
+    ID3D11DeviceContext_OMSetBlendState(s_ctx,
+        blend_state(0, 0, 0, 0, D3D11_COLOR_WRITE_ENABLE_ALL), zero, 0xFFFFFFFFu);
+    ID3D11DeviceContext_OMSetDepthStencilState(s_ctx, NULL, 0);
+    ID3D11DeviceContext_RSSetViewports(s_ctx, 1, &vp);
+    ID3D11DeviceContext_RSSetScissorRects(s_ctx, 1, &rc);
+    ID3D11DeviceContext_IASetInputLayout(s_ctx, NULL);
+    ID3D11DeviceContext_VSSetShader(s_ctx, s_pvs, NULL, 0);
+    ID3D11DeviceContext_PSSetShader(s_ctx, s_pps, NULL, 0);
+    ID3D11DeviceContext_PSSetConstantBuffers(s_ctx, 2, 1, &s_cb_present);
+    ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 1, &r->srv);
+    ID3D11DeviceContext_Draw(s_ctx, 3, 0);
+    IDXGISwapChain_Present(s_chain, 0, 0);
+    present_dump(r, (uint32_t)pk[0], (uint32_t)pk[1]);
+    bind_pipeline();
+    s_st.presents++;
+    return 1;
 }
 
 static int create_pipeline(void)
@@ -1835,10 +2166,7 @@ static int create_pipeline(void)
     D3D11_TEXTURE2D_DESC td;
     D3D11_SHADER_RESOURCE_VIEW_DESC vd;
     D3D11_SUBRESOURCE_DATA sd;
-    D3D11_VIEWPORT vp;
     static const uint32_t white = 0xFFFFFFFFu;
-    UINT stride = VTX_BYTES, offset = 0;
-    ID3D11Buffer *cbs[2];
     int ok = 0;
 
     if (!vs)
@@ -1905,21 +2233,7 @@ static int create_pipeline(void)
                                                         &vd, &s_white_srv)))
         goto done;
 
-    /* The state that never changes. */
-    ID3D11DeviceContext_IASetInputLayout(s_ctx, s_il);
-    ID3D11DeviceContext_IASetPrimitiveTopology(s_ctx, D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-    ID3D11DeviceContext_IASetVertexBuffers(s_ctx, 0, 1, &s_vb, &stride, &offset);
-    ID3D11DeviceContext_VSSetShader(s_ctx, s_vs, NULL, 0);
-    ID3D11DeviceContext_PSSetShader(s_ctx, s_ps, NULL, 0);
-    cbs[0] = s_cb_vs;
-    cbs[1] = s_cb_ps;
-    ID3D11DeviceContext_VSSetConstantBuffers(s_ctx, 0, 2, cbs);
-    ID3D11DeviceContext_PSSetConstantBuffers(s_ctx, 0, 2, cbs);
-    ID3D11DeviceContext_RSSetState(s_ctx, s_rast);
-    vp.TopLeftX = 0; vp.TopLeftY = 0;
-    vp.Width = (float)RT_W; vp.Height = (float)RT_H;
-    vp.MinDepth = 0.0f; vp.MaxDepth = 1.0f;
-    ID3D11DeviceContext_RSSetViewports(s_ctx, 1, &vp);
+    bind_pipeline();
     ok = 1;
 done:
     REL(vs);
@@ -1949,6 +2263,8 @@ int nv2a_gpu_d3d11_install(void)
         const char *sy = getenv("RECOMP_GPU_RASTER_SYNC");
         s_rt_tex = !(rt && strcmp(rt, "0") == 0);
         s_sync_all = sy && strcmp(sy, "all") == 0;
+        s_present_on = !(getenv("RECOMP_GPU_RASTER_PRESENT")
+                         && strcmp(getenv("RECOMP_GPU_RASTER_PRESENT"), "0") == 0);
     }
     type = strcmp(e, "warp") == 0 ? D3D_DRIVER_TYPE_WARP : D3D_DRIVER_TYPE_HARDWARE;
     QueryPerformanceFrequency(&f);
@@ -1991,6 +2307,7 @@ int nv2a_gpu_d3d11_install(void)
     s_be.report = gpu_report;
     s_be.shadow = s_compare;
     s_be.sync_surface = s_sync_all ? NULL : gpu_sync_surface;
+    s_be.present = gpu_present;
     nv2a_backend_register(&s_be);
     fprintf(stderr, "[GPURAST] D3D11 back end on: %ls, FL %u_%u%s\n", ad.Description,
             ((unsigned)fl >> 12) & 0xF, ((unsigned)fl >> 8) & 0xF,
