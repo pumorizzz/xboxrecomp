@@ -358,11 +358,9 @@ typedef struct {
     uint32_t depth_test, depth_func, depth_mask;
     uint32_t zpass_enable;
     /* SET_CLIP_MIN/MAX: a pixel whose window z falls outside is not drawn
-     * (zclip_on only when the title set a real range). This is what takes
-     * off the part of a triangle in front of the near plane: the executor
-     * clips at w = 1e-3, and what lies between there and the near plane
-     * comes out with z far below the minimum -- drawn, it is the needles and
-     * slabs fanning out from whatever the camera is close to. */
+     * (zclip_on only when the title set a real range). raster_xf_clipped
+     * also cuts triangles at the minimum plane, so this mostly catches what
+     * rounding leaves over. */
     float    zclip_min, zclip_max;
     int      zclip_on;
     uint32_t blend_enable, blend_sfactor, blend_dfactor;

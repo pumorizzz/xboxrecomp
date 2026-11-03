@@ -247,11 +247,12 @@ of the code here:
 
 - **Window z is compared as it is.** `SET_CLIP_MIN`/`MAX` only clip -- a pixel
   whose window z falls outside them is not drawn, on the executor's own
-  rasteriser and in the D3D11 back end alike. That is also what takes off the
-  part of a triangle in front of the near plane: the executor clips at
-  w = 1e-3, and what lies between there and the near plane comes out with z
-  far below the minimum; drawn, it fans needles and slabs out from whatever
-  the camera is close to. A title
+  rasteriser and in the D3D11 back end alike. The executor also clips each
+  triangle at the `SET_CLIP_MIN` plane in clip space before handing it on,
+  so a back end never gets the part in front of the near plane: cut only at
+  w = 1e-3, that part reached 1e5 pixels and more off the surface, and the
+  GPU drew slivers of it as needles and slabs fanning out from whatever the
+  camera was close to (`tests/nv2a_near_clip`). A title
   narrows the range for a low-detail layer so it is cut off near the eye; a back
   end that rescales each draw's z over its own range makes that layer about 237
   times deeper (the figure from that back end's title) and puts it in front of
