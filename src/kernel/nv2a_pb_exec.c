@@ -357,6 +357,14 @@ typedef struct {
     uint32_t color_mask;        /* SET_COLOR_MASK: A<<24 R<<16 G<<8 B */
     uint32_t depth_test, depth_func, depth_mask;
     uint32_t zpass_enable;
+    /* SET_CLIP_MIN/MAX: a pixel whose window z falls outside is not drawn
+     * (zclip_on only when the title set a real range). This is what takes
+     * off the part of a triangle in front of the near plane: the executor
+     * clips at w = 1e-3, and what lies between there and the near plane
+     * comes out with z far below the minimum -- drawn, it is the needles and
+     * slabs fanning out from whatever the camera is close to. */
+    float    zclip_min, zclip_max;
+    int      zclip_on;
     uint32_t blend_enable, blend_sfactor, blend_dfactor;
     uint32_t blend_equation, blend_color;
 } RasterState;
@@ -2467,6 +2475,8 @@ static void xf_rows(const XfTri *T, int y0, int step, XfCount *cnt)
                 /* Depth test, then shade, then alpha test, and only then the
                  * depth write: an alpha-tested texel that is cut away must
                  * not leave its depth behind (foliage, fences). */
+                if (RS.zclip_on && (z < RS.zclip_min || z > RS.zclip_max))
+                    continue;
                 if (zp && RS.depth_test && !depth_pass(z, *zp)) {
                     cnt->depth_fail++;
                     continue;
@@ -3016,11 +3026,43 @@ static void raster_batch_program(void)
 {
     uint32_t i, n = s_gpu.idx_count;
 
+    RS.zclip_min = reg_f(0x0394);                  /* SET_CLIP_MIN */
+    RS.zclip_max = reg_f(0x0398);                  /* SET_CLIP_MAX */
+    RS.zclip_on = RS.zclip_max > RS.zclip_min;
+
     if (!s_xf && !(s_xf = (Nv2aVshOutput *)calloc(NV_MAX_INDICES, sizeof *s_xf)))
         return;
-    for (i = 0; i < n; i++)
-        if (!transform_vertex(s_gpu.idx[i], &s_xf[i]))
-            return;                                    /* no program loaded */
+    {
+        /* A vertex an index list names twice is transformed once: what it
+         * comes out as depends only on its attributes, which the index picks,
+         * and on constants that stay put for the batch -- unless the program
+         * writes constants itself. Indexed meshes name most vertices several
+         * times, and the vertex program interpreter was most of the
+         * executor's time in a 3D scene. */
+#define XF_VCACHE 4096
+        static struct { uint32_t idx, pos, gen; } vc[XF_VCACHE];
+        static uint32_t gen;
+        int reuse = !(batch_uses_program() && nv2a_vsh_writes_constants());
+
+        if (++gen == 0) {                      /* wrapped: forget everything */
+            memset(vc, 0, sizeof vc);
+            gen = 1;
+        }
+        for (i = 0; i < n; i++) {
+            uint32_t ix = s_gpu.idx[i];
+            uint32_t slot = (ix * 2654435761u) >> 20;
+            if (reuse && vc[slot].gen == gen && vc[slot].idx == ix) {
+                s_xf[i] = s_xf[vc[slot].pos];
+                continue;
+            }
+            if (!transform_vertex(ix, &s_xf[i]))
+                return;                                /* no program loaded */
+            vc[slot].idx = ix;
+            vc[slot].pos = i;
+            vc[slot].gen = gen;
+        }
+#undef XF_VCACHE
+    }
     xf_set_viewport();
     {
         const VertexAttr *tc = texcoord_attr();

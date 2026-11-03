@@ -63,6 +63,42 @@ int main(void)
                o.pos[0], o.pos[1], o.pos[2], o.pos[3]);
         return 1;
     }
+
+    /* The interpreter decodes a program once and reuses the decode: a program
+     * changed after a run -- the title uploading the next shader into the
+     * same slots -- must run as changed, by either upload path. Here the
+     * final mad loses its c[59] offset (c[60] is zero). */
+    {
+        const float c60[4] = {0, 0, 0, 0};
+        uint32_t j2[4];
+        int k;
+
+        nv2a_vsh_set_constant(60, c60);
+        for (k = 0; k < 4; k++)
+            j2[k] = i2[k];
+        j2[1] = (4u << 21) | (60u << 13);
+        nv2a_vsh_set_instruction(2, j2);
+        if (!nv2a_vsh_run((const float (*)[4])in, &o) || fabsf(o.pos[0] - 160) > 1e-3f) {
+            printf("FAIL: after set_instruction pos.x %g, want 160\n", o.pos[0]);
+            return 1;
+        }
+        /* Back to c[59] through the word-by-word upload (PROGRAM_LOAD). */
+        nv2a_vsh_set_load_slot(2);
+        for (k = 0; k < 4; k++)
+            nv2a_vsh_program_word(i2[k]);
+        if (!nv2a_vsh_run((const float (*)[4])in, &o) || fabsf(o.pos[0] - 480) > 1e-3f) {
+            printf("FAIL: after program words pos.x %g, want 480\n", o.pos[0]);
+            return 1;
+        }
+        /* A new start slot runs from there: from slot 2 alone, R12 is 0 and
+         * the mad gives c[59]. */
+        nv2a_vsh_set_start_slot(2);
+        if (!nv2a_vsh_run((const float (*)[4])in, &o) || fabsf(o.pos[0] - 320) > 1e-3f) {
+            printf("FAIL: from start slot 2 pos.x %g, want 320\n", o.pos[0]);
+            return 1;
+        }
+        nv2a_vsh_set_start_slot(0);
+    }
     puts("ok");
     return 0;
 }

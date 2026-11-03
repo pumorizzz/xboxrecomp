@@ -245,7 +245,13 @@ written against this interface for one title; that back end is not in this
 tree, so treat them as advice from one implementation, not as tested behaviour
 of the code here:
 
-- **Window z is compared as it is.** `SET_CLIP_MIN`/`MAX` only clip. A title
+- **Window z is compared as it is.** `SET_CLIP_MIN`/`MAX` only clip -- a pixel
+  whose window z falls outside them is not drawn, on the executor's own
+  rasteriser and in the D3D11 back end alike. That is also what takes off the
+  part of a triangle in front of the near plane: the executor clips at
+  w = 1e-3, and what lies between there and the near plane comes out with z
+  far below the minimum; drawn, it fans needles and slabs out from whatever
+  the camera is close to. A title
   narrows the range for a low-detail layer so it is cut off near the eye; a back
   end that rescales each draw's z over its own range makes that layer about 237
   times deeper (the figure from that back end's title) and puts it in front of
@@ -306,8 +312,14 @@ Two more steps took the readback out of the frame altogether:
 The fps line counts with `RECOMP_FPS_LIMIT=200` (the cap is 60 by default; a
 completely uncapped run spins the menus at 2,000 flips per second and the
 scripted start press misses them). By the Ruby/bar area in Carbon the back end
-went from 39-41 to 43-45 fps; what remains there is CPU work, not the back
-end (no writebacks, 0.1 s of stall per 10 s).
+went from 39-41 to 43-45 fps; what remained there was CPU work: the executor
+thread spent about 80% of its time in the vertex-program interpreter. Two
+exact changes took that down: the interpreter decodes a program once (a
+program word, an instruction or the start slot marks the decode stale)
+instead of extracting every field of every instruction for every vertex, and
+a batch transforms each vertex its index list names once, reusing the result
+for repeats (not when the program writes constants). Same-session A/B with
+`RECOMP_FPS_LIMIT=200`: Carbon spawn 77 -> 146 fps, the Ruby/bar spot 43 -> 98.
 
 **Compare and far-reaching triangles.** The executor clips at the near plane
 at w = 1e-3 and hands over screen positions, so a triangle that crosses the

@@ -91,6 +91,7 @@ static const char s_hlsl[] =
 "    uint4 at;\n"             /* alpha_func, alpha_ref, stage_valid, kind */
 "    float4 fogc;\n"
 "    uint4 tex[4];\n"         /* w | h<<16, addr_u | addr_v<<8, flags, origin x | y<<16 */
+"    float4 zr;\n"           /* SET_CLIP_MIN, SET_CLIP_MAX (window z) */
 "};\n"
 "Texture2DArray<float4> T0 : register(t0);\n"
 "Texture2DArray<float4> T1 : register(t1);\n"
@@ -110,6 +111,7 @@ static const char s_hlsl[] =
 "    noperspective float fog : FOG;\n"
 "    nointerpolation float4 fc : COLOR2;\n"
 "    noperspective float zn : ZRANGE;\n"   /* z / zmax, unclamped, screen-linear */
+"    noperspective float zw : ZWINDOW;\n"  /* window z as the title produced it */
 "    float4 t0 : TEXCOORD0; float4 t1 : TEXCOORD1;\n"
 "    float4 t2 : TEXCOORD2; float4 t3 : TEXCOORD3;\n"
 "};\n"
@@ -124,6 +126,7 @@ static const char s_hlsl[] =
 "    o.pos = float4(ndc * w, w);\n"
 "    o.d0 = i.d0; o.d1 = i.d1; o.fog = i.fog; o.fc = i.d0;\n"
 "    o.zn = i.pos.z * vsc.x;\n"
+"    o.zw = i.pos.z;\n"
 "    o.t0 = i.t0; o.t1 = i.t1; o.t2 = i.t2; o.t3 = i.t3;\n"
 "    return o;\n"
 "}\n"
@@ -347,6 +350,8 @@ static const char s_hlsl[] =
  * buffer can hold; D3D clamps it to 1.0 first, where LEQUAL against a
  * cleared buffer passes. Near-plane-clipped triangles reach far beyond. */
 "    if ((fl & 8) && i.zn > 1.0000005) discard;\n"
+/* SET_CLIP_MIN/MAX, as the executor's own rasteriser applies them. */
+"    if ((fl & 64) && (i.zw < zr.x || i.zw > zr.y)) discard;\n"
 "    if (fl & 1) {\n"               /* register combiners */
 "        float4 t0, t1, t2, t3;\n"
 "        if (!stage_fetch(0, i.t0, t0)) discard;\n"
@@ -378,6 +383,7 @@ typedef struct {
     uint32_t fin[4], ctl[4], at[4];
     float    fogc[4];
     uint32_t tex[4][4];
+    float    zr[4];
 } PsConsts;
 
 /* ctl[3] flags */
@@ -385,6 +391,7 @@ typedef struct {
 #define PSF_TEXTURED  2u
 #define PSF_ALPHATEST 4u
 #define PSF_ZFAR_FAIL 8u                /* depth test LESS/EQUAL/LEQUAL: z > zmax fails */
+#define PSF_ZCLIP     64u               /* window z outside SET_CLIP_MIN/MAX is not drawn */
 /* tex[i][2] flags */
 #define TXF_NORM   1u
 #define TXF_BILIN  2u
@@ -1535,7 +1542,10 @@ static void gpu_draw(const Nv2aSurface *s, const Nv2aBatch *b)
     pc.ctl[3] = (xf && b->use_rc ? PSF_RC : 0u) | (b->textured ? PSF_TEXTURED : 0u)
               | (xf && rs->alpha_test_enable ? PSF_ALPHATEST : 0u)
               | (xf && z && rs->depth_test_enable && rs->depth_func >= 0x201
-                 && rs->depth_func <= 0x203 ? PSF_ZFAR_FAIL : 0u);
+                 && rs->depth_func <= 0x203 ? PSF_ZFAR_FAIL : 0u)
+              | (xf && rs->depth_max > rs->depth_min ? PSF_ZCLIP : 0u);
+    pc.zr[0] = rs->depth_min;
+    pc.zr[1] = rs->depth_max;
     pc.at[0] = rs->alpha_func;
     pc.at[1] = rs->alpha_ref;
     pc.at[2] = b->stage_valid;
