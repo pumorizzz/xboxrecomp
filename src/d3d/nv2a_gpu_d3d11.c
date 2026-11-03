@@ -50,6 +50,7 @@
 #include <d3d11.h>
 #include <dxgi.h>
 #include <d3dcompiler.h>
+#include <float.h>
 #include <math.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -1592,27 +1593,30 @@ static void gpu_draw(const Nv2aSurface *s, const Nv2aBatch *b)
     /* Dirty is what the triangles cover, not the whole clip: the bounding box
      * of the vertices, inside the scissor. */
     {
-        float bx0 = b->vertices_ex[0].x, by0 = b->vertices_ex[0].y;
-        float bx1 = bx0, by1 = by0;
+        /* A NaN vertex is skipped: compared against it, every test is false,
+         * and a batch whose first vertex was NaN left no dirty rectangle --
+         * what it drew never reached guest RAM (stippled floor tiles in the
+         * frame resolved from there). Bounds are clamped as floats, before a
+         * far-off coordinate is converted. */
+        float bx0 = FLT_MAX, by0 = FLT_MAX, bx1 = -FLT_MAX, by1 = -FLT_MAX;
         LONG gx0, gy0, gx1, gy1;
-        for (i = 1; i < b->count; i++) {
+        for (i = 0; i < b->count; i++) {
             const Nv2aVertexEx *v = &b->vertices_ex[i];
+            if (v->x != v->x || v->y != v->y)
+                continue;
             if (v->x < bx0) bx0 = v->x;
             if (v->x > bx1) bx1 = v->x;
             if (v->y < by0) by0 = v->y;
             if (v->y > by1) by1 = v->y;
         }
-        /* Compared as floats first: clipped vertices can be far outside. */
-        gx0 = bx0 <= (float)rc.left ? rc.left : (LONG)floorf(bx0);
-        gy0 = by0 <= (float)rc.top ? rc.top : (LONG)floorf(by0);
-        gx1 = bx1 >= (float)rc.right ? rc.right : (LONG)ceilf(bx1) + 1;
-        gy1 = by1 >= (float)rc.bottom ? rc.bottom : (LONG)ceilf(by1) + 1;
-        if (gx0 > rc.right) gx0 = rc.right;
-        if (gy0 > rc.bottom) gy0 = rc.bottom;
-        if (gx1 > rc.right) gx1 = rc.right;
-        if (gy1 > rc.bottom) gy1 = rc.bottom;
-        if (gx1 < gx0) gx1 = gx0;
-        if (gy1 < gy0) gy1 = gy0;
+        if (bx0 > bx1)                  /* nothing but NaN: nothing drawn */
+            bx0 = bx1 = (float)rc.left, by0 = by1 = (float)rc.top;
+        bx0 = floorf(bx0); by0 = floorf(by0);
+        bx1 = ceilf(bx1) + 1.0f; by1 = ceilf(by1) + 1.0f;
+        gx0 = bx0 <= (float)rc.left ? rc.left : bx0 >= (float)rc.right ? rc.right : (LONG)bx0;
+        gy0 = by0 <= (float)rc.top ? rc.top : by0 >= (float)rc.bottom ? rc.bottom : (LONG)by0;
+        gx1 = bx1 <= (float)gx0 ? gx0 : bx1 >= (float)rc.right ? rc.right : (LONG)bx1;
+        gy1 = by1 <= (float)gy0 ? gy0 : by1 >= (float)rc.bottom ? rc.bottom : (LONG)by1;
         rt_grow(r, (uint32_t)gx0, (uint32_t)gy0, (uint32_t)gx1, (uint32_t)gy1);
     }
     s_st.draws++;
