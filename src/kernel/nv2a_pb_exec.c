@@ -2918,49 +2918,88 @@ static void xf_lerp(const Nv2aVshOutput *a, const Nv2aVshOutput *b, float t,
         po[i] = pa[i] + (pb[i] - pa[i]) * t;
 }
 
+/* Signed distance to clip plane `pl` of a vertex already in clip space:
+ * 0 is w = NV_CLIP_W, 1 is the SET_CLIP_MIN plane. Window z is
+ * clip.z / w * k + o, so z >= min is clip.z * k + (o - min) * w >= 0 --
+ * linear in clip space, a plane like w. */
+static float xf_plane_dist(const Nv2aVshOutput *v, int pl)
+{
+    if (pl == 0)
+        return v->pos[3] - NV_CLIP_W;
+    return v->pos[2] * s_xf_k[2] + (s_xf_o[2] - RS.zclip_min) * v->pos[3];
+}
+
 static void raster_xf_clipped(const Nv2aVshOutput *a, const Nv2aVshOutput *b,
                               const Nv2aVshOutput *c)
 {
-    const Nv2aVshOutput *in[3];
-    Nv2aVshOutput poly[4], va, vb;
-    float k[3], o[3], ca[3], cb[3];
-    int n = 0, i, j;
+    Nv2aVshOutput buf[2][6];
+    float ca[3];
+    int n = 3, i, j, pl, cur = 0;
+    /* The near plane as well when the title set a depth range: what lies in
+     * front of it is not drawn anyway (xf_rows and the GPU back end discard
+     * it per pixel), and cut at w = NV_CLIP_W alone it reaches 1e5 pixels and
+     * more off screen, where neither rasteriser has the precision to keep
+     * its edges -- the needles and slabs by walls. Window z is linear in
+     * clip space only through w, so k[2] = 0 leaves it to w. */
+    int zplane = RS.zclip_on && s_xf_k[2] != 0.0f;
+    int need = 0;
 
-    if (a->pos[3] > NV_CLIP_W && b->pos[3] > NV_CLIP_W && c->pos[3] > NV_CLIP_W) {
-        raster_xf_triangle(a, b, c);
-        return;
-    }
-    if (a->pos[3] <= NV_CLIP_W && b->pos[3] <= NV_CLIP_W
-        && c->pos[3] <= NV_CLIP_W) {
-        s_gpu.tris_behind++;                  /* wholly behind: nothing */
-        return;
-    }
-    for (i = 0; i < 3; i++) { k[i] = s_xf_k[i]; o[i] = s_xf_o[i]; }
-    in[0] = a; in[1] = b; in[2] = c;
-    for (i = 0; i < 3; i++) {
-        const Nv2aVshOutput *p = in[i], *q = in[(i + 1) % 3];
-        int pin = p->pos[3] > NV_CLIP_W, qin = q->pos[3] > NV_CLIP_W;
-        if (pin) {
-            va = *p;
-            xf_to_clip(p, k, o, ca);
-            for (j = 0; j < 3; j++) va.pos[j] = ca[j];
-            poly[n++] = va;
+    {
+        const Nv2aVshOutput *in[3];
+        in[0] = a; in[1] = b; in[2] = c;
+        for (i = 0; i < 3; i++) {
+            if (in[i]->pos[3] <= NV_CLIP_W)
+                need |= 1;
+            /* In screen terms: (z - min) * w, the distance above times w. */
+            else if (zplane && in[i]->pos[2] < RS.zclip_min)
+                need |= 2;
         }
-        if (pin != qin) {
-            float t = (NV_CLIP_W - p->pos[3]) / (q->pos[3] - p->pos[3]);
-            va = *p; vb = *q;
-            xf_to_clip(p, k, o, ca);
-            xf_to_clip(q, k, o, cb);
-            for (j = 0; j < 3; j++) { va.pos[j] = ca[j]; vb.pos[j] = cb[j]; }
-            xf_lerp(&va, &vb, t, &poly[n++]);
+        if (!need) {
+            raster_xf_triangle(a, b, c);
+            return;
+        }
+        if (a->pos[3] <= NV_CLIP_W && b->pos[3] <= NV_CLIP_W
+            && c->pos[3] <= NV_CLIP_W) {
+            s_gpu.tris_behind++;              /* wholly behind: nothing */
+            return;
+        }
+        for (i = 0; i < 3; i++) {             /* to clip space */
+            buf[0][i] = *in[i];
+            xf_to_clip(in[i], s_xf_k, s_xf_o, ca);
+            for (j = 0; j < 3; j++)
+                buf[0][i].pos[j] = ca[j];
+        }
+    }
+    for (pl = 0; pl < 2; pl++) {
+        const Nv2aVshOutput *src = buf[cur];
+        Nv2aVshOutput *dst = buf[cur ^ 1];
+        int m = 0;
+        if (pl == 1 && !zplane)
+            break;
+        for (i = 0; i < n; i++) {
+            const Nv2aVshOutput *p = &src[i], *q = &src[(i + 1) % n];
+            float dp = xf_plane_dist(p, pl), dq = xf_plane_dist(q, pl);
+            int pin = pl == 0 ? dp > 0.0f : dp >= 0.0f;
+            int qin = pl == 0 ? dq > 0.0f : dq >= 0.0f;
+            if (pin)
+                dst[m++] = *p;
+            if (pin != qin)
+                xf_lerp(p, q, dp / (dp - dq), &dst[m++]);
+        }
+        n = m;
+        cur ^= 1;
+        if (n < 3) {
+            s_gpu.tris_behind++;
+            return;
         }
     }
     /* Back to screen space: divide by the (now positive) w, viewport. */
     for (i = 0; i < n; i++)
         for (j = 0; j < 3; j++)
-            poly[i].pos[j] = poly[i].pos[j] / poly[i].pos[3] * k[j] + o[j];
+            buf[cur][i].pos[j] = buf[cur][i].pos[j] / buf[cur][i].pos[3] * s_xf_k[j]
+                               + s_xf_o[j];
     for (i = 1; i + 1 < n; i++)
-        raster_xf_triangle(&poly[0], &poly[i], &poly[i + 1]);
+        raster_xf_triangle(&buf[cur][0], &buf[cur][i], &buf[cur][i + 1]);
 }
 
 /* About 7 MB, so allocated by the first batch that transforms rather than
