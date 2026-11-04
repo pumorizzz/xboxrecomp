@@ -40,7 +40,8 @@
  *
  * ponytail: one render-target size (1280x1024, the executor's depth-buffer
  * size); bigger surfaces are clamped. Level 0 only, no mip selection, as the
- * software path. Swizzled colour surfaces are not handled.
+ * software path. A swizzled colour surface is drawn linearly on the GPU and
+ * sampled as such (rt_as_texture); written back to guest RAM it stays linear.
  */
 #define COBJMACROS
 #ifndef WIN32_LEAN_AND_MEAN
@@ -404,6 +405,7 @@ typedef struct {
 typedef struct {
     int used;
     uint32_t va, pitch, bpp, W, H;
+    int swizzled;                       /* drawn as a swizzled surface (see rt_as_texture) */
     ID3D11Texture2D *tex;
     ID3D11RenderTargetView *rtv;
     ID3D11ShaderResourceView *srv;      /* the target sampled as a texture */
@@ -806,6 +808,7 @@ static GpuRt *rt_acquire(const Nv2aSurface *s)
         rt_upload_rows(r, r->H, H);
         r->H = H;
     }
+    r->swizzled = s->swizzled != 0;
     r->last_use = ++s_use_clock;
     if (!rt_check(r)) {
         if (!said_bad++)
@@ -1397,11 +1400,20 @@ static GpuRt *rt_as_texture(const Nv2aTexture *t, const Nv2aSurface *dst,
         GpuRt *r = &s_rt[i];
         if (!r->used || r->bpp != 4 || t->offset < r->va || t->offset >= rt_end(r))
             continue;
-        if (sw) {
-            /* A swizzled 32-bit texture over a target the executor draws
-             * linearly (Fallout's 512x128 HUD target, read back as
-             * A8R8G8B8): texel (u,v) is dword swizzle_offset(u,v) from the
-             * base, exactly as the software sampler reads guest RAM. */
+        if (sw && r->swizzled) {
+            /* A swizzled texture over a swizzled surface: the GPU stored
+             * pixel (x,y) where the texture reads texel (x,y), so the target
+             * is sampled as it is. Fallout's character shadows: points drawn
+             * into a 512x128 swizzled surface, then laid on the floor as a
+             * swizzled A8R8G8B8 texture. Read through the linear view below,
+             * the shadows came out as scattered dots. */
+            if (t->offset != r->va || t->width > r->W || t->height > r->H)
+                continue;
+            *ox = *oy = 0;
+        } else if (sw) {
+            /* A swizzled 32-bit texture over a target drawn as a linear
+             * (pitch) surface: texel (u,v) is dword swizzle_offset(u,v) from
+             * the base, exactly as the software sampler reads guest RAM. */
             uint32_t row = r->pitch / 4;
             if (t->offset != r->va || !row
                 || ((uint64_t)t->width * t->height + row - 1) / row > r->H)

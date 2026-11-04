@@ -13,6 +13,13 @@
  *     them Fallout's steam and other particles.
  *   - With SET_POLY_OFFSET_FILL_ENABLE a triangle whose depth rises by 1 per
  *     pixel across x moves by factor * 1 + units; without it, not at all.
+ *   - A surface whose SET_SURFACE_FORMAT type is 2 reaches the back end as
+ *     swizzled: Fallout draws its character shadows into one and samples it
+ *     as a swizzled texture, which a back end must read pixel for pixel.
+ *   - A vertex program input with no array reads its current value, the
+ *     last SET_VERTEX_DATA4F_M: mov oD0, v3 with v3's array off gives the
+ *     colour written there. It used to read 0,0,0,1, which drew Fallout's
+ *     green radioactive liquid opaque black.
  *
  * Harness as tests/nv2a_near_clip. */
 #include <math.h>
@@ -58,6 +65,7 @@ static void mf(uint32_t method, float f) { m(method, f2u(f)); }
 static struct {
     uint32_t n;
     Nv2aVertexEx v[MAX_V];
+    uint32_t swizzled;                  /* the surface of the last draw */
 } s_be;
 
 static void be_clear(const Nv2aSurface *s, const Nv2aRenderState *rs,
@@ -69,7 +77,7 @@ static void be_clear(const Nv2aSurface *s, const Nv2aRenderState *rs,
 static void be_draw(const Nv2aSurface *s, const Nv2aBatch *b)
 {
     uint32_t i;
-    (void)s;
+    s_be.swizzled = s->swizzled;
     if (!b->vertices_ex)
         return;
     for (i = 0; i < b->count && s_be.n < MAX_V; i++)
@@ -187,6 +195,48 @@ int main(void)
     CHECK(s_be.n == 3);
     for (i = 0; i < s_be.n && i < 3; i++)
         CHECK(fabsf(s_be.v[i].z - TRI[i][2]) < 1e-3f);
+    CHECK(s_be.swizzled == 0);
+
+    /* The same triangle into a swizzled surface (type 2, 256 = 2^8 square). */
+    m(0x0208, 0x08080208);
+    draw(5, 3);
+    CHECK(s_be.n == 3 && s_be.swizzled == 1);
+    m(0x0208, 0x0008);
+
+    /* Program mode: mov oPos, v0 ; mov oD0, v3 (final), v3 without an array. */
+    {
+        static const uint32_t prog[2][4] = {
+            { 0, (1u << 21) | (0u << 9), 0, 0 },
+            { 0, (1u << 21) | (3u << 9), 0, 0 },
+        };
+        const float col[4] = { 0.0f, 0.25f, 0.0f, 0.375f };
+        uint32_t w[2][4];
+        int k, j;
+
+        memcpy(w, prog, sizeof w);
+        for (k = 0; k < 2; k++) {
+            w[k][1] |= 0x1Bu;                            /* A = v.xyzw */
+            w[k][2] |= 2u << 26;                         /* A mux: input */
+            w[k][3] |= (0xFu << 12) | (1u << 11);        /* o[] xyzw */
+        }
+        w[1][3] |= (3u << 3) | 1u;                       /* oD0, final */
+        m(0x1E9C, 0);                                    /* PROGRAM_LOAD 0 */
+        for (k = 0; k < 2; k++)
+            for (j = 0; j < 4; j++)
+                m(0x0B00 + 4u * (uint32_t)j, w[k][j]);
+        m(0x1EA0, 0);                                    /* PROGRAM_START 0 */
+        m(0x1E94, 2);                                    /* TRANSFORM_EXECUTION_MODE: program */
+        m(0x176C, 2 | (0 << 4) | (0 << 8));              /* attr 3: no array */
+        for (k = 0; k < 4; k++)
+            mf(0x1A30 + 4u * (uint32_t)k, col[k]);       /* SET_VERTEX_DATA4F_M(3) */
+        put_vertices(TRI, 3);
+        m(0x0338, 0);
+        draw(5, 3);
+        CHECK(s_be.n == 3);
+        for (i = 0; i < s_be.n && i < 3; i++)
+            CHECK(s_be.v[i].d0[0] == 0.0f && s_be.v[i].d0[1] == 0.25f
+                  && s_be.v[i].d0[2] == 0.0f && s_be.v[i].d0[3] == 0.375f);
+    }
 
     nv2a_backend_register(NULL);
     printf(s_fail ? "FAIL\n" : "PASS\n");

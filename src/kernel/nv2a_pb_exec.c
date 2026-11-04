@@ -834,6 +834,7 @@ static void current_surface(Nv2aSurface *out)
     out->aa_sy           = s_gpu.aa_sy > 1.5f ? 2 : 1;
     out->clip_x          = RS.clip_x;
     out->clip_y          = RS.clip_y;
+    out->swizzled        = ((s_gpu.format >> 8) & 0xFu) == 2u;
 }
 
 /* Render state in the NV2A's own values, gathered from what the executor
@@ -3063,8 +3064,15 @@ static int transform_vertex(uint32_t index, Nv2aVshOutput *out)
 
     if (!batch_uses_program())
         return ffp_vertex(index, out);
+    /* An input with no array reads its current value, the last
+     * SET_VERTEX_DATA* written to it (0,0,0,1 from reset). Fallout gives its
+     * radioactive liquid one colour for the whole mesh that way -- green at
+     * alpha 0.38 -- and read as 0,0,0,1 the liquid hid the pit's floor
+     * under opaque black. */
     for (a = 0; a < NV2A_VSH_INPUTS; a++)
-        fetch_attr(&s_gpu.attr[a], index, in[a]);   /* absent: 0,0,0,1 */
+        if (!fetch_attr(&s_gpu.attr[a], index, in[a])
+            && !(s_gpu.attr[a].size && s_gpu.attr[a].stride))
+            memcpy(in[a], s_gpu.imm_attr[a], sizeof in[a]);
     if (!nv2a_vsh_run((const float (*)[4])in, out))
         return 0;
     /* oPos.w == 0 comes from a program that never divided by w: x, y and z

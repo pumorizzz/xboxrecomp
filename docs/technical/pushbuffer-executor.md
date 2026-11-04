@@ -138,6 +138,16 @@ or specular.
   program multiplies unused lights' colours, which hold leftovers up to
   infinity, by a zero intensity; with IEEE NaN there, crates and robots came
   out saturated red. Dot products have no such rule.
+- **Current attribute values.** A vertex program input with no array
+  (`SET_VERTEX_DATA_ARRAY_FORMAT` size 0) reads the last `SET_VERTEX_DATA*`
+  written to it, not 0,0,0,1. Fallout colours its radioactive liquid that way.
+- **Swizzled surfaces.** `Nv2aSurface.swizzled` is set for a
+  `SET_SURFACE_FORMAT` of type 2. The D3D11 back end still draws such a
+  target linearly, and a swizzled texture over it reads pixel (u,v) directly;
+  over a pitch target it reads `swizzle_offset(u,v)`. Fallout's character
+  shadows are drawn into a 512x128 swizzled target this way. Written back to
+  guest RAM, the target stays linear; the software rasteriser does not draw
+  swizzled surfaces.
 
 ### Lighting
 

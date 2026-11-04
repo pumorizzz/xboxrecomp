@@ -49,6 +49,9 @@ typedef struct {
     uint32_t bytes_per_pixel;   /* 2 or 4 */
     uint32_t aa_sx, aa_sy;      /* 1 or 2 each */
     uint32_t clip_x, clip_y;    /* clip rectangle origin, real pixels */
+    uint32_t swizzled;          /* SET_SURFACE_FORMAT type 2: the GPU stores pixel
+                                 * (x,y) at swizzle_offset(x,y), so a swizzled
+                                 * texture over it reads texel (u,v) = pixel (u,v) */
 } Nv2aSurface;
 
 /* A texture as the title programmed it. uv in Nv2aVertex are in texels. */
