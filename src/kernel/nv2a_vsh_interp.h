@@ -35,6 +35,7 @@ typedef struct {
     float d0[4], d1[4];
     float fog[4];
     float tex[4][4];
+    float pts;                  /* oPts.x: point size in pixels, 0 if unwritten */
 } Nv2aVshOutput;
 
 void nv2a_vsh_set_load_slot(uint32_t slot);           /* _PROGRAM_LOAD      */

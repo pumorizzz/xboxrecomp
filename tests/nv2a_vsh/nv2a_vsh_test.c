@@ -99,6 +99,33 @@ int main(void)
         }
         nv2a_vsh_set_start_slot(0);
     }
+
+    /* A product with a zero factor is zero on the NV2A, even against
+     * infinity or NaN: mad oD0, v0, c[61], R0 with v0 = (0, 2, 0, 1),
+     * c[61] = (inf, 3, NaN, 0) and R0 still zero gives (0, 6, 0, 0).
+     * IEEE would give NaN in x and z -- Fallout's lighting program then
+     * coloured crates and robots saturated red. (One input register per
+     * instruction, so the addend is a temp.) */
+    {
+        uint32_t k3[4] = {0};
+        const float c61[4] = {INFINITY, 3.0f, NAN, 0.0f};
+        float vin[NV2A_VSH_INPUTS][4] = {{0}};
+
+        k3[1] = (4u << 21) | (61u << 13);
+        src(k3, 0, V, 0, XYZW); src(k3, 1, C, 0, XYZW); src(k3, 2, T, 0, XYZW);
+        k3[3] |= (0xFu << 12) | (1u << 11) | (3u << 3) | 1u;   /* oD0.xyzw, final */
+        nv2a_vsh_set_instruction(10, k3);
+        nv2a_vsh_set_constant(61, c61);
+        nv2a_vsh_set_start_slot(10);
+        vin[0][1] = 2.0f; vin[0][3] = 1.0f;
+        if (!nv2a_vsh_run((const float (*)[4])vin, &o)
+            || o.d0[0] != 0.0f || o.d0[1] != 6.0f || o.d0[2] != 0.0f || o.d0[3] != 0.0f) {
+            printf("FAIL: zero times inf/NaN: d0 %g %g %g %g, want 0 6 0 0\n",
+                   o.d0[0], o.d0[1], o.d0[2], o.d0[3]);
+            return 1;
+        }
+        nv2a_vsh_set_start_slot(0);
+    }
     puts("ok");
     return 0;
 }

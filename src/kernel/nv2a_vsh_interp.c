@@ -326,6 +326,17 @@ static vec4 splat(float f)
     return r;
 }
 
+/* MUL and MAD as the NV2A computes them: a product with a zero factor is
+ * zero, even against infinity or NaN (IEEE would give NaN). Fallout's
+ * lighting program multiplies the colours of unused lights, which hold leftover
+ * values up to infinity, by their zero intensity; with NaN there the red
+ * channel came out saturated and crates and training robots turned bright red.
+ * Dot products have no such rule. */
+static float mul_hw(float a, float b)
+{
+    return a == 0.0f || b == 0.0f ? 0.0f : a * b;
+}
+
 static vec4 run_mac(uint32_t op, vec4 a, vec4 b, vec4 c, int *a0)
 {
     vec4 r = a;
@@ -333,9 +344,9 @@ static vec4 run_mac(uint32_t op, vec4 a, vec4 b, vec4 c, int *a0)
 
     switch (op) {
     case 1: break;                                            /* mov */
-    case 2: for (i = 0; i < 4; i++) r.v[i] = a.v[i] * b.v[i]; break;
+    case 2: for (i = 0; i < 4; i++) r.v[i] = mul_hw(a.v[i], b.v[i]); break;
     case 3: for (i = 0; i < 4; i++) r.v[i] = a.v[i] + c.v[i]; break;
-    case 4: for (i = 0; i < 4; i++) r.v[i] = a.v[i] * b.v[i] + c.v[i]; break;
+    case 4: for (i = 0; i < 4; i++) r.v[i] = mul_hw(a.v[i], b.v[i]) + c.v[i]; break;
     case 5: r = splat(a.v[0]*b.v[0] + a.v[1]*b.v[1] + a.v[2]*b.v[2]); break;
     case 6: r = splat(a.v[0]*b.v[0] + a.v[1]*b.v[1] + a.v[2]*b.v[2]
                       + b.v[3]); break;                        /* dph */
@@ -486,6 +497,7 @@ int nv2a_vsh_run(const float in[NV2A_VSH_INPUTS][4], Nv2aVshOutput *out)
             memcpy(out->tex[1], outregs[10], sizeof out->tex[1]);
             memcpy(out->tex[2], outregs[11], sizeof out->tex[2]);
             memcpy(out->tex[3], outregs[12], sizeof out->tex[3]);
+            out->pts = outregs[6][0];
             return 1;
         }
     }

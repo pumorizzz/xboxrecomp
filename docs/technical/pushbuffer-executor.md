@@ -119,8 +119,25 @@ near `(0, 0)`. `RECOMP_FFP_TRACE` prints the matrix and a few raw and
 transformed vertices, which is how the order was found.
 
 Texture coordinates are taken from the attribute streams as they are, with no
-texture-coordinate generation or texture matrix; there is no fog coordinate,
-specular, or point sprite.
+texture-coordinate generation or texture matrix; there is no fog coordinate
+or specular.
+
+### Points, polygon offset, zero products
+
+- **Points** (`BEGIN_END` 1) become squares of the vertex's point size in
+  surface pixels: the program's `oPts.x`, else `SET_POINT_SIZE`, capped at
+  63.875. With `SET_POINT_SMOOTH_ENABLE` (D3D's point sprites) every stage's
+  texture coordinates run 0..1 across the square. Fallout draws its particles
+  this way (steam, radiation, laser glow, smoke). `SET_POINT_PARAMS`
+  attenuation is not modelled. Lines are still dropped.
+- **Polygon offset** (`SET_POLY_OFFSET_FILL_ENABLE`, D3D's ZBIAS): window z
+  moves by `factor * max(|dz/dx|, |dz/dy|) + units`, z in depth-buffer steps.
+  Decals on the floor (scorch marks) need it not to flicker.
+- **Zero products.** The vertex program's MUL and MAD give 0 when a factor is
+  0, even against infinity or NaN, as the NV2A does. Fallout's lighting
+  program multiplies unused lights' colours, which hold leftovers up to
+  infinity, by a zero intensity; with IEEE NaN there, crates and robots came
+  out saturated red. Dot products have no such rule.
 
 ### Lighting
 

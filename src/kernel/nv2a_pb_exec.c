@@ -179,6 +179,14 @@ static int surface_write_refused(uint32_t base, uint32_t bytes, const char *what
 #define NV097_SET_SURFACE_PITCH           0x020C
 #define NV097_SET_SURFACE_COLOR_OFFSET    0x0210
 #define NV097_SET_COLOR_CLEAR_VALUE       0x1D90
+/* Polygon offset (D3D's ZBIAS) and point sprites; see raster_xf_triangle and
+ * raster_points. */
+#define NV097_SET_POINT_PARAMS_ENABLE     0x0318
+#define NV097_SET_POINT_SMOOTH_ENABLE     0x031C
+#define NV097_SET_POLY_OFFSET_FILL_ENABLE 0x0338
+#define NV097_SET_POLYGON_OFFSET_SCALE_FACTOR 0x0384
+#define NV097_SET_POLYGON_OFFSET_BIAS     0x0388
+#define NV097_SET_POINT_SIZE              0x043C
 #define NV097_CLEAR_SURFACE               0x1D94
 #define NV097_SET_VERTEX_DATA_ARRAY_OFFSET 0x1720   /* +i*4, 16 attributes */
 #define NV097_SET_VERTEX_DATA_ARRAY_FORMAT 0x1760   /* +i*4 */
@@ -2776,6 +2784,10 @@ void nv2a_pb_exec_sync(void)
         s_backend->sync(NV2A_BACKEND_SYNC_SCAN_END);
 }
 
+/* Set while raster_xf_triangle draws a triangle it has already moved by the
+ * polygon offset, so the copy is not offset again. */
+static int s_in_offset;
+
 static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
                                const Nv2aVshOutput *vc)
 {
@@ -2806,6 +2818,31 @@ static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
     if (area == 0.0f || area != area) {
         s_gpu.xf_degenerate++;
         return;
+    }
+    /* SET_POLY_OFFSET_FILL_ENABLE: z moves by factor * DZ + units, where DZ
+     * is the triangle's steepest depth slope in surface pixels and one unit
+     * is one step of the depth buffer -- z here is already in those steps.
+     * D3D's ZBIAS comes out as this, and Fallout draws its scorch marks and
+     * other decals on the floor with it; without it the decal and the floor
+     * tie in depth and flicker. */
+    if (!s_in_offset && s_reg[NV097_SET_POLY_OFFSET_FILL_ENABLE / 4]) {
+        float units = reg_f(NV097_SET_POLYGON_OFFSET_BIAS);
+        float factor = reg_f(NV097_SET_POLYGON_OFFSET_SCALE_FACTOR);
+        float dzx = ((b[2] - a[2]) * (c[1] - a[1]) - (c[2] - a[2]) * (b[1] - a[1])) / area;
+        float dzy = ((c[2] - a[2]) * (b[0] - a[0]) - (b[2] - a[2]) * (c[0] - a[0])) / area;
+        float dz = fabsf(dzx) > fabsf(dzy) ? fabsf(dzx) : fabsf(dzy);
+        float o = factor * dz + units;
+
+        if (o != 0.0f && o == o) {
+            Nv2aVshOutput ov[3];
+            ov[0] = *va; ov[1] = *vb; ov[2] = *vc;
+            for (k = 0; k < 3; k++)
+                ov[k].pos[2] += o;
+            s_in_offset = 1;
+            raster_xf_triangle(&ov[0], &ov[1], &ov[2]);
+            s_in_offset = 0;
+            return;
+        }
     }
     if (backend_draws()) {                     /* a back end rasterises */
         Nv2aVertex *o = backend_slot();
@@ -3063,6 +3100,62 @@ static void xf_set_viewport(void)
     s_xf_o[2] = of[2];
 }
 
+/* Points, as the hardware draws them: a square of the vertex's point size
+ * centred on it, in surface pixels. The size is the program's oPts.x, or
+ * SET_POINT_SIZE (6.3 fixed point) when nothing wrote one. With point sprites
+ * on (SET_POINT_SMOOTH_ENABLE is what D3D's POINTSPRITEENABLE sets) every
+ * stage's texture coordinates run 0..1 across the square, top left at 0,0.
+ * Sizes stop at 63.875, the most SET_POINT_SIZE holds (D3D's MaxPointSize):
+ * Fallout's programs grow a particle as 1/w, past that next to the camera.
+ *
+ * Fallout's particles -- the steam over the Tutorial's grates, the glow of
+ * its laser emitters, the radiation puddles -- are point sprites; dropping
+ * points left the steam's damage without the steam. The size is not scaled
+ * by w: the vertices here are already surface pixels, and scaling by w (a
+ * few hundred in a 3D scene) washed the screen white or yellow. Distance
+ * attenuation (SET_POINT_PARAMS) is not modelled: the title's own program
+ * already writes the size. */
+static void raster_points(uint32_t n)
+{
+    float fixed = (float)(s_reg[NV097_SET_POINT_SIZE / 4] & 0x1FFu) / 8.0f;
+    int sprite = s_reg[NV097_SET_POINT_SMOOTH_ENABLE / 4] != 0;
+    float ty = s_xf_k[1] < 0.0f ? -1.0f : 1.0f;     /* which way is down */
+    uint32_t i;
+    int k, s;
+
+    if (s_xf_k[0] == 0.0f || s_xf_k[1] == 0.0f)
+        return;
+    for (i = 0; i < n; i++) {
+        const Nv2aVshOutput *v = &s_xf[i];
+        float size = v->pts > 0.0f ? v->pts : fixed;
+        if (size > 63.875f)        /* the hardware's limit, D3D's MaxPointSize */
+            size = 63.875f;
+        /* s_xf holds surface pixels already (screen = clip / w * k + o). */
+        float hx = 0.5f * size * s_gpu.aa_sx;
+        float hy = 0.5f * size * s_gpu.aa_sy;
+        Nv2aVshOutput q[4];
+        static const float cu[4] = {0.0f, 1.0f, 1.0f, 0.0f};
+        static const float cv[4] = {0.0f, 0.0f, 1.0f, 1.0f};
+
+        if (!(size > 0.0f) || v->pos[3] <= 0.0f)
+            continue;
+        for (k = 0; k < 4; k++) {
+            q[k] = *v;
+            q[k].pos[0] += (cu[k] * 2.0f - 1.0f) * hx;
+            q[k].pos[1] += (cv[k] * 2.0f - 1.0f) * hy * ty;
+            if (sprite)
+                for (s = 0; s < 4; s++) {
+                    q[k].tex[s][0] = cu[k];
+                    q[k].tex[s][1] = cv[k];
+                    q[k].tex[s][2] = 0.0f;
+                    q[k].tex[s][3] = 1.0f;
+                }
+        }
+        raster_xf_clipped(&q[0], &q[1], &q[2]);
+        raster_xf_clipped(&q[0], &q[2], &q[3]);
+    }
+}
+
 static void raster_batch_program(void)
 {
     uint32_t i, n = s_gpu.idx_count;
@@ -3228,8 +3321,11 @@ static void raster_batch_program(void)
             raster_xf_clipped(&s_xf[i], &s_xf[i+3], &s_xf[i+2]);
         }
         break;
-    default:
+    case NV_PRIM_POINTS:
+        raster_points(n);
         break;
+    default:
+        break;                             /* lines: not yet */
     }
     /* The batch's triangles, all at once (see xf_queue_push). */
     xf_queue_flush();
@@ -3243,6 +3339,11 @@ static void raster_batch(void)
     uint32_t before = s_gpu.tris_drawn;
     int textured = 0;
 
+    if (s_gpu.prim == NV_PRIM_POINTS && s_gpu.idx_count
+        && (batch_uses_program() || batch_is_ffp())) {
+        raster_batch_program();                /* a point needs one vertex */
+        return;
+    }
     if (s_gpu.idx_count < 3)
         return;
     if (batch_uses_program() || batch_is_ffp()) {
@@ -3471,10 +3572,12 @@ static void draw_primitive(void)
                     s_gpu.tris_drawn - t0,
                     (unsigned long long)(s_gpu.pixels - p0));
             if ((s_gpu.xf_mode & 3) == 2 && s_xf)
-                fprintf(stderr, "[FTRACE]     v0 %g %g %g %g  v1 %g %g  v2 %g %g%c",
+                fprintf(stderr, "[FTRACE]     v0 %g %g %g %g  v1 %g %g  v2 %g %g"
+                        "  pts %g %g %g%c",
                         s_xf[0].pos[0], s_xf[0].pos[1], s_xf[0].pos[2],
                         s_xf[0].pos[3], s_xf[1].pos[0], s_xf[1].pos[1],
-                        s_xf[2].pos[0], s_xf[2].pos[1], 10);
+                        s_xf[2].pos[0], s_xf[2].pos[1],
+                        s_xf[0].pts, s_xf[1].pts, s_xf[2].pts, 10);
             if (s_gpu.rc_seen) {
                 int st;
                 fprintf(stderr, "[FTRACE]     rc stages %u ctl %08X prog %05X fin %08X %08X",
@@ -3493,6 +3596,12 @@ static void draw_primitive(void)
                             RS.rc.color_ocw[st], RS.rc.alpha_ocw[st],
                             RS.rc.factor0[st], RS.rc.factor1[st], 10);
             }
+            if ((s_gpu.xf_mode & 3) == 2 && s_xf)
+                fprintf(stderr, "[FTRACE]     v0 d0 %g %g %g %g d1 %g %g %g %g t0 %g %g %g %g%c",
+                        s_xf[0].d0[0], s_xf[0].d0[1], s_xf[0].d0[2], s_xf[0].d0[3],
+                        s_xf[0].d1[0], s_xf[0].d1[1], s_xf[0].d1[2], s_xf[0].d1[3],
+                        s_xf[0].tex[0][0], s_xf[0].tex[0][1], s_xf[0].tex[0][2],
+                        s_xf[0].tex[0][3], 10);
             if ((s_gpu.xf_mode & 3) == 2) {
                 uint32_t r;
                 for (r = 112; r < 116; r++) {
