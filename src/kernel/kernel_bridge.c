@@ -1978,25 +1978,20 @@ static HANDLE ke_guest_event_prepare(uint32_t guest_va, int *type)
     return h;
 }
 
-/* ── KeSetEvent (ordinal 145) ────────────────────────────── */
-static void bridge_KeSetEvent(void)
+/* KeSetEvent's work, for the bridge and for the runtime itself (a modelled
+ * GPU interrupt). Returns what KeSetEvent puts in eax. */
+static uint32_t ke_set_event(uint32_t guest_va)
 {
-    uint32_t guest_va = STACK_ARG(0);
-    uint32_t increment = STACK_ARG(1);
-    uint32_t wait = STACK_ARG(2);
     HANDLE h;
-
-    (void)increment;
-    (void)wait;
 
     {   /* An event the title built itself (see ke_guest_event). */
         int type;
         HANDLE ge = ke_guest_event(guest_va, &type);
         if (ge) {
-            g_eax = BRIDGE_MEM32(guest_va + 4) != 0;   /* previous state */
+            uint32_t prev = BRIDGE_MEM32(guest_va + 4) != 0;
             BRIDGE_MEM32(guest_va + 4) = 1;
             SetEvent(ge);
-            return;
+            return prev;
         }
     }
     h = ke_shadow_lookup(guest_va);
@@ -2004,10 +1999,26 @@ static void bridge_KeSetEvent(void)
         h = bridge_resolve_handle(guest_va);
     if (!h)
         h = XBOX_TO_NATIVE(guest_va);
-    if (h)
-        g_eax = (uint32_t)SetEvent(h);
-    else
-        g_eax = 0;
+    return h ? (uint32_t)SetEvent(h) : 0;
+}
+
+/* Set a guest event from the runtime: what the title's interrupt handler
+ * would do (xbox_Nv2aFenceWakeEvent). */
+void xbox_KeSignalTitleEvent(uint32_t guest_va)
+{
+    ke_set_event(guest_va);
+}
+
+/* ── KeSetEvent (ordinal 145) ────────────────────────────── */
+static void bridge_KeSetEvent(void)
+{
+    uint32_t guest_va = STACK_ARG(0);
+    uint32_t increment = STACK_ARG(1);
+    uint32_t wait = STACK_ARG(2);
+
+    (void)increment;
+    (void)wait;
+    g_eax = ke_set_event(guest_va);
 }
 
 /* ── KeWaitForSingleObject (ordinal 159) ─────────────────── */
@@ -6909,7 +6920,9 @@ static HANDLE ke_guest_event(uint32_t guest_va, int *type)
         const char *e = getenv("RECOMP_TITLE_KEVENTS");
         enabled = e && *e == '1';
     }
-    if (!enabled)
+    /* The event D3D's fence wait sleeps on has a setter once the project
+     * names it (xbox_Nv2aFenceWakeEvent), so it qualifies on its own. */
+    if (!enabled && (!guest_va || guest_va != xbox_Nv2aFenceWakeEventVa()))
         return NULL;
     if (guest_va < 0x10000u || (guest_va & 3u))
         return NULL;

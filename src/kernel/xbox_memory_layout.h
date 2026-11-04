@@ -225,6 +225,16 @@ int xbox_Nv2aMirrorFence(uint32_t device_ptr_va,
  * resolve into the contiguous window). For the pushbuffer executor. */
 uint32_t xbox_Nv2aFenceWordVa(void);
 
+/* The event XDK D3D's fence wait sleeps on, at device + event_off (the device
+ * pointer at device_ptr_va, as for xbox_Nv2aMirrorFence). Registering it under
+ * RECOMP_PB_EXEC hands the fence to the executor: the mirror stands down, the
+ * word takes the title's own semaphore releases as they execute, and the
+ * event is set when the GPU would interrupt (software method 5) and whenever
+ * DMA_GET is published. See the definition for why each part is needed. */
+int xbox_Nv2aFenceWakeEvent(uint32_t device_ptr_va, uint32_t event_off);
+/* Its guest VA, 0 until the device exists (or none is registered). */
+uint32_t xbox_Nv2aFenceWakeEventVa(void);
+
 void xbox_MemoryLayoutShutdown(void);
 
 /**

@@ -9,8 +9,9 @@
  *   - the render state carries the stencil registers, with the hardware's
  *     reset values until the title writes them;
  *   - the semaphore release lands where the title said, method 0x0310 on
- *     subchannel 5 is latched into PGRAPH 0x400B10, and clears and flips reach
- *     the back end;
+ *     subchannel 5 is latched into PGRAPH 0x400B10 (in the segment scan too
+ *     once a semaphore is named), NO_OPERATION 5 wakes the title's fence
+ *     wait, and clears and flips reach the back end;
  *   - a batch carries every interpolant (Nv2aVertexEx) and the combiner
  *     words, the back end is asked to sync before a flip is presented, and
  *     a visibility test reports the back end's pixel count.
@@ -38,11 +39,15 @@ void xbox_FramebufferWindowSet(uint32_t va, uint32_t pitch) { (void)va; (void)pi
 void xbox_FramebufferWindowSetAA(uint32_t sy) { (void)sy; }
 static uint32_t s_fence_va;                           /* the mirrored fence word, if any */
 uint32_t xbox_Nv2aFenceWordVa(void) { return s_fence_va; }
-int nv2a_pb_dma_walk(void) { return 1; }             /* RECOMP_PB_WALK=dma: 0x0310 is latched */
+static int s_dma_walk = 1;                           /* RECOMP_PB_WALK=dma: 0x0310 is latched */
+int nv2a_pb_dma_walk(void) { return s_dma_walk; }
 void xbox_FramebufferWindowStart(void) {}
 void xbox_FramebufferWindowFrameStats(uint32_t draws) { (void)draws; }
 void xbox_FramebufferWindowPresent(uint32_t va, uint32_t pitch) { (void)va; (void)pitch; }
 void xbox_Nv2aFrameCounterFlip(void) {}
+
+static int s_wakes;                                  /* nv2a_pb_set_wake's callback ran */
+static void count_wake(void) { s_wakes++; }
 
 static volatile uint32_t s_pgraph_400b10;
 volatile uint32_t *xbox_Nv2aRegPtr(uint32_t offset)
@@ -319,6 +324,30 @@ int main(void)
     nv2a_pb_exec_method(5, 0x0310, 0x11111111u);
     CHECK(s_pgraph_400b10 == 0x11111111u);
     nv2a_pb_set_semaphore_target(0x5000);
+
+    /* The segment scan latches only for a named semaphore, and then the marker
+     * as it is: the release that follows it in the kick tells the same story. */
+    s_dma_walk = 0;
+    nv2a_pb_set_semaphore_target(0);
+    nv2a_pb_exec_method(5, 0x0310, 0x22222222u);
+    CHECK(s_pgraph_400b10 == 0x11111111u);
+    nv2a_pb_set_semaphore_target(0x5000);
+    nv2a_pb_exec_method(5, 0x0310, 0x0004D3E7u);
+    CHECK(s_pgraph_400b10 == 0x0004D3E7u);
+    s_dma_walk = 1;
+
+    /* NO_OPERATION 5 is the software method D3D's BlockOnFence sleeps on:
+     * the wake runs there, and for no other value. */
+    s_wakes = 0;
+    m(0x0100, 0);
+    m(0x0100, 4);
+    CHECK(s_wakes == 0);
+    nv2a_pb_set_wake(count_wake);
+    m(0x0100, 5);
+    CHECK(s_wakes == 1);
+    nv2a_pb_set_wake(NULL);
+    m(0x0100, 5);
+    CHECK(s_wakes == 1);
 
     /* Clears and flips reach the back end. */
     m(0x1D90, 0xFF102030u);                           /* SET_COLOR_CLEAR_VALUE */

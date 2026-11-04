@@ -368,3 +368,34 @@ enough. Burnout 3 did, at its Crash Nav menu, with the main thread in
 
 Turn the walk on for a project that delivers the GPU's software-method
 interrupt, or to bring up a title the segment scan draws wrongly.
+
+The segment scan also loses commands. It learns the ring's end from the
+highest `DMA_PUT` it has seen, so on a lap whose closing JUMP lies beyond that
+the commands in between are never executed. In *Fallout: Brotherhood of
+Steel* that was a menu frame without its Bink background, or a wedge of stray
+vertices in a level, a few times a minute.
+
+## Handing the Fence to the Executor
+
+A fence mirror (`xbox_Nv2aMirrorFence`) writes "everything submitted is done"
+as soon as it is submitted. Under `RECOMP_PB_EXEC` that runs ahead of the
+executor, and XDK D3D reuses a dynamic vertex buffer or texture as soon as the
+fence passes the kick that drew from it, so the title overwrites what the
+executor has yet to read.
+
+`xbox_Nv2aFenceWakeEvent(device_ptr_va, event_off)` names the event D3D's
+`BlockOnFence` sleeps on. With it registered and the executor on:
+
+- the mirror stands down, and the fence word takes the title's own
+  `BACK_END_WRITE_SEMAPHORE_RELEASE` values as the executor reaches them
+  (`nv2a_pb_set_semaphore_target`);
+- the `0x0310` marker is latched into `0x400B10` as the title wrote it, in the
+  segment scan as well as in the walk, so the latch and the fence agree;
+- the event is set at `NO_OPERATION 5` (`nv2a_pb_set_wake`), where the GPU's
+  interrupt would set it, and again whenever `DMA_GET` is published: the
+  segment scan publishes GET only after a whole segment, so D3D can patch a
+  marker the executor has already passed. A spurious wake is harmless; D3D
+  re-reads the fence and spins.
+
+The event qualifies for a host shadow even without `RECOMP_TITLE_KEVENTS`.
+Fallout registers `(0xB5E58, 0x1DBC)` and runs the walk.

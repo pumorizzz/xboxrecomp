@@ -1261,8 +1261,89 @@ uint32_t xbox_Nv2aFenceWordVa(void)
     return 0;
 }
 
+/*
+ * Handing the fence to the executor.
+ *
+ * The mirror writes "everything submitted is done" the moment it is
+ * submitted. That is honest only while nothing executes the pushbuffer. With
+ * RECOMP_PB_EXEC the executor reads it later, on this thread, and XDK D3D
+ * frees a dynamic vertex buffer or texture as soon as the fence passes the
+ * kick that used it: Fallout refilled them a kick or two before the executor
+ * drew from them, and single frames lost their menu layer or text, or drew
+ * with another frame's vertices.
+ *
+ * So the word takes the title's own releases instead
+ * (BACK_END_WRITE_SEMAPHORE_RELEASE, which KickOff puts after every kick's
+ * marker): nv2a_pb_set_semaphore_target points the executor at it, and the
+ * executor latches each marker (0x0310 on subchannel 5) into PGRAPH 0x400B10
+ * as it goes. An honest fence then lets D3D's BlockOnFence reach the path the
+ * mirror always short-circuited: with the GPU 0x2400 bytes or more short of
+ * the fence's marker, it patches NO_OPERATION 5 after that marker, waits for
+ * 0x400B10's fence bits to match the word, and sleeps on an event that the
+ * GPU's interrupt for that software method sets. Nothing models the
+ * interrupt, so the executor sets the event itself at that method, and again
+ * every time DMA_GET is published: the segment scan publishes GET only after
+ * a whole segment, so D3D can patch a marker the executor has already passed
+ * while GET still says it has not, and that wake-up would otherwise be lost.
+ * A spurious wake costs nothing -- D3D re-reads the fence and spins.
+ *
+ * Opt-in, per project, because the event has to be named: without it the
+ * honest fence would freeze the title at its first long frame.
+ */
+static uint32_t g_fence_wake_dev_ptr, g_fence_wake_off;
+
+int xbox_Nv2aFenceWakeEvent(uint32_t device_ptr_va, uint32_t event_off)
+{
+    g_fence_wake_dev_ptr = device_ptr_va;
+    g_fence_wake_off = event_off;
+    fprintf(stderr, "  NV2A fence wake event: device at 0x%08X, event +0x%X\n",
+            device_ptr_va, event_off);
+    return 0;
+}
+
+uint32_t xbox_Nv2aFenceWakeEventVa(void)
+{
+    uint32_t dev;
+
+    if (!g_fence_wake_dev_ptr || !fence_readable(g_fence_wake_dev_ptr, 4))
+        return 0;
+    dev = *(volatile uint32_t *)((uintptr_t)g_fence_wake_dev_ptr + g_memory_offset);
+    if (!fence_readable(dev + g_fence_wake_off, 16))
+        return 0;
+    return dev + g_fence_wake_off;
+}
+
+/* The executor owns the fence: a wake event is named and it executes. */
+static int fence_exec_owned(void)
+{
+    static int exec = -1;
+
+    if (exec < 0)
+        exec = getenv("RECOMP_PB_EXEC") != NULL;
+    return exec && g_fence_wake_dev_ptr;
+}
+
+/* Set the wake event (see above). Called from the executor at software method
+ * 5, and here after DMA_GET is published. */
+static void fence_wake(void)
+{
+    extern void xbox_KeSignalTitleEvent(uint32_t guest_va);
+    uint32_t va = xbox_Nv2aFenceWakeEventVa();
+
+    if (va)
+        xbox_KeSignalTitleEvent(va);
+}
+
 static void fence_mirrors_tick(void)
 {
+    if (fence_exec_owned()) {
+        extern void nv2a_pb_set_semaphore_target(uint32_t guest_va);
+        extern void nv2a_pb_set_wake(void (*wake)(void));
+
+        nv2a_pb_set_semaphore_target(xbox_Nv2aFenceWordVa());
+        nv2a_pb_set_wake(fence_wake);
+        return;
+    }
     for (int i = 0; i < g_fence_mirror_count; i++) {
         uint32_t dev, get_ptr;
 
@@ -1527,6 +1608,8 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
                     *get = put;
                     get_written = put;
                 }
+                if (fence_exec_owned())
+                    fence_wake();
                 last_put = put; last_put_ms = now_ms;
                 /* GET as well as PUT. A title that stops submitting has either
                  * finished or is spinning on the GPU catching up, and only GET

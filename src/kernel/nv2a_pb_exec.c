@@ -386,6 +386,10 @@ static float reg_f(uint32_t method)
 static uint32_t s_sem_va;
 void nv2a_pb_set_semaphore_target(uint32_t guest_va) { s_sem_va = guest_va; }
 
+/* What the GPU's interrupt for software method 5 would wake; see nv2a_backend.h. */
+static void (*s_wake)(void);
+void nv2a_pb_set_wake(void (*wake)(void)) { s_wake = wake; }
+
 /* Unhandled methods, ranked. The interesting output is not that something was
  * skipped but which things dominate, because that is the order to implement
  * them in. */
@@ -3883,6 +3887,13 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         *(volatile uint32_t *)(mem + s_sem_va) = param;
         return;
     }
+    /* NO_OPERATION 5: the software method XDK D3D's BlockOnFence patches in
+     * after a fence's marker before it sleeps; the GPU's interrupt for it is
+     * what wakes the title. */
+    if (subch == 0 && method == 0x0100 && param == 5 && s_wake) {
+        s_wake();
+        return;
+    }
     if (!inited) {
         inited = 1;
         s_gpu.aa_sx = s_gpu.aa_sy = 1.0f;
@@ -3965,8 +3976,14 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
      * ever: the title froze at the first screen whose walk was long enough to
      * enter it. So for a mirrored fence the latch carries the mirror's fence
      * bits and the marker's address, which is what a GPU that had consumed
-     * everything would report. */
-    if (method == 0x0310 && subch == 5 && nv2a_pb_dma_walk()) {
+     * everything would report.
+     *
+     * With a named semaphore the latch is the marker as it is, whichever walk
+     * runs: the release follows the marker in the same kick, so the two agree
+     * once both have executed. (Fallout's D3D keeps the fence bits in bits 0-4
+     * and the address above them, not the layout above -- one more reason to
+     * latch what the title wrote rather than rebuild it.) */
+    if (method == 0x0310 && subch == 5 && (nv2a_pb_dma_walk() || s_sem_va)) {
         volatile uint32_t *r = xbox_Nv2aRegPtr(0x400B10);
 
         if (!r)

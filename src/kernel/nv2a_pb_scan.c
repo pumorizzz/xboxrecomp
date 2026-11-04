@@ -440,7 +440,7 @@ void nv2a_pb_scan(uint32_t put_phys)
  * does not deliver that interrupt leaves the title asleep for good -- a title
  * that ran under the segment scan froze on the first screen whose pushbuffer
  * made the walk long enough. So the walk is opt-in, for projects that deliver
- * the GPU's software-method interrupt. */
+ * the GPU's software-method interrupt (xbox_Nv2aFenceWakeEvent does). */
 int nv2a_pb_dma_walk(void)
 {
     static int on = -1;

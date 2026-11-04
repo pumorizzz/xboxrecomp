@@ -192,4 +192,9 @@ int nv2a_backend_surface_ok(uint32_t va, uint32_t bytes);
  * the semaphore context DMA object through RAMIN. */
 void nv2a_pb_set_semaphore_target(uint32_t guest_va);
 
+/* Called when the executor reaches NO_OPERATION 5, the software method whose
+ * GPU interrupt wakes XDK D3D's BlockOnFence (xbox_Nv2aFenceWakeEvent sets
+ * this). NULL: nothing to wake. */
+void nv2a_pb_set_wake(void (*wake)(void));
+
 #endif /* NV2A_BACKEND_H */
