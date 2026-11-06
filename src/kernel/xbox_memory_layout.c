@@ -1301,11 +1301,16 @@ int xbox_Nv2aFenceWakeEvent(uint32_t device_ptr_va, uint32_t event_off)
     return 0;
 }
 
+static int fence_exec_owned(void);
+
+/* Only while the executor owns the fence: the event's setter is the
+ * executor, so without RECOMP_PB_EXEC nothing would ever set it, and a guest
+ * wait on it -- a real host wait once the event qualifies -- never ends. */
 uint32_t xbox_Nv2aFenceWakeEventVa(void)
 {
     uint32_t dev;
 
-    if (!g_fence_wake_dev_ptr || !fence_readable(g_fence_wake_dev_ptr, 4))
+    if (!fence_exec_owned() || !fence_readable(g_fence_wake_dev_ptr, 4))
         return 0;
     dev = *(volatile uint32_t *)((uintptr_t)g_fence_wake_dev_ptr + g_memory_offset);
     if (!fence_readable(dev + g_fence_wake_off, 16))
@@ -1381,8 +1386,14 @@ static void fence_lost_kick_tick(volatile uint32_t *regs)
     }
     if (now - since_ms < 250)
         return;
-    *(volatile uint32_t *)((char *)regs + NV2A_USER_DMA_PUT) = phys;
     seen_ptr = 0;
+    /* Only over the PUT just read: D3D may kick at this very moment, and a
+     * plain store would put DMA_PUT back behind its kick -- past a wrap, out
+     * of reach of this check too, with D3D asleep on a fence in between. */
+    if ((uint32_t)InterlockedCompareExchange(
+            (volatile LONG *)((char *)regs + NV2A_USER_DMA_PUT), (LONG)phys, (LONG)put)
+        != put)
+        return;
     if (kicks++ < 16)
         fprintf(stderr, "  [NV2A] lost kick: D3D wrote to 0x%08X, DMA_PUT stood"
                 " at 0x%08X for 250 ms; kicked\n", phys, put);
