@@ -25,7 +25,11 @@
  *     It used to ask every report, a 10-120 ms hitch every ten seconds.
  *   - An index list that names a vertex twice gets it as that vertex both
  *     times (it is transformed once and reused), and the next batch's
- *     vertices are its own even with the same indices.
+ *     vertices are its own even with the same indices. Unless the program
+ *     writes constants (CXT_WRITE_EN): then each named vertex runs again --
+ *     add c[10], c[10], c[10] doubles c[10] per run, and oD0 = c[10] counts
+ *     the runs: 2 4 8 16 32 64 for indices 0 1 2 2 1 3, where reuse would
+ *     hand back 8 and 4 for the second 2 and 1.
  *   - A flip with a back end that presents the frame itself (present()
  *     returns 1) neither writes the surface back nor hands it to the window;
  *     with present() returning 0 it does both.
@@ -298,6 +302,47 @@ int main(void)
         for (i = 0; i < s_be.n && i < 3; i++)
             CHECK(s_be.v[i].d0[0] == 0.0f && s_be.v[i].d0[1] == 0.25f
                   && s_be.v[i].d0[2] == 0.0f && s_be.v[i].d0[3] == 0.375f);
+    }
+
+    /* A program that writes constants: no reuse.
+     *   mov oPos, v0 ; add c[10], c[10], c[10] ; mov oD0, c[10] (final) */
+    {
+        static const float Q[4][3] = {
+            { 10.0f, 10.0f, 100.0f }, { 110.0f, 10.0f, 100.0f },
+            { 10.0f, 110.0f, 100.0f }, { 110.0f, 110.0f, 100.0f },
+        };
+        static const uint16_t IX[6] = { 0, 1, 2, 2, 1, 3 };
+        uint32_t w[3][4];
+        int k, j;
+
+        memset(w, 0, sizeof w);
+        w[0][1] = (1u << 21) | (0u << 9) | 0x1Bu;            /* mov, v0.xyzw */
+        w[0][2] = 2u << 26;                                  /* A: input */
+        w[0][3] = (0xFu << 12) | (1u << 11);                 /* o[0] xyzw */
+        w[1][1] = (3u << 21) | (10u << 13) | 0x1Bu;          /* add, c[10] */
+        w[1][2] = (3u << 26) | (0x1Bu << 2);                 /* A: const, C: .xyzw */
+        w[1][3] = (3u << 28) | (0xFu << 12) | (10u << 3);    /* C: const; c[10] xyzw */
+        w[2][1] = (1u << 21) | (10u << 13) | 0x1Bu;          /* mov, c[10] */
+        w[2][2] = 3u << 26;                                  /* A: const */
+        w[2][3] = (0xFu << 12) | (1u << 11) | (3u << 3) | 1u; /* oD0 xyzw, final */
+        m(0x1E9C, 0);                                        /* PROGRAM_LOAD 0 */
+        for (k = 0; k < 3; k++)
+            for (j = 0; j < 4; j++)
+                m(0x0B00 + 4u * (uint32_t)j, w[k][j]);
+        m(0x1EA0, 0);                                        /* PROGRAM_START 0 */
+        m(0x1E94, 2);                                        /* program mode */
+        m(0x1E98, 1);                                        /* CXT_WRITE_EN */
+        m(0x1760, 2 | (3 << 4) | (12 << 8));                 /* attr 0: float3 */
+        m(0x1EA4, 10);                                       /* CONSTANT_LOAD c[10] */
+        for (k = 0; k < 4; k++)
+            mf(0x0B80 + 4u * (uint32_t)k, 1.0f);
+        put_vertices(Q, 4);
+        draw_indexed(IX, 6);
+        CHECK(s_be.n == 6);
+        for (k = 0; k < 6 && (uint32_t)k < s_be.n; k++)
+            CHECK(s_be.v[k].d0[0] == (float)(2 << k));
+        m(0x1E98, 0);
+        m(0x1E94, 0);                                        /* fixed function again */
     }
 
     /* present() 1: the back end showed the frame -- no writeback, no window
