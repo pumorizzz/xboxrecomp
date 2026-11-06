@@ -1334,6 +1334,60 @@ static void fence_wake(void)
         xbox_KeSignalTitleEvent(va);
 }
 
+/*
+ * A kick the title lost.
+ *
+ * XDK D3D writes a command, moves its write pointer (device + 0) past it and
+ * kicks by storing DMA_PUT. Guest threads run here on real host cores at the
+ * same time, which the Xbox's one CPU never did, and D3D is not thread-safe:
+ * Fallout's loader threads and its main thread raced, a fence marker went into
+ * the pushbuffer with no DMA_PUT for it, and the main thread then waited in
+ * BlockOnFence for a fence the GPU could never reach (the Tutorial froze on
+ * its loading screen). While the fence was mirrored that went unnoticed: the
+ * wait passed, and the next kick took the marker along.
+ *
+ * So, with the fence owned by the executor: when the GPU has consumed
+ * everything it was given and D3D's write pointer has stood further on for
+ * 250 ms, the commands up to it are kicked as D3D would have. The bytes are
+ * complete -- D3D moves its pointer only after writing them -- and kicking
+ * early only makes the GPU start sooner. Not hardware behaviour: recovery from
+ * a race the hardware never sees. Logged, so the race stays visible. */
+static void fence_lost_kick_tick(volatile uint32_t *regs)
+{
+    static uint32_t seen_ptr, since_ms, kicks;
+    uint32_t dev, ptr, put, get, phys;
+    DWORD now = GetTickCount();
+
+    if (!g_fence_wake_dev_ptr || !fence_readable(g_fence_wake_dev_ptr, 4))
+        return;
+    dev = *(volatile uint32_t *)((uintptr_t)g_fence_wake_dev_ptr + g_memory_offset);
+    if (!fence_readable(dev, 4))
+        return;
+    ptr = *(volatile uint32_t *)((uintptr_t)dev + g_memory_offset);
+    put = *(volatile uint32_t *)((char *)regs + NV2A_USER_DMA_PUT);
+    get = *(volatile uint32_t *)((char *)regs + NV2A_USER_DMA_GET);
+    phys = ptr & 0x0FFFFFFFu;
+    /* Only a pointer in the contiguous window, ahead of an idle GPU in the
+     * same stretch of ring: a wrap is D3D's own JUMP, which it kicks itself. */
+    if ((ptr & 0xF0000000u) != 0x80000000u || get != put || phys <= put
+            || phys - put > 0x10000u) {
+        seen_ptr = 0;
+        return;
+    }
+    if (ptr != seen_ptr) {
+        seen_ptr = ptr;
+        since_ms = now;
+        return;
+    }
+    if (now - since_ms < 250)
+        return;
+    *(volatile uint32_t *)((char *)regs + NV2A_USER_DMA_PUT) = phys;
+    seen_ptr = 0;
+    if (kicks++ < 16)
+        fprintf(stderr, "  [NV2A] lost kick: D3D wrote to 0x%08X, DMA_PUT stood"
+                " at 0x%08X for 250 ms; kicked\n", phys, put);
+}
+
 static void fence_mirrors_tick(void)
 {
     if (fence_exec_owned()) {
@@ -1630,6 +1684,8 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
                 }
             }
         }
+        if (fence_exec_owned())
+            fence_lost_kick_tick(regs);
         if (s_nv2a_trace) {
             static uint32_t last_start = 0xFFFFFFFFu;
             uint32_t start = *(volatile uint32_t *)((char *)regs + 0x600800);
