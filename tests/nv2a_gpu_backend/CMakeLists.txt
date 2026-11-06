@@ -11,6 +11,8 @@ add_executable(nv2a-gpu-backend-test nv2a_gpu_backend_test.c
     ../../src/d3d/nv2a_gpu_d3d11.c)
 target_include_directories(nv2a-gpu-backend-test PRIVATE ../../src/kernel ../../src)
 target_link_libraries(nv2a-gpu-backend-test PRIVATE d3d11 dxgi dxguid d3dcompiler)
+# A failed readback, which WARP never produces by itself (see rt_writeback).
+target_compile_definitions(nv2a-gpu-backend-test PRIVATE NV2A_GPU_TEST_HOOKS)
 if(MSVC)
     target_compile_definitions(nv2a-gpu-backend-test PRIVATE _CRT_SECURE_NO_WARNINGS)
 endif()

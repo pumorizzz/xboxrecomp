@@ -708,6 +708,16 @@ static int rt_taken(GpuRt *r)
     return 0;
 }
 
+/* tests/nv2a_gpu_backend builds with NV2A_GPU_TEST_HOOKS: the next
+ * nv2a_gpu_test_fail_maps readbacks fail, as a Map can on a real device and
+ * never does on WARP. Not in a title's build. */
+#ifdef NV2A_GPU_TEST_HOOKS
+int nv2a_gpu_test_fail_maps;
+#define TEST_MAP_FAILS() (nv2a_gpu_test_fail_maps > 0 ? (nv2a_gpu_test_fail_maps--, 1) : 0)
+#else
+#define TEST_MAP_FAILS() 0
+#endif
+
 /* The dirty rectangle into guest RAM and the shadow, now. */
 static void rt_writeback(GpuRt *r)
 {
@@ -724,8 +734,9 @@ static void rt_writeback(GpuRt *r)
                                               x0, y0, 0, (ID3D11Resource *)r->tex,
                                               0, &box);
     t0 = now_ms();
-    if (FAILED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)s_staging, 0,
-                                       D3D11_MAP_READ, 0, &m))) {
+    if (TEST_MAP_FAILS()
+        || FAILED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)s_staging, 0,
+                                          D3D11_MAP_READ, 0, &m))) {
         r->dirty = 1;                   /* still newer than guest RAM: keep it so */
         return;
     }
