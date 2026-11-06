@@ -1,6 +1,7 @@
-/* The D3D11 back end gives up a target whose memory the title took back.
+/* The D3D11 back end, run for real on the WARP adapter (no window, no GPU
+ * needed).
  *
- * Runs the real back end on the WARP adapter (no window, no GPU needed).
+ * It gives up a target whose memory the title took back.
  * Target A is cleared on the GPU and left dirty, as Fallout leaves its
  * shadow atlas; then the CPU writes A's bytes, as when the title frees the
  * atlas and the heap (RECOMP_HEAP_RECLAIM) hands them to a texture. Nine more
@@ -11,6 +12,12 @@
  *     drawn with wood-coloured splinters, the smoke over the robots gone.
  *   - B, untouched by the CPU, still goes back into guest RAM with its
  *     clear colour: a target the title still owns loses nothing.
+ *
+ * It hands over to the software rasteriser when the device is lost
+ * (RECOMP_GPU_RASTER_LOSE_AT stands in for a driver reset): a clear before
+ * the loss stays on the GPU, guest RAM untouched; after the flip that finds
+ * the device gone, a clear lands in guest RAM -- the executor draws again.
+ * Before, a lost device left the window frozen on its last frame.
  *
  * Harness as tests/nv2a_points; Windows only. */
 #include <stddef.h>
@@ -25,7 +32,7 @@
 #define H 64
 #define PITCH (W * 4)
 #define SURF(i) (0x10000u + (uint32_t)(i) * 0x10000u)
-#define MEM_BYTES 0x100000u
+#define MEM_BYTES 0x110000u
 static uint8_t s_mem[MEM_BYTES];
 
 /* ---- what the executor and the back end expect the runtime to provide -- */
@@ -78,6 +85,8 @@ int main(void)
     int i;
 
     _putenv("RECOMP_GPU_RASTER=warp");
+    _putenv("RECOMP_GPU_RASTER_LOSE_AT=3");
+    _putenv("RECOMP_FPS_LIMIT=0");
     if (!nv2a_gpu_d3d11_install()) {
         printf("SKIP: no D3D11 WARP device\n");
         return 0;
@@ -96,6 +105,14 @@ int main(void)
 
     CHECK(surface_is(SURF(0), 0xABABABABu));
     CHECK(surface_is(SURF(1), CLEAR_ARGB));
+
+    /* Device loss at the third flip. */
+    clear_surface_at(SURF(12));
+    CHECK(surface_is(SURF(12), 0));          /* on the GPU, not in guest RAM */
+    for (i = 0; i < 3; i++)
+        m(0x0130, 0);                        /* FLIP_STALL */
+    clear_surface_at(SURF(13));
+    CHECK(surface_is(SURF(13), CLEAR_ARGB)); /* the software path drew it */
 
     nv2a_backend_register(NULL);
     printf(s_fail ? "FAIL\n" : "PASS\n");

@@ -725,8 +725,10 @@ static void rt_writeback(GpuRt *r)
                                               0, &box);
     t0 = now_ms();
     if (FAILED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)s_staging, 0,
-                                       D3D11_MAP_READ, 0, &m)))
+                                       D3D11_MAP_READ, 0, &m))) {
+        r->dirty = 1;                   /* still newer than guest RAM: keep it so */
         return;
+    }
     s_st.stall_ms += now_ms() - t0;
     rt_store(r, &m, x0, y0, x1, y1);
     ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)s_staging, 0);
@@ -1872,6 +1874,32 @@ static void tex_evict(void)
             tex_release(&s_tex[i]);
 }
 
+static void release_all(void);
+
+/* RECOMP_GPU_RASTER_LOSE_AT=<flip>: behave as if the device were lost at that
+ * flip -- the one way to run the path below without a driver reset. */
+static uint32_t s_lose_at;
+
+/* A lost device (driver reset, TDR, update, the adapter gone): every call
+ * fails from then on, Present included, and the window would stand frozen.
+ * The executor's own rasteriser takes over from the next frame: the back end
+ * unregisters and lets go of the device, and the window presents guest RAM
+ * again. Checked at the flip, after which the executor calls the back end no
+ * more this frame -- not inside a draw that is still using the context. */
+static int gpu_lost(void)
+{
+    HRESULT why = ID3D11Device_GetDeviceRemovedReason(s_dev);
+
+    if (SUCCEEDED(why) && !(s_lose_at && s_flip_no >= s_lose_at))
+        return 0;
+    fprintf(stderr, "[GPURAST] D3D11 device lost (0x%08lX) at flip %u; the software"
+                    " rasteriser takes over%c", (unsigned long)why, s_flip_no, 10);
+    nv2a_backend_register(NULL);
+    xbox_FramebufferWindowExternal(0);
+    release_all();
+    return 1;
+}
+
 static void gpu_flip(void)
 {
     DWORD now = GetTickCount();
@@ -1899,6 +1927,7 @@ static void gpu_flip(void)
         memset(&s_st, 0, sizeof s_st);
         s_st.last_tick = now;
     }
+    gpu_lost();
 }
 
 /* ---- install ------------------------------------------------------------ */
@@ -2331,6 +2360,10 @@ int nv2a_gpu_d3d11_install(void)
         s_sync_all = sy && strcmp(sy, "all") == 0;
         s_present_on = !(getenv("RECOMP_GPU_RASTER_PRESENT")
                          && strcmp(getenv("RECOMP_GPU_RASTER_PRESENT"), "0") == 0);
+    }
+    {
+        const char *la = getenv("RECOMP_GPU_RASTER_LOSE_AT");
+        s_lose_at = la ? (uint32_t)strtoul(la, NULL, 10) : 0;
     }
     type = strcmp(e, "warp") == 0 ? D3D_DRIVER_TYPE_WARP : D3D_DRIVER_TYPE_HARDWARE;
     QueryPerformanceFrequency(&f);
