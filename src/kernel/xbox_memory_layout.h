@@ -232,8 +232,17 @@ uint32_t xbox_Nv2aFenceWordVa(void);
  * event is set when the GPU would interrupt (software method 5) and whenever
  * DMA_GET is published. See the definition for why each part is needed. */
 int xbox_Nv2aFenceWakeEvent(uint32_t device_ptr_va, uint32_t event_off);
-/* Its guest VA, 0 until the device exists (or none is registered). */
+/* Its guest VA, 0 until the device exists, while none is registered, or
+ * without RECOMP_PB_EXEC (nothing would set it then). */
 uint32_t xbox_Nv2aFenceWakeEventVa(void);
+
+/* One poll of the lost-kick recovery (see the definition): D3D's write
+ * pointer `ptr` (a contiguous VA), DMA_PUT as `put` read from `put_reg`, and
+ * DMA_GET. Kicks -- moves DMA_PUT up to ptr, only if it still holds `put` --
+ * once ptr has stood ahead of an idle GPU for 250 ms; returns 1 then. */
+typedef struct { uint32_t seen_ptr, since_ms, kicks; } XboxLostKick;
+int xbox_Nv2aLostKickPoll(XboxLostKick *st, uint32_t ptr, volatile uint32_t *put_reg,
+                          uint32_t put, uint32_t get, uint32_t now_ms);
 
 void xbox_MemoryLayoutShutdown(void);
 

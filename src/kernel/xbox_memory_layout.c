@@ -1357,11 +1357,42 @@ static void fence_wake(void)
  * complete -- D3D moves its pointer only after writing them -- and kicking
  * early only makes the GPU start sooner. Not hardware behaviour: recovery from
  * a race the hardware never sees. Logged, so the race stays visible. */
+int xbox_Nv2aLostKickPoll(XboxLostKick *st, uint32_t ptr, volatile uint32_t *put_reg,
+                          uint32_t put, uint32_t get, uint32_t now_ms)
+{
+    uint32_t phys = ptr & 0x0FFFFFFFu;
+
+    /* Only a pointer in the contiguous window, ahead of an idle GPU in the
+     * same stretch of ring: a wrap is D3D's own JUMP, which it kicks itself. */
+    if ((ptr & 0xF0000000u) != 0x80000000u || get != put || phys <= put
+            || phys - put > 0x10000u) {
+        st->seen_ptr = 0;
+        return 0;
+    }
+    if (ptr != st->seen_ptr) {
+        st->seen_ptr = ptr;
+        st->since_ms = now_ms;
+        return 0;
+    }
+    if (now_ms - st->since_ms < 250)
+        return 0;
+    st->seen_ptr = 0;
+    /* Only over the PUT read: D3D may kick at this very moment, and a plain
+     * store would put DMA_PUT back behind its kick -- past a wrap, out of
+     * reach of this check too, with D3D asleep on a fence in between. */
+    if ((uint32_t)InterlockedCompareExchange((volatile LONG *)put_reg, (LONG)phys,
+                                             (LONG)put) != put)
+        return 0;
+    if (st->kicks++ < 16)
+        fprintf(stderr, "  [NV2A] lost kick: D3D wrote to 0x%08X, DMA_PUT stood"
+                " at 0x%08X for 250 ms; kicked\n", phys, put);
+    return 1;
+}
+
 static void fence_lost_kick_tick(volatile uint32_t *regs)
 {
-    static uint32_t seen_ptr, since_ms, kicks;
-    uint32_t dev, ptr, put, get, phys;
-    DWORD now = GetTickCount();
+    static XboxLostKick st;
+    uint32_t dev, ptr, put, get;
 
     if (!g_fence_wake_dev_ptr || !fence_readable(g_fence_wake_dev_ptr, 4))
         return;
@@ -1371,32 +1402,8 @@ static void fence_lost_kick_tick(volatile uint32_t *regs)
     ptr = *(volatile uint32_t *)((uintptr_t)dev + g_memory_offset);
     put = *(volatile uint32_t *)((char *)regs + NV2A_USER_DMA_PUT);
     get = *(volatile uint32_t *)((char *)regs + NV2A_USER_DMA_GET);
-    phys = ptr & 0x0FFFFFFFu;
-    /* Only a pointer in the contiguous window, ahead of an idle GPU in the
-     * same stretch of ring: a wrap is D3D's own JUMP, which it kicks itself. */
-    if ((ptr & 0xF0000000u) != 0x80000000u || get != put || phys <= put
-            || phys - put > 0x10000u) {
-        seen_ptr = 0;
-        return;
-    }
-    if (ptr != seen_ptr) {
-        seen_ptr = ptr;
-        since_ms = now;
-        return;
-    }
-    if (now - since_ms < 250)
-        return;
-    seen_ptr = 0;
-    /* Only over the PUT just read: D3D may kick at this very moment, and a
-     * plain store would put DMA_PUT back behind its kick -- past a wrap, out
-     * of reach of this check too, with D3D asleep on a fence in between. */
-    if ((uint32_t)InterlockedCompareExchange(
-            (volatile LONG *)((char *)regs + NV2A_USER_DMA_PUT), (LONG)phys, (LONG)put)
-        != put)
-        return;
-    if (kicks++ < 16)
-        fprintf(stderr, "  [NV2A] lost kick: D3D wrote to 0x%08X, DMA_PUT stood"
-                " at 0x%08X for 250 ms; kicked\n", phys, put);
+    xbox_Nv2aLostKickPoll(&st, ptr, (volatile uint32_t *)((char *)regs + NV2A_USER_DMA_PUT),
+                          put, get, GetTickCount());
 }
 
 static void fence_mirrors_tick(void)
