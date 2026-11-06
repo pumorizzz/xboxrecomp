@@ -24,8 +24,10 @@
  *     every target it drew) only when RECOMP_FB_DUMP will write the picture.
  *     It used to ask every report, a 10-120 ms hitch every ten seconds.
  *   - An index list that names a vertex twice gets it as that vertex both
- *     times (it is transformed once and reused), and the next batch's
- *     vertices are its own even with the same indices. Unless the program
+ *     times, and the next batch's vertices are its own even with the same
+ *     indices. (The executor transforms such a vertex once and reuses it;
+ *     with nothing that changes per run, reuse itself is not visible from
+ *     here -- only that it hands back the right vertex.) Unless the program
  *     writes constants (CXT_WRITE_EN): then each named vertex runs again --
  *     add c[10], c[10], c[10] doubles c[10] per run, and oD0 = c[10] counts
  *     the runs: 2 4 8 16 32 64 for indices 0 1 2 2 1 3, where reuse would
@@ -245,8 +247,8 @@ int main(void)
     CHECK(s_be.n == 3 && s_be.swizzled == 1);
     m(0x0208, 0x0008);
 
-    /* Indices 0 1 2 2 1 3: vertices 2 and 1 come back reused, and as
-     * themselves; the next batch, same indices, positions moved by 40. */
+    /* Indices 0 1 2 2 1 3: the second 2 and 1 come back as themselves; the
+     * next batch, same indices, positions moved by 40. */
     {
         static const float Q[4][3] = {
             { 10.0f, 10.0f, 100.0f }, { 110.0f, 10.0f, 100.0f },
