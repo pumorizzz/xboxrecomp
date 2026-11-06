@@ -23,6 +23,12 @@
  *   - The periodic report asks the back end for a READ sync (a download of
  *     every target it drew) only when RECOMP_FB_DUMP will write the picture.
  *     It used to ask every report, a 10-120 ms hitch every ten seconds.
+ *   - An index list that names a vertex twice gets it as that vertex both
+ *     times (it is transformed once and reused), and the next batch's
+ *     vertices are its own even with the same indices.
+ *   - A flip with a back end that presents the frame itself (present()
+ *     returns 1) neither writes the surface back nor hands it to the window;
+ *     with present() returning 0 it does both.
  *
  * Harness as tests/nv2a_near_clip. */
 #include <math.h>
@@ -52,7 +58,8 @@ uint32_t xbox_Nv2aFenceWordVa(void) { return 0; }
 int nv2a_pb_dma_walk(void) { return 1; }
 void xbox_FramebufferWindowStart(void) {}
 void xbox_FramebufferWindowFrameStats(uint32_t draws) { (void)draws; }
-void xbox_FramebufferWindowPresent(uint32_t va, uint32_t pitch) { (void)va; (void)pitch; }
+static uint32_t s_window_presents;
+void xbox_FramebufferWindowPresent(uint32_t va, uint32_t pitch) { (void)va; (void)pitch; s_window_presents++; }
 void xbox_Nv2aFrameCounterFlip(void) {}
 volatile uint32_t *xbox_Nv2aRegPtr(uint32_t offset) { (void)offset; return NULL; }
 
@@ -94,6 +101,20 @@ static void be_sync(uint32_t reason) { if (reason == NV2A_BACKEND_SYNC_READ) s_r
 static uint32_t be_report(void) { return 0; }
 static const Nv2aBackend s_backend = { be_clear, be_draw, be_flip, be_sync, be_report };
 
+/* The same, with a present() that answers s_present_ret. */
+static int s_present_ret;
+static uint32_t s_presents, s_surface_syncs;
+static void be_sync_surface(uint32_t va, uint32_t bytes) { (void)va; (void)bytes; s_surface_syncs++; }
+static int be_present(uint32_t va, uint32_t pitch, uint32_t aa_sy)
+{
+    (void)va; (void)pitch; (void)aa_sy;
+    s_presents++;
+    return s_present_ret;
+}
+static const Nv2aBackend s_backend_present = {
+    be_clear, be_draw, be_flip, be_sync, be_report, 0, be_sync_surface, be_present
+};
+
 static int s_fail;
 #define CHECK(c) do { if (!(c)) { printf("FAIL line %d: %s\n", __LINE__, #c); s_fail = 1; } } while (0)
 
@@ -126,6 +147,18 @@ static void put_vertices(const float (*p)[3], int n)
         memcpy(s_mem + POS_AT + 12u * (uint32_t)i, p[i], 12);
         memcpy(s_mem + DIFF_AT + 4u * (uint32_t)i, &c, 4);
     }
+}
+
+/* Triangles by index: ARRAY_ELEMENT16, two indices a word. */
+static void draw_indexed(const uint16_t *ix, uint32_t n)
+{
+    uint32_t i;
+    s_be.n = 0;
+    m(0x17FC, 5);                            /* BEGIN_END: triangles */
+    for (i = 0; i + 1 < n; i += 2)
+        m(0x1800, ix[i] | ((uint32_t)ix[i + 1] << 16));
+    m(0x17FC, 0);
+    nv2a_pb_exec_sync();
 }
 
 static void draw(uint32_t prim, uint32_t count)
@@ -208,6 +241,30 @@ int main(void)
     CHECK(s_be.n == 3 && s_be.swizzled == 1);
     m(0x0208, 0x0008);
 
+    /* Indices 0 1 2 2 1 3: vertices 2 and 1 come back reused, and as
+     * themselves; the next batch, same indices, positions moved by 40. */
+    {
+        static const float Q[4][3] = {
+            { 10.0f, 10.0f, 100.0f }, { 110.0f, 10.0f, 100.0f },
+            { 10.0f, 110.0f, 100.0f }, { 110.0f, 110.0f, 100.0f },
+        };
+        static const uint16_t IX[6] = { 0, 1, 2, 2, 1, 3 };
+        float q[4][3];
+        int pass, k;
+
+        memcpy(q, Q, sizeof q);
+        for (pass = 0; pass < 2; pass++) {
+            put_vertices((const float (*)[3])q, 4);
+            draw_indexed(IX, 6);
+            CHECK(s_be.n == 6);
+            for (k = 0; k < 6 && (uint32_t)k < s_be.n; k++)
+                CHECK(fabsf(s_be.v[k].x - q[IX[k]][0]) < 1e-3f
+                      && fabsf(s_be.v[k].y - q[IX[k]][1]) < 1e-3f);
+            for (k = 0; k < 4; k++)
+                q[k][0] += 40.0f;
+        }
+    }
+
     /* Program mode: mov oPos, v0 ; mov oD0, v3 (final), v3 without an array. */
     {
         static const uint32_t prog[2][4] = {
@@ -242,6 +299,19 @@ int main(void)
             CHECK(s_be.v[i].d0[0] == 0.0f && s_be.v[i].d0[1] == 0.25f
                   && s_be.v[i].d0[2] == 0.0f && s_be.v[i].d0[3] == 0.375f);
     }
+
+    /* present() 1: the back end showed the frame -- no writeback, no window
+     * copy. present() 0: both. */
+    nv2a_backend_register(&s_backend_present);
+    s_present_ret = 1;
+    s_window_presents = s_surface_syncs = s_presents = 0;
+    m(0x0130, 0);                                        /* FLIP_STALL */
+    CHECK(s_presents == 1 && s_surface_syncs == 0 && s_window_presents == 0);
+    s_present_ret = 0;
+    s_window_presents = s_surface_syncs = s_presents = 0;
+    m(0x0130, 0);
+    CHECK(s_presents == 1 && s_surface_syncs == 1 && s_window_presents == 1);
+    nv2a_backend_register(&s_backend);
 
     /* No dump, no download: not for the draws above, not for the report. */
     nv2a_pb_exec_report();
