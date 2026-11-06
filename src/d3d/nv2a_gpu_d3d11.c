@@ -413,6 +413,7 @@ typedef struct {
     int dirty, need_full;
     uint32_t dx0, dy0, dx1, dy1;        /* dirty rectangle, half-open */
     uint32_t epoch_checked, last_use;
+    uint32_t taken_epoch;               /* rt_taken compared in this epoch */
 } GpuRt;
 
 typedef struct {
@@ -482,7 +483,7 @@ static uint32_t *s_scratch;             /* RT_W*RT_H texels: conversions, decode
 static size_t s_scratch_n;
 
 static struct {
-    uint32_t flips, draws, writebacks, uploads, decodes, rt_tex, presents;
+    uint32_t flips, draws, writebacks, uploads, decodes, rt_tex, presents, taken;
     uint32_t wb_why[4];                 /* texture, dropped target, sync, present */
     uint64_t wb_bytes, up_bytes;
     double stall_ms;
@@ -670,6 +671,43 @@ static int rt_take_dirty(GpuRt *r, uint32_t *x0, uint32_t *y0, uint32_t *x1,
     return nv2a_backend_surface_ok(r->va + *y0 * r->pitch, (*y1 - *y0) * r->pitch);
 }
 
+/* Has the title taken a dirty target's memory for something else?
+ *
+ * Between writebacks nothing here writes guest RAM under the dirty
+ * rectangle, so there it still equals the shadow -- unless the CPU (or a
+ * texture upload) wrote it. That happens when the title frees a target and
+ * the heap hands the bytes out again (RECOMP_HEAP_RECLAIM): Fallout's shadow
+ * atlas moves between allocations, and the target left behind stays dirty
+ * for good. Writing it back then laid stale pixels over the new owner -- a
+ * texture, vertices, objects -- and sampling it served the stale pixels in
+ * place of the new texels. Such a target drops what it drew and takes guest
+ * RAM as it is. Compared once an epoch: a dirty target is sampled per draw. */
+static int rt_taken(GpuRt *r)
+{
+    uint32_t rb = rt_row_bytes(r), y, x0, x1, y1;
+    const uint8_t *g = guest(r->va);
+
+    if (!r->dirty || r->need_full || s_compare || r->taken_epoch == s_epoch)
+        return 0;
+    r->taken_epoch = s_epoch;
+    x0 = r->dx0;
+    x1 = r->dx1 < r->W ? r->dx1 : r->W;
+    y1 = r->dy1 < r->H ? r->dy1 : r->H;
+    if (x0 >= x1 || r->dy0 >= y1
+        || !nv2a_backend_surface_ok(r->va + r->dy0 * r->pitch, (y1 - r->dy0) * r->pitch))
+        return 0;
+    for (y = r->dy0; y < y1; y++)
+        if (memcmp(g + (size_t)y * r->pitch + x0 * r->bpp,
+                   r->shadow + (size_t)y * rb + x0 * r->bpp, (x1 - x0) * r->bpp) != 0) {
+            r->dirty = 0;
+            r->need_full = 1;           /* rt_check uploads guest RAM whole */
+            r->epoch_checked = EPOCH_NONE;
+            s_st.taken++;
+            return 1;
+        }
+    return 0;
+}
+
 /* The dirty rectangle into guest RAM and the shadow, now. */
 static void rt_writeback(GpuRt *r)
 {
@@ -678,7 +716,7 @@ static void rt_writeback(GpuRt *r)
     uint32_t x0, x1, y0, y1;
     double t0;
 
-    if (!rt_take_dirty(r, &x0, &y0, &x1, &y1))
+    if (rt_taken(r) || !rt_take_dirty(r, &x0, &y0, &x1, &y1))
         return;
     box.left = x0; box.right = x1; box.top = y0; box.bottom = y1;
     box.front = 0; box.back = 1;
@@ -1434,6 +1472,7 @@ static GpuRt *rt_as_texture(const Nv2aTexture *t, const Nv2aSurface *dst,
         if (ranges_overlap(r->va, rt_end(r), dst->color_va,
                            dst->color_va + (dst->clip_y + dst->height) * dst->pitch))
             return NULL;                /* the surface being drawn: via guest RAM */
+        rt_taken(r);
         if (!rt_check(r))               /* clean: catch up with CPU writes first */
             return NULL;
         return r;
@@ -1850,12 +1889,13 @@ static void gpu_flip(void)
                         " guest->rt uploads %u (%.1f MB), tex decodes %u,"
                         " rt as texture %u, GPU presents %u, readback stall ms %.1f"
                         " (writebacks for: textures %u, dropped targets %u, syncs %u,"
-                        " presents %u)\n",
+                        " presents %u), dropped as taken by the title %u\n",
                 (double)(now - s_st.last_tick) / 1000.0, s_st.flips, s_st.draws,
                 s_st.writebacks, (double)s_st.wb_bytes / 1048576.0,
                 s_st.uploads, (double)s_st.up_bytes / 1048576.0,
                 s_st.decodes, s_st.rt_tex, s_st.presents, s_st.stall_ms,
-                s_st.wb_why[0], s_st.wb_why[1], s_st.wb_why[2], s_st.wb_why[3]);
+                s_st.wb_why[0], s_st.wb_why[1], s_st.wb_why[2], s_st.wb_why[3],
+                s_st.taken);
         memset(&s_st, 0, sizeof s_st);
         s_st.last_tick = now;
     }
