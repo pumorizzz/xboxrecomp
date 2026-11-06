@@ -22,7 +22,11 @@
  * A dirty target sampled as a texture is checked the same way: target T is
  * cleared on the GPU, its bytes taken by the CPU, then drawn from as a
  * linear A8R8G8B8 texture onto D -- D gets the CPU's bytes, not the stale
- * clear colour.
+ * clear colour. And when the title draws into T again after taking its
+ * bytes, D gets what was drawn last -- dropping the stale pixels once T is
+ * sampled must not take the fresh ones along. (In between it draws
+ * elsewhere, as a title must: D3D frees a surface only once the GPU is done
+ * with it, and the back end looks for taken bytes when the target changes.)
  *
  * A readback whose Map fails keeps its target dirty: the next one writes it
  * (NV2A_GPU_TEST_HOOKS fails the Map, which WARP never does by itself).
@@ -123,12 +127,14 @@ static int s_fail;
 
 #define CLEAR_ARGB 0xFF102030u
 
-static void clear_surface_at(uint32_t va)
+static void clear_surface_to(uint32_t va, uint32_t argb)
 {
     m(0x0210, va);                           /* SET_SURFACE_COLOR_OFFSET */
-    m(0x1D90, CLEAR_ARGB);                   /* SET_COLOR_CLEAR_VALUE */
+    m(0x1D90, argb);                         /* SET_COLOR_CLEAR_VALUE */
     m(0x1D94, 0xF0);                         /* CLEAR_SURFACE: colour */
 }
+
+static void clear_surface_at(uint32_t va) { clear_surface_to(va, CLEAR_ARGB); }
 
 /* Every dword of the surface at va equals want. */
 static int surface_is(uint32_t va, uint32_t want)
@@ -174,6 +180,15 @@ int main(void)
     draw_textured_at(SURF(15), SURF(14));    /* D */
     write_back_all();
     CHECK(surface_is(SURF(15), 0xABABABABu));
+
+    /* Taken, then drawn into again: the fresh clear survives. */
+    clear_surface_at(SURF(19));              /* T */
+    memset(s_mem + SURF(19), 0xAB, PITCH * H);
+    clear_surface_at(SURF(21));              /* work elsewhere meanwhile */
+    clear_surface_to(SURF(19), 0xFF405060u);
+    draw_textured_at(SURF(20), SURF(19));    /* D */
+    write_back_all();
+    CHECK(surface_is(SURF(20), 0xFF405060u));
 
     /* A failed readback keeps the target dirty for the next one. */
     clear_surface_at(SURF(16));

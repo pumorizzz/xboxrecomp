@@ -745,8 +745,12 @@ static void rt_writeback(GpuRt *r)
     ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)s_staging, 0);
 }
 
+static GpuRt *s_last_acquired;          /* rt_acquire's previous answer */
+
 static void rt_release(GpuRt *r)
 {
+    if (r == s_last_acquired)
+        s_last_acquired = NULL;
     REL(r->srv);
     REL(r->rtv);
     REL(r->tex);
@@ -861,6 +865,15 @@ static GpuRt *rt_acquire(const Nv2aSurface *s)
     }
     r->swizzled = s->swizzled != 0;
     r->last_use = ++s_use_clock;
+    /* Before drawing on: if the title took these bytes meanwhile, what was
+     * drawn before is gone, and dropping it later would take what is drawn
+     * now along with it. Only when the target changes: it is acquired for
+     * every draw, and while the title keeps drawing into it it cannot have
+     * freed it -- D3D waits for the fence before it lets go of a surface, so
+     * its bytes change hands only after work went elsewhere. */
+    if (r != s_last_acquired)
+        rt_taken(r);
+    s_last_acquired = r;
     if (!rt_check(r)) {
         if (!said_bad++)
             fprintf(stderr, "[GPURAST] surface 0x%08X is not guest memory a"
@@ -1967,6 +1980,11 @@ static void release_all(void)
     for (i = 0; i < s_qfree; i++)
         REL(s_qpool[i]);
     s_qfree = 0;
+    /* Unresolved too: a lost device lets go mid-frame, with queries out. */
+    for (i = 0; i < s_npend; i++)
+        REL(s_qpend[i]);
+    s_npend = 0;
+    s_qmade = 0;
     REL(s_white_srv);
     REL(s_white);
     present_release();
