@@ -20,6 +20,9 @@
  *     last SET_VERTEX_DATA4F_M: mov oD0, v3 with v3's array off gives the
  *     colour written there. It used to read 0,0,0,1, which drew Fallout's
  *     green radioactive liquid opaque black.
+ *   - The periodic report asks the back end for a READ sync (a download of
+ *     every target it drew) only when RECOMP_FB_DUMP will write the picture.
+ *     It used to ask every report, a 10-120 ms hitch every ten seconds.
  *
  * Harness as tests/nv2a_near_clip. */
 #include <math.h>
@@ -55,6 +58,7 @@ volatile uint32_t *xbox_Nv2aRegPtr(uint32_t offset) { (void)offset; return NULL;
 
 extern void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param);
 extern void nv2a_pb_exec_sync(void);
+extern void nv2a_pb_exec_report(void);
 
 static void m(uint32_t method, uint32_t param) { nv2a_pb_exec_method(0, method, param); }
 static uint32_t f2u(float f) { uint32_t u; memcpy(&u, &f, 4); return u; }
@@ -85,7 +89,8 @@ static void be_draw(const Nv2aSurface *s, const Nv2aBatch *b)
 }
 
 static void be_flip(void) {}
-static void be_sync(uint32_t reason) { (void)reason; }
+static uint32_t s_read_syncs;
+static void be_sync(uint32_t reason) { if (reason == NV2A_BACKEND_SYNC_READ) s_read_syncs++; }
 static uint32_t be_report(void) { return 0; }
 static const Nv2aBackend s_backend = { be_clear, be_draw, be_flip, be_sync, be_report };
 
@@ -237,6 +242,18 @@ int main(void)
             CHECK(s_be.v[i].d0[0] == 0.0f && s_be.v[i].d0[1] == 0.25f
                   && s_be.v[i].d0[2] == 0.0f && s_be.v[i].d0[3] == 0.375f);
     }
+
+    /* No dump, no download: not for the draws above, not for the report. */
+    nv2a_pb_exec_report();
+    CHECK(s_read_syncs == 0);
+    /* A dump (into a directory that is not there) still gets one. */
+#ifdef _WIN32
+    _putenv("RECOMP_FB_DUMP=nv2a_points_no_such_dir/f_");
+#else
+    setenv("RECOMP_FB_DUMP", "nv2a_points_no_such_dir/f_", 1);
+#endif
+    nv2a_pb_exec_report();
+    CHECK(s_read_syncs == 1);
 
     nv2a_backend_register(NULL);
     printf(s_fail ? "FAIL\n" : "PASS\n");

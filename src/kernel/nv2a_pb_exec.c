@@ -3434,7 +3434,7 @@ static void raster_batch(void)
      * triangles went down correctly just before it. A few frames that actually
      * contain geometry are worth more than any number of clears. */
     if (s_gpu.tris_drawn != before && s_drawn_dumps < FB_DUMP_AFTER_DRAW
-        && !s_flip_dumping) {
+        && !s_flip_dumping && getenv("RECOMP_FB_DUMP")) {
         s_drawn_dumps++;
         if (s_backend && s_backend->sync)
             s_backend->sync(NV2A_BACKEND_SYNC_READ);
@@ -4705,7 +4705,10 @@ void nv2a_pb_exec_report(void)
             s_gpu.min_x, s_gpu.max_x, s_gpu.min_y, s_gpu.max_y);
     /* One picture per report rather than per clear: a title clears hundreds of
      * times a second and nobody wants that many files. */
-    if (!s_flip_dumping) {
+    /* Only with a dump to write: the sync downloads every dirty GPU target,
+     * and without RECOMP_FB_DUMP nobody reads them -- it was a 10-120 ms
+     * hitch every report for nothing. */
+    if (!s_flip_dumping && getenv("RECOMP_FB_DUMP")) {
         if (s_backend && s_backend->sync)
             s_backend->sync(NV2A_BACKEND_SYNC_READ);
         dump_surface_bmp();
