@@ -98,6 +98,11 @@ void xbox_FramebufferWindowSet(uint32_t fb_va, uint32_t pitch)
  * surfaces (#162) come through at twice the height until it honours this. */
 void xbox_FramebufferWindowSetAA(uint32_t sy) { (void)sy; }
 
+/* ponytail: the display aspect and size (fb_present.c) are Windows-only; the
+ * SDL window shows the frame at its own size. */
+void xbox_FramebufferWindowSetAspect(uint32_t n, uint32_t d) { (void)n; (void)d; }
+void xbox_FramebufferWindowSetSize(uint32_t w, uint32_t h) { (void)w; (void)h; }
+
 /* The window is opened by xbox_HostWindowMain, on the main thread. */
 void xbox_FramebufferWindowStart(void) {}
 

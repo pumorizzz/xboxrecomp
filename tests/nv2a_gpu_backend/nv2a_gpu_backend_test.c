@@ -69,6 +69,12 @@ void xbox_Nv2aFrameCounterFlip(void) {}
 volatile uint32_t *xbox_Nv2aRegPtr(uint32_t offset) { (void)offset; return NULL; }
 void *xbox_FramebufferWindowHandle(void) { return NULL; }
 void xbox_FramebufferWindowExternal(int on) { (void)on; }
+void xbox_FramebufferWindowFit(uint32_t cw, uint32_t ch, int32_t out[4])
+{
+    out[0] = out[1] = 0;
+    out[2] = (int32_t)cw;
+    out[3] = (int32_t)ch;
+}
 
 extern void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param);
 extern void nv2a_pb_exec_sync(void);

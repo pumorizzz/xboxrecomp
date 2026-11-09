@@ -66,6 +66,7 @@
 extern ptrdiff_t xbox_GetMemoryOffset(void);
 extern void *xbox_FramebufferWindowHandle(void);       /* src/video/fb_present.c */
 extern void xbox_FramebufferWindowExternal(int on);
+extern void xbox_FramebufferWindowFit(uint32_t cw, uint32_t ch, int32_t out[4]);
 
 #define RT_W 1280                       /* = NV_ZBUF_W in nv2a_pb_exec.c */
 #define RT_H 1024                       /* = NV_ZBUF_H */
@@ -2065,16 +2066,29 @@ static ID3DBlob *compile(const char *entry, const char *target)
 #define PRESENT_W 640
 #define PRESENT_H 480
 
+/* The back buffer is the window's client area; the 640x480 frame is drawn
+ * into the rectangle xbox_FramebufferWindowFit gives (the display aspect,
+ * bars around it), bilinear between frame pixels -- exactly the frame's
+ * pixels when the rectangle is 640x480. pk.xy: surface texels per frame pixel
+ * (2x-wide anti-aliasing, aa_sy); vp: the rectangle; fs: the frame's size. */
 static const char s_present_hlsl[] =
 "Texture2DArray<float4> src : register(t0);\n"
-"cbuffer P : register(b2) { float4 pk; };\n"     /* source pixels per window pixel */
+"cbuffer P : register(b2) { float4 pk; float4 vp; float4 fs; };\n"
 "float4 pvs(uint i : SV_VertexID) : SV_Position {\n"
 "    float2 q = float2((i << 1) & 2, i & 2);\n"
 "    return float4(q * float2(2, -2) + float2(-1, 1), 0, 1);\n"
 "}\n"
+"float3 tap(int2 c) {\n"
+"    c = clamp(c, int2(0, 0), int2(fs.xy) - 1);\n"
+"    return src.Load(int4(c * int2(pk.xy), 0, 0)).rgb;\n"
+"}\n"
 "float4 pps(float4 p : SV_Position) : SV_Target {\n"
-"    int2 c = int2(floor(p.xy) * pk.xy);\n"
-"    return float4(src.Load(int4(c, 0, 0)).rgb, 1.0);\n"
+"    float2 s = (p.xy - vp.xy) / vp.zw * fs.xy - 0.5;\n"
+"    int2 i = int2(floor(s));\n"
+"    float2 f = s - floor(s);\n"
+"    float3 a = lerp(tap(i), tap(i + int2(1, 0)), f.x);\n"
+"    float3 b = lerp(tap(i + int2(0, 1)), tap(i + int2(1, 1)), f.x);\n"
+"    return float4(lerp(a, b, f.y), 1.0);\n"
 "}\n";
 
 static int s_present_on = 1, s_present_failed;
@@ -2128,9 +2142,22 @@ static void present_dump(GpuRt *r, uint32_t sx, uint32_t sy)
 }
 static IDXGISwapChain *s_chain;
 static ID3D11RenderTargetView *s_bb_rtv;
+static uint32_t s_bb_w, s_bb_h;          /* back buffer = the client area */
 static ID3D11VertexShader *s_pvs;
 static ID3D11PixelShader *s_pps;
 static ID3D11Buffer *s_cb_present;
+
+static void client_size(HWND hwnd, uint32_t *w, uint32_t *h)
+{
+    RECT cr;
+
+    if (!GetClientRect(hwnd, &cr) || cr.right < 1 || cr.bottom < 1) {
+        *w = *h = 0;                    /* minimised */
+        return;
+    }
+    *w = (uint32_t)cr.right;
+    *h = (uint32_t)cr.bottom;
+}
 
 static int present_setup(HWND hwnd)
 {
@@ -2147,9 +2174,14 @@ static int present_setup(HWND hwnd)
         || FAILED(IDXGIDevice_GetAdapter(xd, &xa))
         || FAILED(IDXGIAdapter_GetParent(xa, &IID_IDXGIFactory, (void **)&xf)))
         goto done;
+    client_size(hwnd, &s_bb_w, &s_bb_h);
+    if (!s_bb_w) {
+        s_bb_w = PRESENT_W;
+        s_bb_h = PRESENT_H;
+    }
     memset(&sd, 0, sizeof sd);
-    sd.BufferDesc.Width = PRESENT_W;
-    sd.BufferDesc.Height = PRESENT_H;
+    sd.BufferDesc.Width = s_bb_w;
+    sd.BufferDesc.Height = s_bb_h;
     sd.BufferDesc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
     sd.SampleDesc.Count = 1;
     sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
@@ -2173,7 +2205,7 @@ static int present_setup(HWND hwnd)
                                                  ID3D10Blob_GetBufferSize(ps), NULL, &s_pps)))
         goto done;
     memset(&bd, 0, sizeof bd);
-    bd.ByteWidth = 16;
+    bd.ByteWidth = 48;
     bd.Usage = D3D11_USAGE_DYNAMIC;
     bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
     bd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
@@ -2208,7 +2240,8 @@ static int gpu_present(uint32_t va, uint32_t pitch, uint32_t aa_sy)
     D3D11_RECT rc;
     GpuRt *r = NULL;
     HWND hwnd;
-    float pk[4];
+    float pk[12];
+    int32_t fit[4];
     int i;
 
     if (s_compare || !s_present_on || s_present_failed)
@@ -2243,18 +2276,55 @@ static int gpu_present(uint32_t va, uint32_t pitch, uint32_t aa_sy)
     if (!rt_check(r))                   /* clean: catch up with CPU writes first */
         return 0;
     xbox_FramebufferWindowExternal(1);
+    {
+        /* The back buffer follows the window: resized, maximised, F11. */
+        uint32_t cw, ch;
+        client_size(hwnd, &cw, &ch);
+        if (!cw)                        /* minimised: nothing to draw into */
+            return 1;
+        if (cw != s_bb_w || ch != s_bb_h) {
+            ID3D11Texture2D *back = NULL;
+            ID3D11DeviceContext_OMSetRenderTargets(s_ctx, 0, NULL, NULL);
+            REL(s_bb_rtv);
+            if (FAILED(IDXGISwapChain_ResizeBuffers(s_chain, 0, cw, ch,
+                                                    DXGI_FORMAT_UNKNOWN, 0))
+                || FAILED(IDXGISwapChain_GetBuffer(s_chain, 0, &IID_ID3D11Texture2D,
+                                                   (void **)&back))
+                || FAILED(ID3D11Device_CreateRenderTargetView(s_dev, (ID3D11Resource *)back,
+                                                              NULL, &s_bb_rtv))) {
+                REL(back);
+                fprintf(stderr, "[GPURAST] swap chain resize to %ux%u failed; presenting"
+                                " through guest RAM\n", cw, ch);
+                present_release();
+                s_present_failed = 1;
+                xbox_FramebufferWindowExternal(0);
+                bind_pipeline();
+                return 0;
+            }
+            REL(back);
+            s_bb_w = cw;
+            s_bb_h = ch;
+        }
+    }
+    xbox_FramebufferWindowFit(s_bb_w, s_bb_h, fit);
     pk[0] = (float)(pitch / (PRESENT_W * r->bpp) ? pitch / (PRESENT_W * r->bpp) : 1);
     pk[1] = (float)(aa_sy ? aa_sy : 1);
     pk[2] = pk[3] = 0.0f;
+    pk[4] = (float)fit[0]; pk[5] = (float)fit[1];
+    pk[6] = (float)fit[2]; pk[7] = (float)fit[3];
+    pk[8] = (float)PRESENT_W; pk[9] = (float)PRESENT_H;
+    pk[10] = pk[11] = 0.0f;
     if (SUCCEEDED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)s_cb_present, 0,
                                           D3D11_MAP_WRITE_DISCARD, 0, &m))) {
         memcpy(m.pData, pk, sizeof pk);
         ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)s_cb_present, 0);
     }
-    vp.TopLeftX = 0; vp.TopLeftY = 0;
-    vp.Width = (float)PRESENT_W; vp.Height = (float)PRESENT_H;
+    vp.TopLeftX = (float)fit[0]; vp.TopLeftY = (float)fit[1];
+    vp.Width = (float)fit[2]; vp.Height = (float)fit[3];
     vp.MinDepth = 0.0f; vp.MaxDepth = 1.0f;
-    rc.left = 0; rc.top = 0; rc.right = PRESENT_W; rc.bottom = PRESENT_H;
+    rc.left = fit[0]; rc.top = fit[1];
+    rc.right = fit[0] + fit[2]; rc.bottom = fit[1] + fit[3];
+    ID3D11DeviceContext_ClearRenderTargetView(s_ctx, s_bb_rtv, zero);   /* the bars */
     ID3D11DeviceContext_OMSetRenderTargets(s_ctx, 1, &s_bb_rtv, NULL);
     ID3D11DeviceContext_OMSetBlendState(s_ctx,
         blend_state(0, 0, 0, 0, D3D11_COLOR_WRITE_ENABLE_ALL), zero, 0xFFFFFFFFu);

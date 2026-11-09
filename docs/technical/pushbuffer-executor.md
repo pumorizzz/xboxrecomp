@@ -319,10 +319,18 @@ Two more steps took the readback out of the frame altogether:
 
 - **Presenting from the GPU.** With a framebuffer window (`RECOMP_FB_WINDOW`)
   the back end puts a swap chain on it and draws the presented target into
-  the back buffer (640x480, every other pixel of a 2x-wide anti-aliased
-  surface, as the GDI path takes them); `fb_present.c` keeps the title bar,
-  the keyboard and the close button and stops blitting
-  (`xbox_FramebufferWindowHandle`, `xbox_FramebufferWindowExternal`).
+  the back buffer (every other pixel of a 2x-wide anti-aliased surface, as
+  the GDI path takes them); `fb_present.c` keeps the title bar, the keyboard
+  and the close button and stops blitting
+  (`xbox_FramebufferWindowHandle`, `xbox_FramebufferWindowExternal`). The
+  back buffer is the window's client area, resized with it; the 640x480 frame
+  goes, filtered, into the largest rectangle of the display aspect
+  (`xbox_FramebufferWindowFit`, bars around it), as the GDI path stretches
+  it. `RECOMP_FB_ASPECT=16:9` (or `xbox_FramebufferWindowSetAspect`, for a
+  title patched to draw 16:9 anamorphically) sets the aspect,
+  `RECOMP_FB_SIZE=2560x1440` the picture's size (shrunk to the work area),
+  F11 or `RECOMP_FB_FULLSCREEN=1` borderless full screen. The title still
+  renders at its own resolution; only the picture is larger.
   Headless there is nothing to show, so nothing is read back. Reading the
   frame a flip later from a ring of staging textures had not helped (1.6 s
   per 10 s, same fps); not reading it at all does.

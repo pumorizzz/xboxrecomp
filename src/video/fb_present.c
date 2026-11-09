@@ -52,6 +52,96 @@ void xbox_FramebufferWindowExternal(int on)
 static uint32_t      s_fb_va, s_fb_pitch, s_fb_width = 640, s_fb_height = 480;
 static uint32_t     *s_rgb;           /* converted 32-bit copy for GDI */
 
+/* How the frame is shown: at what aspect, and how big the window opens.
+ *
+ * The guest frame stays 640x480; what changes is the picture it is shown as.
+ * A title patched for widescreen draws anamorphically into the same buffer,
+ * as on an Xbox set to 16:9, and a TV stretched it -- here the window does:
+ * the frame is scaled into the largest rectangle of the display aspect that
+ * fits the window, bars around it, filtered. RECOMP_FB_ASPECT=16:9 (or
+ * xbox_FramebufferWindowSetAspect, which a game project calls when it knows)
+ * sets the aspect; 4:3 by default. RECOMP_FB_SIZE=<w>x<h> (or
+ * xbox_FramebufferWindowSetSize) is the size the window's picture opens at --
+ * 2560x1440 draws a 1440p picture -- shrunk to fit the screen's work area;
+ * by default the frame's height at the display aspect (640x480, 853x480).
+ * F11, or RECOMP_FB_FULLSCREEN=1 from the start, fills the monitor without a
+ * border. Only the picture is larger: the title still renders 640x480. */
+static uint32_t s_aspect_n = 4, s_aspect_d = 3;
+static uint32_t s_disp_w, s_disp_h;   /* 0: from the frame and the aspect */
+static int      s_fullscreen;
+static RECT     s_windowed_rect;
+static LONG     s_windowed_style;
+
+void xbox_FramebufferWindowSetAspect(uint32_t n, uint32_t d)
+{
+    if (n && d) {
+        s_aspect_n = n;
+        s_aspect_d = d;
+    }
+}
+
+void xbox_FramebufferWindowSetSize(uint32_t w, uint32_t h)
+{
+    s_disp_w = w;
+    s_disp_h = h;
+}
+
+/* Where the frame goes in a cw x ch client area: the largest rectangle of the
+ * display aspect, centred. The D3D11 back end draws its swap chain the same
+ * way. */
+void xbox_FramebufferWindowFit(uint32_t cw, uint32_t ch, int32_t out[4])
+{
+    uint64_t w = cw, h = ch;
+
+    if (w * s_aspect_d > h * s_aspect_n)
+        w = (h * s_aspect_n + s_aspect_d / 2) / s_aspect_d;
+    else
+        h = (w * s_aspect_d + s_aspect_n / 2) / s_aspect_n;
+    if (!w) w = 1;
+    if (!h) h = 1;
+    out[0] = (int32_t)((cw - w) / 2);
+    out[1] = (int32_t)((ch - h) / 2);
+    out[2] = (int32_t)w;
+    out[3] = (int32_t)h;
+}
+
+static void fb_read_display_env(void)
+{
+    const char *a = getenv("RECOMP_FB_ASPECT"), *s = getenv("RECOMP_FB_SIZE");
+    unsigned n, d, w, h;
+
+    if (a && sscanf(a, "%u:%u", &n, &d) == 2)
+        xbox_FramebufferWindowSetAspect(n, d);
+    if (s && sscanf(s, "%ux%u", &w, &h) == 2 && w && h)
+        xbox_FramebufferWindowSetSize(w, h);
+}
+
+/* Borderless over the whole monitor, or back to the window it was. */
+static void fb_toggle_fullscreen(HWND h)
+{
+    if (!s_fullscreen) {
+        MONITORINFO mi;
+        mi.cbSize = sizeof mi;
+        if (!GetMonitorInfoA(MonitorFromWindow(h, MONITOR_DEFAULTTONEAREST), &mi))
+            return;
+        GetWindowRect(h, &s_windowed_rect);
+        s_windowed_style = GetWindowLongA(h, GWL_STYLE);
+        SetWindowLongA(h, GWL_STYLE, (s_windowed_style & ~WS_OVERLAPPEDWINDOW) | WS_POPUP);
+        SetWindowPos(h, HWND_TOP, mi.rcMonitor.left, mi.rcMonitor.top,
+                     mi.rcMonitor.right - mi.rcMonitor.left,
+                     mi.rcMonitor.bottom - mi.rcMonitor.top,
+                     SWP_FRAMECHANGED | SWP_NOOWNERZORDER);
+        s_fullscreen = 1;
+    } else {
+        SetWindowLongA(h, GWL_STYLE, s_windowed_style);
+        SetWindowPos(h, NULL, s_windowed_rect.left, s_windowed_rect.top,
+                     s_windowed_rect.right - s_windowed_rect.left,
+                     s_windowed_rect.bottom - s_windowed_rect.top,
+                     SWP_FRAMECHANGED | SWP_NOOWNERZORDER | SWP_NOZORDER);
+        s_fullscreen = 0;
+    }
+}
+
 /* A finished frame, taken at the flip and shown until the next one.
  *
  * The window used to convert straight out of guest memory every 16 ms. Even
@@ -175,6 +265,11 @@ static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
 
     case WM_KEYDOWN:
     case WM_SYSKEYDOWN:
+        if (w == VK_F11) {
+            if (!(l & (1 << 30)))       /* not auto-repeat */
+                fb_toggle_fullscreen(h);
+            return 0;
+        }
         xbox_InputKeySet((int)w, 1);
         /* RECOMP_KEY_TRACE: each key as it arrives, edge-triggered.
          *
@@ -303,10 +398,30 @@ static DWORD WINAPI fb_thread(LPVOID unused)
         wc.lpfnWndProc   = fb_wndproc;
         wc.hInstance     = GetModuleHandleA(NULL);
         wc.hCursor       = LoadCursorA(NULL, IDC_ARROW);
+        wc.hbrBackground = (HBRUSH)GetStockObject(BLACK_BRUSH);   /* the bars */
         wc.lpszClassName = "XboxRecompFramebuffer";
         RegisterClassA(&wc);
     }
-    r.left = 0; r.top = 0; r.right = (LONG)s_fb_width; r.bottom = (LONG)s_fb_height;
+    fb_read_display_env();
+    {
+        /* The picture's size, then shrunk (aspect kept) until the window,
+         * frame included, fits the work area. */
+        uint64_t cw = s_disp_w, ch = s_disp_h;
+        RECT work, fr = { 0, 0, 0, 0 };
+
+        if (!cw || !ch) {
+            ch = s_fb_height;
+            cw = (ch * s_aspect_n + s_aspect_d / 2) / s_aspect_d;
+        }
+        AdjustWindowRect(&fr, WS_OVERLAPPEDWINDOW, FALSE);
+        if (SystemParametersInfoA(SPI_GETWORKAREA, 0, &work, 0)) {
+            uint64_t mw = (uint64_t)(work.right - work.left) - (uint64_t)(fr.right - fr.left);
+            uint64_t mh = (uint64_t)(work.bottom - work.top) - (uint64_t)(fr.bottom - fr.top);
+            if (cw > mw) { ch = ch * mw / cw; cw = mw; }
+            if (ch > mh) { cw = cw * mh / ch; ch = mh; }
+        }
+        r.left = 0; r.top = 0; r.right = (LONG)cw; r.bottom = (LONG)ch;
+    }
     AdjustWindowRect(&r, WS_OVERLAPPEDWINDOW, FALSE);
     hwnd = CreateWindowExA(0, "XboxRecompFramebuffer", "Xbox Recomp - Framebuffer",
                            WS_OVERLAPPEDWINDOW | WS_VISIBLE,
@@ -319,6 +434,10 @@ static DWORD WINAPI fb_thread(LPVOID unused)
     }
     s_fb_hwnd = hwnd;
     hdc = GetDC(hwnd);
+    SetStretchBltMode(hdc, HALFTONE);   /* filtered when scaled, as the swap chain */
+    SetBrushOrgEx(hdc, 0, 0, NULL);
+    if (getenv("RECOMP_FB_FULLSCREEN") && atoi(getenv("RECOMP_FB_FULLSCREEN")))
+        fb_toggle_fullscreen(hwnd);
 
     memset(&bi, 0, sizeof(bi));
     bi.bmiHeader.biSize        = sizeof(bi.bmiHeader);
@@ -330,15 +449,20 @@ static DWORD WINAPI fb_thread(LPVOID unused)
 
     s_rgb = (uint32_t *)calloc((size_t)s_fb_width * s_fb_height, 4);
 
-    fprintf(stderr, "  [FBWIN] framebuffer window open (%ux%u)\n",
-            s_fb_width, s_fb_height);
+    fprintf(stderr, "  [FBWIN] framebuffer window open (%ux%u frame, shown %u:%u in %ldx%ld)\n",
+            s_fb_width, s_fb_height, s_aspect_n, s_aspect_d,
+            (long)(r.right - r.left), (long)(r.bottom - r.top));
 
     while (InterlockedCompareExchange(&s_fb_running, 1, 1)) {
         MSG msg;
+        RECT cr;
+        int32_t fit[4];
         while (PeekMessageA(&msg, NULL, 0, 0, PM_REMOVE)) {
             TranslateMessage(&msg);
             DispatchMessageA(&msg);
         }
+        GetClientRect(hwnd, &cr);
+        xbox_FramebufferWindowFit((uint32_t)cr.right, (uint32_t)cr.bottom, fit);
         if (s_fb_external) {
             /* Somebody else presents into this window. */
         } else if (s_present_idx >= 0 && s_rgb) {
@@ -349,7 +473,7 @@ static DWORD WINAPI fb_thread(LPVOID unused)
             if (s_present[idx])
                 memcpy(s_rgb, s_present[idx],
                        (size_t)s_fb_width * s_fb_height * 4);
-            StretchDIBits(hdc, 0, 0, (int)s_fb_width, (int)s_fb_height,
+            StretchDIBits(hdc, fit[0], fit[1], fit[2], fit[3],
                           0, 0, (int)s_fb_width, (int)s_fb_height,
                           s_rgb, &bi, DIB_RGB_COLORS, SRCCOPY);
         } else if (s_fb_va && s_fb_pitch && s_rgb) {
@@ -358,7 +482,7 @@ static DWORD WINAPI fb_thread(LPVOID unused)
             const uint8_t *src =
                 (const uint8_t *)((uintptr_t)s_fb_va + xbox_GetMemoryOffset());
             fb_convert(src, s_fb_pitch / s_fb_width);
-            StretchDIBits(hdc, 0, 0, (int)s_fb_width, (int)s_fb_height,
+            StretchDIBits(hdc, fit[0], fit[1], fit[2], fit[3],
                           0, 0, (int)s_fb_width, (int)s_fb_height,
                           s_rgb, &bi, DIB_RGB_COLORS, SRCCOPY);
         }
