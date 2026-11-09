@@ -336,6 +336,12 @@ thread waited on the worker, and the game froze on its main menu with
 so a stale close finds an empty slot and does nothing until the whole table
 has come round (`tests/kernel_bridge`).
 
+`NtDuplicateObject` with `DUPLICATE_CLOSE_SOURCE` releases the source token
+as well, whether the duplicate is made or not: the host closes the source
+handle either way, and Windows tends to give the duplicate the very same
+value, so a slot left behind named the live duplicate and a close through the
+dead token destroyed it.
+
 ### The Heap Grows Only on 487
 
 When `NtAllocateVirtualMemory` refuses a requested base it answers

@@ -174,6 +174,32 @@ int main(void)
         sp[0] = 0xBEEF0005u; sp[1] = b; sp[2] = 0;
         g_eax = 0xDEADBEEFu;
         CALL(16);                                         /* NtSetEvent(B) */
+        {
+            uint32_t set_b = g_eax;
+
+            /* NtDuplicateObject(A', &D, CLOSE_SOURCE | SAME_ACCESS) closes A''s
+             * host handle, and its token has to go with it. Windows may give
+             * the duplicate the very value A' had, so a slot left behind named
+             * the live duplicate: a close through the dead token A' -- a no-op
+             * on the kernel -- destroyed D. */
+            uint32_t a2, d;
+            sp[0] = 0xBEEF0003u; sp[1] = HANDLE_VA; sp[2] = 0; sp[3] = 1; sp[4] = 0;
+            CALL(8);                                      /* NtCreateEvent(&A') */
+            a2 = *(uint32_t *)(mem + HANDLE_VA);
+            sp[0] = 0xBEEF0006u; sp[1] = a2; sp[2] = 0x30020; sp[3] = 0x3u;
+            CALL(4);                                      /* NtDuplicateObject */
+            d = *(uint32_t *)(mem + 0x30020);
+            sp[0] = 0xBEEF0004u; sp[1] = a2;
+            CALL(12);                                     /* NtClose(A'), stale */
+            sp[0] = 0xBEEF0005u; sp[1] = d; sp[2] = 0;
+            g_eax = 0xDEADBEEFu;
+            CALL(16);                                     /* NtSetEvent(D) */
+            snprintf(detail, sizeof detail, "A' 0x%08X, D 0x%08X, NtSetEvent(D) 0x%08X",
+                     a2, d, g_eax);
+            check(d && d != a2 && g_eax == 0,
+                  "a close through a DUPLICATE_CLOSE_SOURCE'd token spares the duplicate", detail);
+            g_eax = set_b;
+        }
 #undef CALL
         {
 

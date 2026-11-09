@@ -5798,15 +5798,22 @@ static void bridge_RtlUnicodeStringToAnsiString(void)
  * by-value source token in, a 4-byte guest slot for the duplicated target.
  * The source resolves through the table, DuplicateHandle produces a real
  * native handle, and the target lands via bridge_write_handle as a fresh
- * token -- same shape as NtCreateEvent. DUPLICATE_CLOSE_SOURCE also closes
- * the native handle behind the source token, which is why the source token is
- * NOT consumed here (the OS handle it wraps is gone after this call). */
+ * token -- same shape as NtCreateEvent.
+ *
+ * DUPLICATE_CLOSE_SOURCE closes the native handle behind the source token,
+ * whether the duplicate is made or not, so the token is released with it.
+ * Left in the table, it named a handle value the host hands out again --
+ * Windows gives the duplicate the source's own value -- so a close through
+ * the dead token, a no-op on the kernel, destroyed the live duplicate
+ * (tests/kernel_bridge). */
 static void bridge_NtDuplicateObject(void)
 {
+    uint32_t src_token = STACK_ARG(0);
     uint32_t target_va = STACK_ARG(1);
-    HANDLE src = bridge_resolve_handle(STACK_ARG(0));
+    HANDLE src = bridge_resolve_handle(src_token);
     HANDLE dup = NULL;
     DWORD opts = 0;
+    BOOL ok;
 
     if (!target_va) {
         g_eax = 0xC000000Du;   /* STATUS_INVALID_PARAMETER */
@@ -5815,32 +5822,32 @@ static void bridge_NtDuplicateObject(void)
     if (STACK_ARG(2) & 0x1) opts |= DUPLICATE_CLOSE_SOURCE;
     if (STACK_ARG(2) & 0x2) opts |= DUPLICATE_SAME_ACCESS;
 
-    if (!DuplicateHandle(GetCurrentProcess(), src, GetCurrentProcess(),
-                         &dup, 0, FALSE, opts)) {
+    ok = DuplicateHandle(GetCurrentProcess(), src, GetCurrentProcess(),
+                         &dup, 0, FALSE, opts);
+    if (!ok) {
         static int logged = 0;
         if (logged++ < 8) {
             fprintf(stderr, "  [KERNEL] NtDuplicateObject: token=0x%08X "
                     "handle=%p failed (error %lu)\n",
-                    STACK_ARG(0), src, (unsigned long)GetLastError());
+                    src_token, src, (unsigned long)GetLastError());
             fflush(stderr);
         }
-        g_eax = 0xC0000001u;   /* STATUS_UNSUCCESSFUL */
-        return;
-    }
-    /* A host may hand back the current-process pseudo-handle itself as the
-     * duplicate (the POSIX shim does). It is not a table handle -- the token
-     * allocator would read it as INVALID_HANDLE_VALUE -- so give the guest
-     * its own NtCurrentProcess() value, which resolves back to it. */
-    if (dup == (HANDLE)(intptr_t)-1) {
+    } else if (dup == (HANDLE)(intptr_t)-1) {
+        /* A host may hand back the current-process pseudo-handle itself as
+         * the duplicate (the POSIX shim does). It is not a table handle --
+         * the token allocator would read it as INVALID_HANDLE_VALUE -- so give
+         * the guest its own NtCurrentProcess() value, which resolves back to
+         * it. */
         BRIDGE_MEM32(target_va) = 0xFFFFFFFFu;
-        g_eax = 0;
-        return;
+    } else {
+        BRIDGE_MEM32(target_va) = bridge_handle_token_ex(dup, 1);
+        thobj_attach_token(BRIDGE_MEM32(target_va), thobj_from_token(src_token));
     }
-    BRIDGE_MEM32(target_va) = bridge_handle_token_ex(dup, 1);
-    thobj_attach_token(BRIDGE_MEM32(target_va), thobj_from_token(STACK_ARG(0)));
-    if (opts & DUPLICATE_CLOSE_SOURCE)
-        thobj_detach_token(STACK_ARG(0));
-    g_eax = 0;
+    if (opts & DUPLICATE_CLOSE_SOURCE) {
+        thobj_detach_token(src_token);
+        bridge_take_handle(src_token);         /* the host closed it */
+    }
+    g_eax = ok ? 0 : 0xC0000001u;              /* STATUS_UNSUCCESSFUL */
 }
 
 /* ── Dispatch table: ordinal → bridge function + stack arg bytes ── */
