@@ -349,6 +349,22 @@ a batch transforms each vertex its index list names once, reusing the result
 for repeats (not when the program writes constants). Same-session A/B with
 `RECOMP_FPS_LIMIT=200`: Carbon spawn 77 -> 146 fps, the Ruby/bar spot 43 -> 98.
 
+Later, with point sprites and the zero-product rule in, the executor thread
+was busy 99% of the time by the bar, about 63% of it in the interpreter, while
+the title waited on the GPU fence and the software rasteriser's workers sat
+idle under the back end. A vertex's run reads only its attributes, the decoded
+program and the constants, so the vertices a batch runs are now shared out
+over several threads (`RECOMP_VSH_THREADS`, default half the logical
+processors): the executor marks which positions run and which reuse another's
+result, the runs go in chunks to the executor and its helpers, then the
+repeats are copied. Each helper takes the executor's MXCSR, so the results
+are the same bit for bit (`tests/nv2a_vsh_threads`, flush-to-zero included).
+A program that writes constants (CXT_WRITE_EN) still runs its vertices one by
+one, in order, and a batch with 256 or fewer to run stays on the executor.
+Same point by the bar, no frame limit: 66 fps on one thread, 130 on eight;
+about three quarters of the vertices ran threaded, none in programs that write
+constants.
+
 **Compare and far-reaching triangles.** The executor clips at the near plane
 at w = 1e-3 and hands over screen positions, so a triangle that crosses the
 near plane can have a vertex millions of pixels away. The software rasteriser's
@@ -369,6 +385,7 @@ frames Carbon compares at 0.00–0.02%.
 | `RECOMP_PB_EXEC` | execute it |
 | `RECOMP_PB_WALK=dma` | walk the pushbuffer like the DMA engine (JUMPs, wraps, GET per command, the `0x0310` latch) instead of scanning each submitted segment; see [The DMA Walk Is Opt-In](#the-dma-walk-is-opt-in) |
 | `RECOMP_PB_EXEC_VERBOSE` | per-batch trace |
+| `RECOMP_VSH_THREADS=<n>` | threads that run a batch's vertex programs, the executor included (default half the logical processors, at most 16); `1` runs every vertex on the executor thread |
 | `RECOMP_FFP_TRACE` | composite matrix and sample vertices of the first fixed-function batches |
 | `RECOMP_GPU_RASTER` | rasterise on the GPU through the D3D11 back end (`src/d3d/nv2a_gpu_d3d11.c`), once the game project calls `nv2a_gpu_d3d11_install()`: `1` a hardware adapter (WARP if none), `warp` the WARP adapter, `compare` the software path draws and the GPU draws alongside, printing per flip how far they differ and how many far-reaching triangles the frame had (`<RECOMP_FB_DUMP>gpu_/sw_<flip>_<surface>.bmp` for the first frames that differ by more than 1%). Unset or `0`: off |
 | `RECOMP_GPU_RASTER_SYNC=all` | the D3D11 back end writes its surfaces back at every executor sync, not only when they are read (for a title whose CPU reads what the GPU drew) |

@@ -334,6 +334,9 @@ static struct {
      * together are what a 3D scene needs and a 2D one never used. */
     uint32_t xf_mode;                   /* TRANSFORM_EXECUTION_MODE: 2 = program */
     uint32_t batches_program, verts_program, tris_behind;
+    /* Vertices run (not reused), of them on several threads, and vertices of
+     * batches whose program writes constants (run one by one, in order). */
+    uint32_t verts_run, verts_threaded, verts_cxt;
     /* Where program-path triangles go, so "nothing drew" has a reason. */
     uint32_t xf_degenerate, xf_offscreen, xf_drawn;
     uint64_t xf_depth_fail, xf_pixels;
@@ -3089,6 +3092,170 @@ static int transform_vertex(uint32_t index, Nv2aVshOutput *out)
     return 1;
 }
 
+/* A batch's vertices on several threads.
+ *
+ * Running the vertex program was most of the executor's time in a 3D scene
+ * (about 63% by Ruby's bar in Fallout, the executor thread busy 99% and the
+ * title waiting on it), while the rasteriser's workers sit idle under a GPU
+ * back end. A vertex's run reads only its attributes, the decoded program
+ * and the constants, so the vertices a batch runs can be shared out: the
+ * result is the same bit for bit. Not when the program writes constants
+ * (CXT_WRITE_EN) -- then each run sees the one before it and they go one by
+ * one, in order, as before.
+ *
+ * The executor sets a job up (gen odd), opens it (gen even), and takes
+ * chunks of it alongside the helpers; a helper counts itself in `active`
+ * before it takes a chunk and checks the job is still the one it woke for,
+ * so the executor, waiting for `active` to fall to 0, never changes a job
+ * a helper is still in. Each thread gets the executor's MXCSR, so rounding
+ * and denormals are the executor's.
+ *
+ * RECOMP_VSH_THREADS=<n> threads in all, the executor included (default half
+ * the logical processors, at most 16); 1 runs every vertex on the executor
+ * as before. A batch with fewer than NV_VSH_MIN_PARALLEL vertices to run is
+ * not worth the hand-over. */
+#define NV_VSH_MAX_THREADS 16
+#define NV_VSH_CHUNK 32
+#define NV_VSH_MIN_PARALLEL 256
+
+static int s_vsh_threads = -1;
+static uint32_t *s_xu;          /* positions in the batch whose vertex runs */
+static uint32_t *s_xsrc;        /* for each position, whose result it takes */
+
+static int vsh_threads(void)
+{
+    if (s_vsh_threads < 0) {
+        const char *e = getenv("RECOMP_VSH_THREADS");
+        int n = 1;
+#if defined(_WIN32)
+        SYSTEM_INFO si;
+        GetSystemInfo(&si);
+        n = (int)si.dwNumberOfProcessors / 2;
+#endif
+        if (e)
+            n = atoi(e);
+        s_vsh_threads = n < 1 ? 1 : n > NV_VSH_MAX_THREADS ? NV_VSH_MAX_THREADS : n;
+    }
+    return s_vsh_threads;
+}
+
+/* For tests and game projects: the thread count, as RECOMP_VSH_THREADS. */
+void nv2a_pb_exec_set_vsh_threads(int n)
+{
+    s_vsh_threads = n < 1 ? 1 : n > NV_VSH_MAX_THREADS ? NV_VSH_MAX_THREADS : n;
+}
+
+/* For tests: how many vertices have run on several threads. */
+uint32_t nv2a_pb_exec_vsh_threaded(void) { return s_gpu.verts_threaded; }
+
+#if defined(_WIN32) && (defined(_M_X64) || defined(_M_IX86) || defined(__x86_64__) || defined(__i386__))
+#include <xmmintrin.h>
+#define NV_VSH_POOL 1
+
+static struct {
+    int started;                /* helper threads created */
+    volatile LONG gen;          /* odd while a job is set up */
+    volatile LONG next;         /* the next chunk's first entry of s_xu */
+    volatile LONG active;       /* helpers inside the job */
+    volatile LONG failed;       /* a vertex could not be run */
+    uint32_t count;             /* entries of s_xu */
+    unsigned int csr;           /* the executor's MXCSR */
+} s_vp;
+
+static void vp_run(void)
+{
+    LONG c;
+
+    while ((c = InterlockedExchangeAdd(&s_vp.next, NV_VSH_CHUNK)) < (LONG)s_vp.count) {
+        uint32_t k, e = (uint32_t)c + NV_VSH_CHUNK;
+        if (e > s_vp.count)
+            e = s_vp.count;
+        for (k = (uint32_t)c; k < e; k++) {
+            uint32_t p = s_xu[k];
+            if (!transform_vertex(s_gpu.idx[p], &s_xf[p]))
+                s_vp.failed = 1;
+        }
+    }
+}
+
+static DWORD WINAPI vsh_worker(LPVOID arg)
+{
+    LONG last = 0;
+
+    (void)arg;
+    for (;;) {
+        LONG g = s_vp.gen;
+        int spins = 0;
+        while (g == last || (g & 1)) {
+            if (++spins < NV_RASTER_SPIN)
+                YieldProcessor();
+            else
+                WaitOnAddress(&s_vp.gen, &g, sizeof g, INFINITE);
+            g = s_vp.gen;
+        }
+        InterlockedIncrement(&s_vp.active);
+        if (s_vp.gen == g) {
+            if (_mm_getcsr() != s_vp.csr)
+                _mm_setcsr(s_vp.csr);
+            vp_run();
+        }
+        InterlockedDecrement(&s_vp.active);
+        last = g;
+    }
+    return 0;
+}
+
+static void vp_quiet(void)
+{
+    while (s_vp.active)
+        YieldProcessor();
+}
+#endif
+
+/* Run the vertices s_xu names, into s_xf at their positions. 0 if one could
+ * not be run (no program loaded), as transform_vertex. */
+static int transform_batch(uint32_t nu)
+{
+    uint32_t k;
+
+    if (!nu)
+        return 1;
+    /* The first on the executor alone: it decodes a changed program, and
+     * whether there is one to run at all is answered once. */
+    if (!transform_vertex(s_gpu.idx[s_xu[0]], &s_xf[s_xu[0]]))
+        return 0;
+    s_gpu.verts_run += nu;
+#if defined(NV_VSH_POOL)
+    if (nu > NV_VSH_MIN_PARALLEL) {
+        while (s_vp.started < vsh_threads() - 1) {
+            HANDLE h = CreateThread(NULL, 0, vsh_worker, NULL, 0, NULL);
+            if (!h)
+                break;
+            CloseHandle(h);
+            s_vp.started++;
+        }
+    }
+    if (nu > NV_VSH_MIN_PARALLEL && s_vp.started) {
+        InterlockedIncrement(&s_vp.gen);                /* odd: setting up */
+        vp_quiet();
+        s_vp.count = nu;
+        s_vp.next = 1;                                  /* s_xu[0] is done */
+        s_vp.failed = 0;
+        s_vp.csr = _mm_getcsr();
+        InterlockedIncrement(&s_vp.gen);                /* even: open */
+        WakeByAddressAll((PVOID)&s_vp.gen);
+        vp_run();
+        vp_quiet();
+        s_gpu.verts_threaded += nu;
+        return !s_vp.failed;
+    }
+#endif
+    for (k = 1; k < nu; k++)
+        if (!transform_vertex(s_gpu.idx[s_xu[k]], &s_xf[s_xu[k]]))
+            return 0;
+    return 1;
+}
+
 static void xf_set_viewport(void)
 {
     const float *of = nv2a_vsh_constant(59);
@@ -3174,6 +3341,10 @@ static void raster_batch_program(void)
 
     if (!s_xf && !(s_xf = (Nv2aVshOutput *)calloc(NV_MAX_INDICES, sizeof *s_xf)))
         return;
+    if (!s_xu && !(s_xu = (uint32_t *)calloc(NV_MAX_INDICES, sizeof *s_xu)))
+        return;
+    if (!s_xsrc && !(s_xsrc = (uint32_t *)calloc(NV_MAX_INDICES, sizeof *s_xsrc)))
+        return;
     {
         /* A vertex an index list names twice is transformed once: what it
          * comes out as depends only on its attributes, which the index picks,
@@ -3190,6 +3361,34 @@ static void raster_batch_program(void)
             memset(vc, 0, sizeof vc);
             gen = 1;
         }
+        if (!reuse)
+            s_gpu.verts_cxt += n;
+        else if (vsh_threads() > 1) {
+            /* The same reuse, with the runs on several threads: first which
+             * positions run and which take another's result, then the runs,
+             * then the copies. */
+            uint32_t nu = 0;
+
+            for (i = 0; i < n; i++) {
+                uint32_t ix = s_gpu.idx[i];
+                uint32_t slot = (ix * 2654435761u) >> 20;
+                if (vc[slot].gen == gen && vc[slot].idx == ix) {
+                    s_xsrc[i] = vc[slot].pos;
+                    continue;
+                }
+                s_xsrc[i] = i;
+                s_xu[nu++] = i;
+                vc[slot].idx = ix;
+                vc[slot].pos = i;
+                vc[slot].gen = gen;
+            }
+            if (!transform_batch(nu))
+                return;                                /* no program loaded */
+            for (i = 0; i < n; i++)
+                if (s_xsrc[i] != i)
+                    s_xf[i] = s_xf[s_xsrc[i]];
+            goto transformed;
+        }
         for (i = 0; i < n; i++) {
             uint32_t ix = s_gpu.idx[i];
             uint32_t slot = (ix * 2654435761u) >> 20;
@@ -3199,12 +3398,14 @@ static void raster_batch_program(void)
             }
             if (!transform_vertex(ix, &s_xf[i]))
                 return;                                /* no program loaded */
+            s_gpu.verts_run++;
             vc[slot].idx = ix;
             vc[slot].pos = i;
             vc[slot].gen = gen;
         }
 #undef XF_VCACHE
     }
+transformed:
     xf_set_viewport();
     {
         const VertexAttr *tc = texcoord_attr();
@@ -4730,6 +4931,9 @@ void nv2a_pb_exec_report(void)
     fprintf(stderr, "[GPU] vertex programs: %u batches, %u vertices;"
                     " %u triangles dropped behind the eye\n",
             s_gpu.batches_program, s_gpu.verts_program, s_gpu.tris_behind);
+    fprintf(stderr, "[GPU] vertex transform: %u run, %u of them on %d threads;"
+                    " %u in batches that write constants\n",
+            s_gpu.verts_run, s_gpu.verts_threaded, vsh_threads(), s_gpu.verts_cxt);
     if (s_gpu.batches_ffp)
         fprintf(stderr, "[GPU] fixed-function transform: %u batches\n",
                 s_gpu.batches_ffp);
