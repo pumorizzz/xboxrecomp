@@ -69,10 +69,13 @@ int main(void)
     }
     g_xbox_mem_offset = (ptrdiff_t)mem;
 
-    /* Two imports, in the form an XBE stores them: 0x80000000 | ordinal. */
+    /* The imports, in the form an XBE stores them: 0x80000000 | ordinal. */
     *(uint32_t *)(mem + THUNK_VA) = 0x80000000u | 173u;
     *(uint32_t *)(mem + THUNK_VA + 4) = 0x80000000u | 197u;
-    xbox_kernel_set_thunk_address(THUNK_VA, 2);
+    *(uint32_t *)(mem + THUNK_VA + 8) = 0x80000000u | 189u;    /* NtCreateEvent */
+    *(uint32_t *)(mem + THUNK_VA + 12) = 0x80000000u | 187u;   /* NtClose */
+    *(uint32_t *)(mem + THUNK_VA + 16) = 0x80000000u | 225u;   /* NtSetEvent */
+    xbox_kernel_set_thunk_address(THUNK_VA, 5);
     xbox_kernel_bridge_init();
 
     /* bridge_init rewrites the entry in place to a synthetic VA. */
@@ -139,6 +142,45 @@ int main(void)
                      g_esp, STACK_VA + 16);
             check(g_esp == STACK_VA + 16,
                   "ordinal 197 pops its three stdcall arguments", detail);
+        }
+    }
+
+    /* A handle closed twice must not take a newer object with it. Fallout:
+     * Brotherhood of Steel closes its .clp archives twice at every load; when
+     * the freed token went straight to the next object, the second close
+     * destroyed that object -- a Bink worker's event or mutex, with the
+     * worker waiting on it for good. Event A is made and closed, event B is
+     * made, A is closed again: B keeps its own token and can still be set. */
+    {
+        /* The dispatcher a lookup returns serves the entry looked up last, so
+         * each call looks its entry up first. */
+#define CALL(off) do { recomp_func_t f_ = recomp_lookup_kernel(*(uint32_t *)(mem + THUNK_VA + (off))); \
+                       g_esp = STACK_VA; if (f_) f_(); } while (0)
+        const uint32_t HANDLE_VA = 0x30010;
+        uint32_t *sp = (uint32_t *)(mem + STACK_VA);
+        uint32_t a, b;
+        char detail[128];
+
+        sp[0] = 0xBEEF0003u; sp[1] = HANDLE_VA; sp[2] = 0; sp[3] = 1; sp[4] = 0;
+        CALL(8);                                          /* NtCreateEvent(&A) */
+        a = *(uint32_t *)(mem + HANDLE_VA);
+        sp[0] = 0xBEEF0004u; sp[1] = a;
+        CALL(12);                                         /* NtClose(A) */
+        sp[0] = 0xBEEF0003u; sp[1] = HANDLE_VA; sp[2] = 0; sp[3] = 1; sp[4] = 0;
+        CALL(8);                                          /* NtCreateEvent(&B) */
+        b = *(uint32_t *)(mem + HANDLE_VA);
+        sp[0] = 0xBEEF0004u; sp[1] = a;
+        CALL(12);                                         /* NtClose(A), again */
+        sp[0] = 0xBEEF0005u; sp[1] = b; sp[2] = 0;
+        g_eax = 0xDEADBEEFu;
+        CALL(16);                                         /* NtSetEvent(B) */
+#undef CALL
+        {
+
+            snprintf(detail, sizeof detail, "A 0x%08X, B 0x%08X", a, b);
+            check(a && b && a != b, "a new object does not get a just-closed token", detail);
+            snprintf(detail, sizeof detail, "NtSetEvent(B) status 0x%08X", g_eax);
+            check(g_eax == 0, "closing A twice leaves B working", detail);
         }
     }
 

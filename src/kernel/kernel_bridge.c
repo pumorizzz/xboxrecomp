@@ -3315,13 +3315,27 @@ static void handle_lock(void)
 
 static void handle_unlock(void) { InterlockedExchange(&s_handle_lock, 0); }
 
+/* Where the search for a free slot starts: just past the last token given
+ * out, wrapping at the end.
+ *
+ * A title may close a handle twice. Fallout: Brotherhood of Steel closes its
+ * .clp archives, and a few calls later closes them again, at every level and
+ * menu load. When the freed slot went to the very next object, the second
+ * close destroyed that object instead: a Bink worker's mutex or event made by
+ * another thread in that window was closed while the worker waited on it, the
+ * worker never woke, and the main thread waited on the worker for good (the
+ * game froze on its main menu with intro.bik looping). Handed out in turn, a
+ * slot comes back only after the whole table has, and a stale close finds it
+ * empty and does nothing. */
+static int s_handle_next = 1;
+
 /* A token for h. The same HANDLE normally gets the same token. A duplicate
  * must not: on POSIX, DuplicateHandle returns its source pointer with one
  * more reference. If the duplicate shared the source's token, NtClose on
  * either one would clear the slot that both of them use. */
 static uint32_t bridge_handle_token_ex(HANDLE h, int fresh)
 {
-    int i;
+    int i, n;
     if (!h || h == INVALID_HANDLE_VALUE) return 0;
     handle_lock();
     for (i = 1; !fresh && i < BRIDGE_HANDLE_MAX; i++)
@@ -3329,12 +3343,17 @@ static uint32_t bridge_handle_token_ex(HANDLE h, int fresh)
             handle_unlock();
             return BRIDGE_HANDLE_TAG | (uint32_t)i;
         }
-    for (i = 1; i < BRIDGE_HANDLE_MAX; i++)
+    for (n = 1, i = s_handle_next; n < BRIDGE_HANDLE_MAX; n++) {
+        if (i >= BRIDGE_HANDLE_MAX)
+            i = 1;
         if (s_handle_table[i] == NULL) {
             s_handle_table[i] = h;
+            s_handle_next = i + 1;
             handle_unlock();
             return BRIDGE_HANDLE_TAG | (uint32_t)i;
         }
+        i++;
+    }
     handle_unlock();
     fprintf(stderr, "  [BRIDGE] handle table full\n");
     return 0;

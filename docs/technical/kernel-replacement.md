@@ -322,6 +322,20 @@ Handle tokens at `0xFFFFFFF0` and above are sign-extended in
 `bridge_resolve_handle`, and the first few `NtDuplicateObject` failures are
 logged with the handle and the Windows error.
 
+### A Closed Token Is Not Handed Out Again Soon
+
+Guest handles are tokens (`0x48000000 | slot`) into the bridge's table of
+host HANDLEs. A free slot used to be the lowest one, so the token a title had
+just closed went to the very next object. *Fallout: Brotherhood of Steel*
+closes its `.clp` archives twice at every level and menu load, a few calls
+apart. When another thread made an object in between — a Bink worker's mutex
+or event — it got the archive's old token, and the title's second close
+destroyed it under the worker waiting on it. The worker never woke, the main
+thread waited on the worker, and the game froze on its main menu with
+`intro.bik` looping. Slots are now handed out in turn from the last one given,
+so a stale close finds an empty slot and does nothing until the whole table
+has come round (`tests/kernel_bridge`).
+
 ### The Heap Grows Only on 487
 
 When `NtAllocateVirtualMemory` refuses a requested base it answers
