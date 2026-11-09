@@ -17,3 +17,9 @@ if(MSVC)
     target_compile_definitions(nv2a-gpu-backend-test PRIVATE _CRT_SECURE_NO_WARNINGS)
 endif()
 add_test(NAME nv2a-gpu-backend COMMAND nv2a-gpu-backend-test)
+# The same at an internal resolution of 3x3 with 4x MSAA (RECOMP_GPU_RASTER_SCALE):
+# the rows the CPU wrote go up through the scaled targets, writebacks come down
+# averaged, a target sampled as a texture is read at the high resolution.
+add_test(NAME nv2a-gpu-backend-scaled COMMAND nv2a-gpu-backend-test)
+set_tests_properties(nv2a-gpu-backend-scaled PROPERTIES
+    ENVIRONMENT "RECOMP_GPU_RASTER_SCALE=3;RECOMP_GPU_RASTER_MSAA=4")

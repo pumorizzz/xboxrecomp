@@ -329,8 +329,25 @@ Two more steps took the readback out of the frame altogether:
   it. `RECOMP_FB_ASPECT=16:9` (or `xbox_FramebufferWindowSetAspect`, for a
   title patched to draw 16:9 anamorphically) sets the aspect,
   `RECOMP_FB_SIZE=2560x1440` the picture's size (shrunk to the work area),
-  F11 or `RECOMP_FB_FULLSCREEN=1` borderless full screen. The title still
-  renders at its own resolution; only the picture is larger.
+  F11 or `RECOMP_FB_FULLSCREEN=1` borderless full screen.
+- **Internal resolution and MSAA.** `RECOMP_GPU_RASTER_SCALE=<n>|<x>x<y>`
+  (1-8) makes every target and depth buffer that many times the surface,
+  `RECOMP_GPU_RASTER_MSAA=<n>` multisamples them (lowered to what the device
+  has; compare forces both off). Vertices stay in surface pixels and the
+  viewport is scaled. Guest RAM keeps the surface's own size: rows the CPU
+  wrote go up through a native texture drawn point by point over each block
+  (`bps_up`), a writeback resolves and averages each block down (`bps_down`,
+  `rt_read_native`), so shadows, `rt_taken` and the software path compare
+  native bytes as before. A target sampled as a texture is read at the high
+  resolution (`rt_texel`; a swizzled view takes each block's centre), and the
+  presenter draws the high-resolution frame. All targets and depth buffers
+  share one size, as D3D11 wants a target and its depth buffer equal: native
+  1280 x `s_gh`, where `s_gh` starts at 512 and grows -- everything written
+  back and made again -- when a surface reaches lower. Occlusion counts are
+  divided back to pixels. Scale 1 without MSAA is the old path exactly.
+  Cost is GPU time per pixel (the combiner ubershader): Fallout's menu,
+  uncapped on an RTX 3080 Ti, 1x ~1,800 fps, 3x3 + 4x MSAA ~122, 4x3 + 4x ~85.
+  `tests/nv2a_gpu_backend` runs a second time at 3x3 + 4x MSAA.
   Headless there is nothing to show, so nothing is read back. Reading the
   frame a flip later from a ring of staging textures had not helped (1.6 s
   per 10 s, same fps); not reading it at all does.

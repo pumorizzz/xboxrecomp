@@ -91,12 +91,11 @@ static void draw_quad(uint32_t va, uint32_t tex, uint32_t fmt, int sync);
 
 static void draw_textured_at(uint32_t va, uint32_t tex) { draw_quad(va, tex, 0x12, 1); }
 
-static void draw_quad(uint32_t va, uint32_t tex, uint32_t fmt, int sync)
+/* Fixed function, white diffuse, stage 0 the W x H texture at tex; vertices
+ * `n` of P (positions, texcoords = positions). */
+static void fixed_state(uint32_t tex, uint32_t fmt, const float (*P)[3], uint32_t n)
 {
     static const float I[16] = { 1, 0, 0, 0,  0, 1, 0, 0,  0, 0, 1, 0,  0, 0, 0, 1 };
-    static const float P[6][3] = {
-        { 0, 0, 0 }, { W, 0, 0 }, { 0, H, 0 }, { W, 0, 0 }, { W, H, 0 }, { 0, H, 0 },
-    };
     uint32_t i, white = 0xFFFFFFFFu;
 
     for (i = 0; i < 16; i++)
@@ -106,7 +105,7 @@ static void draw_quad(uint32_t va, uint32_t tex, uint32_t fmt, int sync)
     mf(0x0394, 0.0f);                        /* SET_CLIP_MIN */
     mf(0x0398, 16777215.0f);                 /* SET_CLIP_MAX */
     m(0x1E94, 0);                            /* fixed function */
-    for (i = 0; i < 6; i++) {
+    for (i = 0; i < n; i++) {
         float tc[2];
         tc[0] = P[i][0]; tc[1] = P[i][1];
         memcpy(s_mem + POS_AT + 12u * i, P[i], 12);
@@ -120,6 +119,15 @@ static void draw_quad(uint32_t va, uint32_t tex, uint32_t fmt, int sync)
     m(0x1B04, (fmt << 8) | (1u << 16) | (6u << 20) | (6u << 24));  /* FORMAT, 1 level, 64x64 */
     m(0x1B10, (uint32_t)PITCH << 16);        /* CONTROL1: pitch */
     m(0x1B1C, ((uint32_t)W << 16) | H);      /* IMAGE_RECT */
+}
+
+static void draw_quad(uint32_t va, uint32_t tex, uint32_t fmt, int sync)
+{
+    static const float P[6][3] = {
+        { 0, 0, 0 }, { W, 0, 0 }, { 0, H, 0 }, { W, 0, 0 }, { W, H, 0 }, { 0, H, 0 },
+    };
+
+    fixed_state(tex, fmt, P, 6);
     if (sync)
         m(0x0210, va);                       /* SET_SURFACE_COLOR_OFFSET (a new epoch) */
     m(0x17FC, 5);                            /* BEGIN_END: triangles */
@@ -127,6 +135,19 @@ static void draw_quad(uint32_t va, uint32_t tex, uint32_t fmt, int sync)
     m(0x17FC, 0);
     if (sync)
         nv2a_pb_exec_sync();
+}
+
+/* A triangle (0,0) (W,0) (0,H) on the surface at va, as draw_quad. */
+static void draw_tri(uint32_t va, uint32_t tex)
+{
+    static const float P[3][3] = { { 0, 0, 0 }, { W, 0, 0 }, { 0, H, 0 } };
+
+    fixed_state(tex, 0x12, P, 3);
+    m(0x0210, va);                           /* SET_SURFACE_COLOR_OFFSET */
+    m(0x17FC, 5);                            /* BEGIN_END: triangles */
+    m(0x1810, (2u << 24) | 0);               /* DRAW_ARRAYS 3 from 0 */
+    m(0x17FC, 0);
+    nv2a_pb_exec_sync();
 }
 
 /* Every target the back end holds dirty, into guest RAM (the report's READ
@@ -224,6 +245,43 @@ int main(void)
     CHECK(surface_is(SURF(16), 0));          /* the Map failed: nothing yet */
     write_back_all();
     CHECK(surface_is(SURF(16), CLEAR_ARGB));
+
+    /* The internal scale (RECOMP_GPU_RASTER_SCALE, _MSAA; ctest runs this
+     * twice): a white triangle across black, cut along the diagonal, comes
+     * back to guest RAM with the edge pixels between the two -- each the
+     * average of its block drawn at the higher resolution. At scale 1 a pixel
+     * is either colour. The interior stays exact either way. */
+    {
+        const char *sc = getenv("RECOMP_GPU_RASTER_SCALE");
+        int scaled = sc && atoi(sc) > 1;
+        uint32_t x, y, v, mixed = 0, solid_ok = 1;
+        memset(s_mem + SURF(12), 0xFF, PITCH * H);   /* a white texture */
+        clear_surface_to(SURF(24), 0xFF000000u);
+        draw_tri(SURF(24), SURF(12));
+        write_back_all();
+        for (y = 0; y < H; y++)
+            for (x = 0; x < W; x++) {
+                memcpy(&v, s_mem + SURF(24) + y * PITCH + 4 * x, 4);
+                if ((v & 0xFFFFFF) != 0 && (v & 0xFFFFFF) != 0xFFFFFF)
+                    mixed++;
+                if (x + y + 2 < W && v != 0xFFFFFFFFu)      /* well inside */
+                    solid_ok = 0;
+                if (x + y > W + 1 && v != 0xFF000000u)       /* well outside */
+                    solid_ok = 0;
+            }
+        printf("diagonal edge: %u pixels between black and white (scaled %d)\n",
+               mixed, scaled);
+        CHECK(solid_ok);
+        CHECK(scaled ? mixed > W / 2 : mixed == 0);
+
+        /* That target sampled as a texture, texel for pixel, onto D: read at
+         * the high resolution, D comes down to the very bytes the target did.
+         * Read at the surface's own (or from the wrong texels), the edge
+         * would differ. */
+        draw_textured_at(SURF(13), SURF(24));
+        write_back_all();
+        CHECK(memcmp(s_mem + SURF(13), s_mem + SURF(24), PITCH * H) == 0);
+    }
 
     /* Device loss at the third flip. */
     clear_surface_at(SURF(17));
