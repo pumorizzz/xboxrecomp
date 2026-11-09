@@ -27,6 +27,9 @@
  * sampled must not take the fresh ones along. (In between it draws
  * elsewhere, as a title must: D3D frees a surface only once the GPU is done
  * with it, and the back end looks for taken bytes when the target changes.)
+ * Nor may a writeback in the same epoch as a look write stale pixels: T is
+ * sampled, then taken, then -- no epoch boundary in between -- decoded as a
+ * DXT1 texture, which writes T back first. T's bytes stay the CPU's.
  *
  * A readback whose Map fails keeps its target dirty: the next one writes it
  * (NV2A_GPU_TEST_HOOKS fails the Map, which WARP never does by itself).
@@ -76,8 +79,13 @@ static void m(uint32_t method, uint32_t param) { nv2a_pb_exec_method(0, method, 
 static void mf(uint32_t method, float f) { uint32_t u; memcpy(&u, &f, 4); m(method, u); }
 
 /* A quad over the whole surface at va, fixed function, white, sampling
- * stage 0 -- a linear A8R8G8B8 texture W x H at tex. */
-static void draw_textured_at(uint32_t va, uint32_t tex)
+ * stage 0 -- a W x H texture at tex, linear A8R8G8B8 unless fmt says else.
+ * With sync 0 the executor's scan does not end: the back end's epoch stays. */
+static void draw_quad(uint32_t va, uint32_t tex, uint32_t fmt, int sync);
+
+static void draw_textured_at(uint32_t va, uint32_t tex) { draw_quad(va, tex, 0x12, 1); }
+
+static void draw_quad(uint32_t va, uint32_t tex, uint32_t fmt, int sync)
 {
     static const float I[16] = { 1, 0, 0, 0,  0, 1, 0, 0,  0, 0, 1, 0,  0, 0, 0, 1 };
     static const float P[6][3] = {
@@ -103,14 +111,16 @@ static void draw_textured_at(uint32_t va, uint32_t tex)
     m(0x172C, DIFF_AT); m(0x176C, 0 | (4 << 4) | (4 << 8));    /* attr 3: D3DCOLOR */
     m(0x1744, TC_AT);   m(0x1784, 2 | (2 << 4) | (8 << 8));    /* attr 9: float2 */
     m(0x1B00, tex);                          /* SET_TEXTURE_OFFSET */
-    m(0x1B04, (0x12u << 8) | (1u << 16));    /* FORMAT: linear A8R8G8B8, 1 level */
+    m(0x1B04, (fmt << 8) | (1u << 16) | (6u << 20) | (6u << 24));  /* FORMAT, 1 level, 64x64 */
     m(0x1B10, (uint32_t)PITCH << 16);        /* CONTROL1: pitch */
     m(0x1B1C, ((uint32_t)W << 16) | H);      /* IMAGE_RECT */
-    m(0x0210, va);                           /* SET_SURFACE_COLOR_OFFSET */
+    if (sync)
+        m(0x0210, va);                       /* SET_SURFACE_COLOR_OFFSET (a new epoch) */
     m(0x17FC, 5);                            /* BEGIN_END: triangles */
     m(0x1810, (5u << 24) | 0);               /* DRAW_ARRAYS 6 from 0 */
     m(0x17FC, 0);
-    nv2a_pb_exec_sync();
+    if (sync)
+        nv2a_pb_exec_sync();
 }
 
 /* Every target the back end holds dirty, into guest RAM (the report's READ
@@ -190,7 +200,18 @@ int main(void)
     write_back_all();
     CHECK(surface_is(SURF(20), 0xFF405060u));
 
-    /* A failed readback keeps the target dirty for the next one. */
+    /* Sampled, taken, written back -- all in one epoch. */
+    clear_surface_at(SURF(22));              /* T */
+    m(0x0210, SURF(23));                     /* D, then no epoch boundary: */
+    draw_quad(SURF(23), SURF(22), 0x12, 0);  /* T looked at, sampled */
+    memset(s_mem + SURF(22), 0xAB, PITCH * H);
+    draw_quad(SURF(23), SURF(22), 0x0C, 0);  /* DXT1 at T: T written back first */
+    nv2a_pb_exec_sync();
+    CHECK(surface_is(SURF(22), 0xABABABABu));
+
+    /* A failed readback keeps the target dirty for the next one. Every other
+     * target clean first, so the one failure lands on this one. */
+    write_back_all();
     clear_surface_at(SURF(16));
     nv2a_gpu_test_fail_maps = 1;
     write_back_all();

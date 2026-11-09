@@ -681,13 +681,15 @@ static int rt_take_dirty(GpuRt *r, uint32_t *x0, uint32_t *y0, uint32_t *x1,
  * for good. Writing it back then laid stale pixels over the new owner -- a
  * texture, vertices, objects -- and sampling it served the stale pixels in
  * place of the new texels. Such a target drops what it drew and takes guest
- * RAM as it is. Compared once an epoch: a dirty target is sampled per draw. */
-static int rt_taken(GpuRt *r)
+ * RAM as it is. Compared once an epoch where it is sampled or drawn into --
+ * that happens per draw -- but before every writeback: a writeback is rare,
+ * and the CPU may have taken the bytes since this epoch's look. */
+static int rt_taken(GpuRt *r, int every_time)
 {
     uint32_t rb = rt_row_bytes(r), y, x0, x1, y1;
     const uint8_t *g = guest(r->va);
 
-    if (!r->dirty || r->need_full || s_compare || r->taken_epoch == s_epoch)
+    if (!r->dirty || r->need_full || s_compare || (!every_time && r->taken_epoch == s_epoch))
         return 0;
     r->taken_epoch = s_epoch;
     x0 = r->dx0;
@@ -726,7 +728,7 @@ static void rt_writeback(GpuRt *r)
     uint32_t x0, x1, y0, y1;
     double t0;
 
-    if (rt_taken(r) || !rt_take_dirty(r, &x0, &y0, &x1, &y1))
+    if (rt_taken(r, 1) || !rt_take_dirty(r, &x0, &y0, &x1, &y1))
         return;
     box.left = x0; box.right = x1; box.top = y0; box.bottom = y1;
     box.front = 0; box.back = 1;
@@ -872,7 +874,7 @@ static GpuRt *rt_acquire(const Nv2aSurface *s)
      * freed it -- D3D waits for the fence before it lets go of a surface, so
      * its bytes change hands only after work went elsewhere. */
     if (r != s_last_acquired)
-        rt_taken(r);
+        rt_taken(r, 0);
     s_last_acquired = r;
     if (!rt_check(r)) {
         if (!said_bad++)
@@ -1498,7 +1500,7 @@ static GpuRt *rt_as_texture(const Nv2aTexture *t, const Nv2aSurface *dst,
         if (ranges_overlap(r->va, rt_end(r), dst->color_va,
                            dst->color_va + (dst->clip_y + dst->height) * dst->pitch))
             return NULL;                /* the surface being drawn: via guest RAM */
-        rt_taken(r);
+        rt_taken(r, 0);
         if (!rt_check(r))               /* clean: catch up with CPU writes first */
             return NULL;
         return r;
