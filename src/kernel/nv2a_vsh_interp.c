@@ -33,6 +33,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#if defined(__SSE2__) || defined(_M_X64) || (defined(_M_IX86_FP) && _M_IX86_FP >= 2)
+#include <emmintrin.h>
+#define VSH_SSE 1
+#endif
 
 static uint32_t s_program[NV2A_VSH_SLOTS][4];
 static float    s_const[NV2A_VSH_CONSTANTS][4];
@@ -331,10 +335,25 @@ static vec4 splat(float f)
  * lighting program multiplies the colours of unused lights, which hold leftover
  * values up to infinity, by their zero intensity; with NaN there the red
  * channel came out saturated and crates and training robots turned bright red.
- * Dot products have no such rule. */
-static float mul_hw(float a, float b)
+ * Dot products have no such rule.
+ *
+ * All four lanes at once, without a branch: the rule written per component
+ * as a == 0 || b == 0 ? 0 : a * b kept the compiler from vectorising the
+ * hottest loop of the interpreter, and cost about a sixth of the frame by
+ * Ruby's bar (66 -> 56 fps). */
+static vec4 mul4_hw(const vec4 *a, const vec4 *b)
 {
-    return a == 0.0f || b == 0.0f ? 0.0f : a * b;
+    vec4 r;
+#ifdef VSH_SSE
+    __m128 x = _mm_loadu_ps(a->v), y = _mm_loadu_ps(b->v), z = _mm_setzero_ps();
+    __m128 zero = _mm_or_ps(_mm_cmpeq_ps(x, z), _mm_cmpeq_ps(y, z));
+    _mm_storeu_ps(r.v, _mm_andnot_ps(zero, _mm_mul_ps(x, y)));
+#else
+    int i;
+    for (i = 0; i < 4; i++)
+        r.v[i] = a->v[i] == 0.0f || b->v[i] == 0.0f ? 0.0f : a->v[i] * b->v[i];
+#endif
+    return r;
 }
 
 static vec4 run_mac(uint32_t op, vec4 a, vec4 b, vec4 c, int *a0)
@@ -344,9 +363,9 @@ static vec4 run_mac(uint32_t op, vec4 a, vec4 b, vec4 c, int *a0)
 
     switch (op) {
     case 1: break;                                            /* mov */
-    case 2: for (i = 0; i < 4; i++) r.v[i] = mul_hw(a.v[i], b.v[i]); break;
+    case 2: r = mul4_hw(&a, &b); break;
     case 3: for (i = 0; i < 4; i++) r.v[i] = a.v[i] + c.v[i]; break;
-    case 4: for (i = 0; i < 4; i++) r.v[i] = mul_hw(a.v[i], b.v[i]) + c.v[i]; break;
+    case 4: r = mul4_hw(&a, &b); for (i = 0; i < 4; i++) r.v[i] += c.v[i]; break;
     case 5: r = splat(a.v[0]*b.v[0] + a.v[1]*b.v[1] + a.v[2]*b.v[2]); break;
     case 6: r = splat(a.v[0]*b.v[0] + a.v[1]*b.v[1] + a.v[2]*b.v[2]
                       + b.v[3]); break;                        /* dph */
