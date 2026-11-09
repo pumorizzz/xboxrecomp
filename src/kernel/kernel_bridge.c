@@ -5844,6 +5844,9 @@ static void bridge_NtDuplicateObject(void)
         thobj_attach_token(BRIDGE_MEM32(target_va), thobj_from_token(src_token));
     }
     if (opts & DUPLICATE_CLOSE_SOURCE) {
+        /* As NtClose: the token goes back without the asynchronous-I/O mark
+         * of the file it named, or the next owner's reads answer PENDING. */
+        bridge_forget_async_handle(src_token);
         thobj_detach_token(src_token);
         bridge_take_handle(src_token);         /* the host closed it */
     }

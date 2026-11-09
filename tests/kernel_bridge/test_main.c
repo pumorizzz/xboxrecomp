@@ -29,6 +29,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#if !defined(_WIN32)
+#include <unistd.h>
+#endif
 
 /* Provided by the generated title; a regression harness has no title, and a
  * static archive resolves only what gets pulled in. Nothing here calls a
@@ -75,7 +78,9 @@ int main(void)
     *(uint32_t *)(mem + THUNK_VA + 8) = 0x80000000u | 189u;    /* NtCreateEvent */
     *(uint32_t *)(mem + THUNK_VA + 12) = 0x80000000u | 187u;   /* NtClose */
     *(uint32_t *)(mem + THUNK_VA + 16) = 0x80000000u | 225u;   /* NtSetEvent */
-    xbox_kernel_set_thunk_address(THUNK_VA, 5);
+    *(uint32_t *)(mem + THUNK_VA + 20) = 0x80000000u | 190u;   /* NtCreateFile */
+    *(uint32_t *)(mem + THUNK_VA + 24) = 0x80000000u | 219u;   /* NtReadFile */
+    xbox_kernel_set_thunk_address(THUNK_VA, 7);
     xbox_kernel_bridge_init();
 
     /* bridge_init rewrites the entry in place to a synthetic VA. */
@@ -208,6 +213,115 @@ int main(void)
             snprintf(detail, sizeof detail, "NtSetEvent(B) status 0x%08X", g_eax);
             check(g_eax == 0, "closing A twice leaves B working", detail);
         }
+    }
+
+    /* A token DUPLICATE_CLOSE_SOURCE releases must not keep its "opened for
+     * asynchronous I/O" mark. File F is opened without FILE_SYNCHRONOUS_IO
+     * and handed to NtDuplicateObject with CLOSE_SOURCE; once round the
+     * table its token goes to a synchronous file S. With RECOMP_ASYNC_IO a
+     * read on S must
+     * complete (0), not answer STATUS_PENDING as F's mark would have it. */
+    {
+#define CALL(off) do { recomp_func_t f_ = recomp_lookup_kernel(*(uint32_t *)(mem + THUNK_VA + (off))); \
+                       g_esp = STACK_VA; if (f_) f_(); } while (0)
+        const uint32_t HANDLE_VA = 0x30010, DUP_VA = 0x30020, IOS_VA = 0x30030,
+                       OA_VA = 0x30040, NAME_VA = 0x30050, PATH_VA = 0x30060,
+                       BUF_VA = 0x30100;
+        static const char guest_path[] = "D:\\dup.bin";
+        uint32_t *sp = (uint32_t *)(mem + STACK_VA);
+        uint32_t f, s = 0, n;
+        char root[512], file[600], detail[160];
+        FILE *fp;
+        int made = 0;
+
+#if defined(_WIN32)
+        {
+            char tmp[MAX_PATH];
+            unsigned k = 0;
+            GetTempPathA(MAX_PATH, tmp);
+            do snprintf(root, sizeof root, "%sbridgeasync-%lu-%u", tmp,
+                        (unsigned long)GetCurrentProcessId(), k);
+            while (!(made = CreateDirectoryA(root, NULL)) && ++k < 1000);
+            snprintf(file, sizeof file, "%s\\dup.bin", root);
+        }
+#else
+        {
+            char tmpl[] = "/tmp/bridgeasyncXXXXXX";
+            made = mkdtemp(tmpl) != NULL;
+            snprintf(root, sizeof root, "%s", tmpl);
+            snprintf(file, sizeof file, "%s/dup.bin", root);
+        }
+#endif
+        fp = made ? fopen(file, "wb") : NULL;
+        check(fp != NULL, "scratch file for the async mark made", file);
+        if (fp) {
+            fputs("WXYZ", fp);
+            fclose(fp);
+            xbox_path_init(root, root);
+            memcpy(mem + PATH_VA, guest_path, sizeof guest_path);
+            *(uint16_t *)(mem + NAME_VA) = (uint16_t)(sizeof guest_path - 1);
+            *(uint16_t *)(mem + NAME_VA + 2) = (uint16_t)sizeof guest_path;
+            *(uint32_t *)(mem + NAME_VA + 4) = PATH_VA;
+            *(uint32_t *)(mem + OA_VA) = 0;
+            *(uint32_t *)(mem + OA_VA + 4) = NAME_VA;
+            *(uint32_t *)(mem + OA_VA + 8) = 0x40;
+
+            /* NtCreateFile(&F, GENERIC_READ, ..., FILE_OPEN, no SYNCHRONOUS_IO) */
+            sp[0] = 0xBEEF0007u; sp[1] = HANDLE_VA; sp[2] = 0x80000080u; sp[3] = OA_VA;
+            sp[4] = IOS_VA; sp[5] = 0; sp[6] = 0; sp[7] = 1; sp[8] = 1; sp[9] = 0x40;
+            CALL(20);
+            f = *(uint32_t *)(mem + HANDLE_VA);
+            snprintf(detail, sizeof detail, "status 0x%08X, F 0x%08X", g_eax, f);
+            check(g_eax == 0 && f, "file opened for asynchronous I/O", detail);
+
+            /* NtDuplicateObject(F, &D, CLOSE_SOURCE | SAME_ACCESS) */
+            sp[0] = 0xBEEF0006u; sp[1] = f; sp[2] = DUP_VA; sp[3] = 0x3u;
+            CALL(4);
+
+            /* NtCreateFile(&S, GENERIC_READ | SYNCHRONIZE, ..., SYNCHRONOUS_IO),
+             * closed and opened again until S is handed F's token -- once
+             * round the table. */
+            for (n = 0; f && n < 16384; n++) {
+                sp[0] = 0xBEEF0007u; sp[1] = HANDLE_VA; sp[2] = 0x80100080u; sp[3] = OA_VA;
+                sp[4] = IOS_VA; sp[5] = 0; sp[6] = 0; sp[7] = 1; sp[8] = 1; sp[9] = 0x60;
+                CALL(20);
+                s = *(uint32_t *)(mem + HANDLE_VA);
+                if (g_eax || !s || s == f)
+                    break;
+                sp[0] = 0xBEEF0004u; sp[1] = s;
+                CALL(12);
+            }
+            snprintf(detail, sizeof detail, "F 0x%08X, S 0x%08X", f, s);
+            check(s && s == f, "a synchronous file gets the released token", detail);
+
+#if defined(_WIN32)
+            _putenv("RECOMP_ASYNC_IO=1");
+#else
+            setenv("RECOMP_ASYNC_IO", "1", 1);
+#endif
+            /* NtReadFile(S, no event/APC, &ios, buf, 4, no offset) */
+            memset(mem + BUF_VA, 0, 4);
+            sp[0] = 0xBEEF0008u; sp[1] = s; sp[2] = 0; sp[3] = 0; sp[4] = 0;
+            sp[5] = IOS_VA; sp[6] = BUF_VA; sp[7] = 4; sp[8] = 0;
+            g_eax = 0xDEADBEEFu;
+            CALL(24);
+            snprintf(detail, sizeof detail, "NtReadFile(S) 0x%08X, read %.4s",
+                     g_eax, (const char *)(mem + BUF_VA));
+            check(g_eax == 0 && !memcmp(mem + BUF_VA, "WXYZ", 4),
+                  "the token keeps no async mark from its last owner", detail);
+
+            sp[0] = 0xBEEF0004u; sp[1] = s;
+            CALL(12);
+            sp[0] = 0xBEEF0004u; sp[1] = *(uint32_t *)(mem + DUP_VA);
+            CALL(12);
+            remove(file);
+        }
+#if defined(_WIN32)
+        if (made) RemoveDirectoryA(root);
+#else
+        if (made) rmdir(root);
+#endif
+#undef CALL
     }
 
     VirtualFree(mem, 0, MEM_RELEASE);

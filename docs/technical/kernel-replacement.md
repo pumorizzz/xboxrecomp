@@ -340,7 +340,10 @@ has come round (`tests/kernel_bridge`).
 as well, whether the duplicate is made or not: the host closes the source
 handle either way, and Windows tends to give the duplicate the very same
 value, so a slot left behind named the live duplicate and a close through the
-dead token destroyed it.
+dead token destroyed it. As with `NtClose`, the token also drops the
+"opened for asynchronous I/O" mark of the file it named; otherwise, once round
+the table, a synchronous file's reads answered `STATUS_PENDING` under
+`RECOMP_ASYNC_IO`.
 
 ### The Heap Grows Only on 487
 
