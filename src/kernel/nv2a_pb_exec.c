@@ -877,6 +877,9 @@ static void current_render_state(Nv2aRenderState *r)
 
 static int sample_tex(const Texture *t, uint32_t face_offset,
                       uint32_t u, uint32_t v, uint32_t *argb);
+static int texel_convert(uint32_t fmt, const uint8_t *p, uint32_t u,
+                         const uint8_t *mem, uint32_t palette, uint32_t *argb);
+static uint32_t linear_twin(uint32_t fmt);
 static uint32_t tex_face_stride(const Texture *t);
 
 /* The executor's own Texture for a back end's description of one. */
@@ -897,8 +900,72 @@ static void backend_texture(const Nv2aTexture *tex, Texture *t)
     t->valid   = 1;
 }
 
+/* The whole face at once. The back end decodes every new texture with this,
+ * on the executor's thread, mid-frame: texel by texel through sample_tex it
+ * ran at ~19 Mpixel/s, and a street of new textures was a 60-80 ms hitch.
+ * The same texels, bit for bit (nv2a_backend_decode_texture_face_ref is the
+ * texel-by-texel original, kept for tests/nv2a_tex_decode):
+ *   - a swizzled image walks its Morton index by masked increment, x and y
+ *     apart (offset(x,y) = offset(x,0) | offset(0,y)), instead of depositing
+ *     both coordinates bit by bit for every texel;
+ *   - a DXT image decodes each 4x4 block once, not once per texel;
+ *   - the colour conversion is sample_tex's own (texel_convert).
+ * Every texel is in range, so the clamp sample_tex applies is a no-op. */
 int nv2a_backend_decode_texture_face(const Nv2aTexture *tex, uint32_t face,
                                      uint32_t *argb_out)
+{
+    const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
+    Texture t;
+    uint32_t x, y, w = tex->width, h = tex->height, fmt, bb;
+    const uint8_t *base;
+
+    backend_texture(tex, &t);
+    base = mem + t.offset + (t.cube ? face * tex_face_stride(&t) : 0);
+    fmt = t.color;
+    if (!w || !h)
+        return 1;
+    bb = d3d8_format_dxt_block_bytes(fmt);
+    if (bb) {
+        uint32_t bw = (w + 3) >> 2, bx, by, px[16], i, j;
+        for (by = 0; by < (h + 3) >> 2; by++)
+            for (bx = 0; bx < bw; bx++) {
+                d3d8_dxt_decode_block(base + ((size_t)by * bw + bx) * bb, fmt, px);
+                for (j = 0; j < 4 && by * 4 + j < h; j++)
+                    for (i = 0; i < 4 && bx * 4 + i < w; i++)
+                        argb_out[(size_t)(by * 4 + j) * w + bx * 4 + i] = px[j * 4 + i];
+            }
+        return 1;
+    }
+    if (d3d8_format_is_swizzled(fmt)) {
+        uint32_t mask_x, mask_y, ox, oy = 0;
+        fmt = linear_twin(fmt);
+        xbox_swizzle_masks(w, h, &mask_x, &mask_y);
+        for (y = 0; y < h; y++) {
+            uint32_t *row = &argb_out[(size_t)y * w];
+            ox = 0;
+            for (x = 0; x < w; x++) {
+                if (!texel_convert(fmt, base, ox | oy, mem, t.palette, &row[x]))
+                    return 0;
+                ox = (ox - mask_x) & mask_x;     /* the next x, in x's bits */
+            }
+            oy = (oy - mask_y) & mask_y;
+        }
+        return 1;
+    }
+    for (y = 0; y < h; y++) {
+        const uint8_t *p = base + (size_t)y * t.pitch;
+        uint32_t *row = &argb_out[(size_t)y * w];
+        for (x = 0; x < w; x++)
+            if (!texel_convert(fmt, p, x, mem, t.palette, &row[x]))
+                return 0;
+    }
+    return 1;
+}
+
+/* The texel-by-texel decode the one above replaced: the reference
+ * tests/nv2a_tex_decode holds it to. */
+int nv2a_backend_decode_texture_face_ref(const Nv2aTexture *tex, uint32_t face,
+                                         uint32_t *argb_out)
 {
     Texture t;
     uint32_t x, y, face_offset;
@@ -1214,7 +1281,16 @@ static int sample_tex(const Texture *t, uint32_t face_offset,
     } else {
         p = mem + base + (size_t)v * t->pitch;
     }
+    return texel_convert(fmt, p, u, mem, t->palette, argb);
+}
 
+/* Texel `u` of the row (linear) or image (swizzled, `u` the Morton index) at
+ * `p`, in format `fmt` -- a linear one: swizzled formats come here as their
+ * linear_twin. One copy for sample_tex and the whole-texture decode, so the
+ * two cannot disagree about a colour. */
+static int texel_convert(uint32_t fmt, const uint8_t *p, uint32_t u,
+                         const uint8_t *mem, uint32_t palette, uint32_t *argb)
+{
     switch (fmt) {
 
     /* 32-bit, alpha-red-green-blue in the dword. */
@@ -1229,9 +1305,9 @@ static int sample_tex(const Texture *t, uint32_t face_offset,
      * header art this way; without a case every such quad came out as the
      * unsupported-format fill, a white box where the logo should be. */
     case 0x0B:                                      /* SZ_I8_A8R8G8B8 */
-        if (!t->palette)
+        if (!palette)
             return 0;
-        *argb = ((const uint32_t *)(mem + t->palette))[p[u]];
+        *argb = ((const uint32_t *)(mem + palette))[p[u]];
         return 1;
 
     /* 32-bit, other channel orders. The name gives the byte order from the

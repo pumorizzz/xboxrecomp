@@ -178,6 +178,11 @@ int nv2a_backend_decode_texture(const Nv2aTexture *tex, uint32_t *argb_out);
 int nv2a_backend_decode_texture_face(const Nv2aTexture *tex, uint32_t face,
                                      uint32_t *argb_out);
 
+/* The same, texel by texel through the executor's sampler: slow, the
+ * reference tests/nv2a_tex_decode holds the decode above to. */
+int nv2a_backend_decode_texture_face_ref(const Nv2aTexture *tex, uint32_t face,
+                                         uint32_t *argb_out);
+
 /* Bytes level 0 spans in guest memory, over all faces of a cube. */
 uint32_t nv2a_backend_texture_bytes(const Nv2aTexture *tex);
 

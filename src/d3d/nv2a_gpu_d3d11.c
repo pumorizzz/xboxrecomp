@@ -26,10 +26,11 @@
  * address; guest zeta memory is never read or written (nor is it on the
  * software path).
  *
- * Textures are decoded on the CPU through the executor's own sampler
+ * Textures are decoded on the CPU with the executor's own colour conversion
  * (nv2a_backend_decode_texture_face) into BGRA8 texture arrays (six slices
- * for a cube), cached by what the title programmed and re-hashed once per
- * epoch. The pixel shader samples them by hand -- Load, the title's wrap
+ * for a cube) -- DXT1/3/5 in whole blocks go up as BC1/2/3 instead and the
+ * GPU decodes them -- cached by what the title programmed and re-hashed once
+ * per epoch. The pixel shader samples them by hand -- Load, the title's wrap
  * mode, the executor's bilinear taps -- so the GPU reads the texels the
  * software path would.
  *
@@ -554,7 +555,7 @@ static uint32_t *s_scratch;             /* RT_W*RT_H texels: conversions, decode
 static size_t s_scratch_n;
 
 static struct {
-    uint32_t flips, draws, writebacks, uploads, decodes, rt_tex, presents, taken;
+    uint32_t flips, draws, writebacks, uploads, decodes, bc_uploads, rt_tex, presents, taken;
     uint32_t wb_why[4];                 /* texture, dropped target, sync, present */
     uint64_t wb_bytes, up_bytes;
     double stall_ms;
@@ -891,8 +892,11 @@ static int rt_taken(GpuRt *r, int every_time)
 #ifdef NV2A_GPU_TEST_HOOKS
 int nv2a_gpu_test_fail_maps;
 #define TEST_MAP_FAILS() (nv2a_gpu_test_fail_maps > 0 ? (nv2a_gpu_test_fail_maps--, 1) : 0)
+int nv2a_gpu_test_bc_uploads;           /* DXT textures uploaded as BC, so far */
+#define TEST_BC_UPLOAD() (nv2a_gpu_test_bc_uploads++)
 #else
 #define TEST_MAP_FAILS() 0
+#define TEST_BC_UPLOAD() ((void)0)
 #endif
 
 /* The dirty rectangle into guest RAM and the shadow, now. */
@@ -1181,11 +1185,35 @@ static uint64_t tex_hash(const Nv2aTexture *d, uint32_t bytes)
     return h;
 }
 
+/* The BC format a DXT texture uploads to as it is, or DXGI_FORMAT_UNKNOWN.
+ *
+ * DXT1/3/5 are BC1/2/3 block for block (in the same order, a row of blocks
+ * after another), so the GPU decodes them and the CPU does not -- a new DXT
+ * texture used to cost the executor's thread a whole decode mid-frame. The
+ * GPU's colours are within a step or two of d3d8_dxt_decode_texel's (both
+ * round the 5:6:5 endpoints and the thirds their own way; the test holds them
+ * to +-2). DXT1's three-colour mode, index 3 transparent black, and DXT3/5
+ * colour always four-colour, are BC1/2/3's rules too.
+ * D3D11 wants a BC texture's sides in whole blocks; a cube stays on the CPU,
+ * the face stride being the title's to choose. */
+static DXGI_FORMAT tex_bc_format(const Nv2aTexture *d)
+{
+    if (d->cube || (d->width & 3) || (d->height & 3))
+        return DXGI_FORMAT_UNKNOWN;
+    switch (d->color) {
+    case 0x0C: return DXGI_FORMAT_BC1_UNORM;
+    case 0x0E: return DXGI_FORMAT_BC2_UNORM;
+    case 0x0F: return DXGI_FORMAT_BC3_UNORM;
+    default:   return DXGI_FORMAT_UNKNOWN;
+    }
+}
+
 /* Decode every face into the entry's texture array. */
 static int tex_decode(GpuTex *t, const Nv2aTexture *d)
 {
     uint32_t faces = d->cube ? 6 : 1, f;
     uint32_t *buf;
+    DXGI_FORMAT bc = tex_bc_format(d);
 
     if (!t->tex) {
         D3D11_TEXTURE2D_DESC td;
@@ -1193,7 +1221,7 @@ static int tex_decode(GpuTex *t, const Nv2aTexture *d)
         memset(&td, 0, sizeof td);
         td.Width = d->width; td.Height = d->height; td.MipLevels = 1;
         td.ArraySize = faces;
-        td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        td.Format = bc != DXGI_FORMAT_UNKNOWN ? bc : DXGI_FORMAT_B8G8R8A8_UNORM;
         td.SampleDesc.Count = 1;
         td.Usage = D3D11_USAGE_DEFAULT;
         td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
@@ -1209,6 +1237,15 @@ static int tex_decode(GpuTex *t, const Nv2aTexture *d)
             REL(t->tex);
             return 0;
         }
+    }
+    if (bc != DXGI_FORMAT_UNKNOWN) {
+        ID3D11DeviceContext_UpdateSubresource(s_ctx, (ID3D11Resource *)t->tex, 0, NULL,
+                                              guest(d->offset),
+                                              (d->width / 4)
+                                              * d3d8_format_dxt_block_bytes(d->color), 0);
+        s_st.bc_uploads++;
+        TEST_BC_UPLOAD();
+        return 1;
     }
     buf = scratch((size_t)d->width * d->height);
     if (!buf)
@@ -2163,14 +2200,14 @@ static void gpu_flip(void)
         s_st.last_tick = now;
     if (now - s_st.last_tick >= 10000) {
         fprintf(stderr, "[GPURAST] %.1fs: flips %u, draws %u, writebacks %u (%.1f MB),"
-                        " guest->rt uploads %u (%.1f MB), tex decodes %u,"
+                        " guest->rt uploads %u (%.1f MB), tex decodes %u, DXT as BC %u,"
                         " rt as texture %u, GPU presents %u, readback stall ms %.1f"
                         " (writebacks for: textures %u, dropped targets %u, syncs %u,"
                         " presents %u), dropped as taken by the title %u\n",
                 (double)(now - s_st.last_tick) / 1000.0, s_st.flips, s_st.draws,
                 s_st.writebacks, (double)s_st.wb_bytes / 1048576.0,
                 s_st.uploads, (double)s_st.up_bytes / 1048576.0,
-                s_st.decodes, s_st.rt_tex, s_st.presents, s_st.stall_ms,
+                s_st.decodes, s_st.bc_uploads, s_st.rt_tex, s_st.presents, s_st.stall_ms,
                 s_st.wb_why[0], s_st.wb_why[1], s_st.wb_why[2], s_st.wb_why[3],
                 s_st.taken);
         memset(&s_st, 0, sizeof s_st);

@@ -415,6 +415,75 @@ static inline int d3d8_dxt_decode_texel(const uint8_t *base, uint32_t fmt,
     return 1;
 }
 
+/* All sixteen texels of one DXT1/DXT3/DXT5 block at `b`, row by row, the same
+ * values d3d8_dxt_decode_texel gives one at a time (tests/nv2a_tex_decode holds
+ * them to it) -- the palette worked out once instead of sixteen times. */
+static inline void d3d8_dxt_decode_block(const uint8_t *b, uint32_t fmt,
+                                         uint32_t px[16])
+{
+    uint32_t alpha[16], c[4], c0, c1, bits32, i;
+    int dxt1 = d3d8_format_dxt_block_bytes(fmt) == 8;
+
+    for (i = 0; i < 16; i++)
+        alpha[i] = 255u;
+    if (!dxt1) {
+        if (fmt == 0x0E) {                 /* DXT3: 4 bits per texel, packed */
+            for (i = 0; i < 16; i++) {
+                uint32_t nib = b[i >> 1];
+                alpha[i] = d3d8_expand_channel((i & 1u) ? (nib >> 4) : (nib & 0x0Fu), 4);
+            }
+        } else {                           /* DXT5: two endpoints + 3-bit index */
+            uint32_t a0 = b[0], a1 = b[1], a[8];
+            uint64_t bits = 0;
+            for (i = 0; i < 6; i++)
+                bits |= (uint64_t)b[2 + i] << (8 * i);
+            a[0] = a0; a[1] = a1;
+            if (a0 > a1)
+                for (i = 1; i < 7; i++)
+                    a[i + 1] = ((7 - i) * a0 + i * a1) / 7;
+            else {
+                for (i = 1; i < 5; i++)
+                    a[i + 1] = ((5 - i) * a0 + i * a1) / 5;
+                a[6] = 0; a[7] = 255;
+            }
+            for (i = 0; i < 16; i++)
+                alpha[i] = a[(bits >> (3 * i)) & 7u];
+        }
+        b += 8;
+    }
+
+    c0 = (uint32_t)b[0] | ((uint32_t)b[1] << 8);
+    c1 = (uint32_t)b[2] | ((uint32_t)b[3] << 8);
+    for (i = 0; i < 2; i++) {
+        uint32_t rgb = i ? c1 : c0;
+        c[i] = (d3d8_expand_channel((rgb >> 11) & 0x1Fu, 5) << 16)
+             | (d3d8_expand_channel((rgb >>  5) & 0x3Fu, 6) <<  8)
+             |  d3d8_expand_channel( rgb        & 0x1Fu, 5);
+    }
+    c[2] = c[3] = 0;
+    if (c0 > c1 || !dxt1) {
+        for (i = 0; i < 3; i++) {
+            uint32_t sh = i * 8, m0 = (c[0] >> sh) & 0xFFu, m1 = (c[1] >> sh) & 0xFFu;
+            c[2] |= ((2 * m0 + m1) / 3) << sh;
+            c[3] |= ((m0 + 2 * m1) / 3) << sh;
+        }
+    } else {
+        for (i = 0; i < 3; i++) {
+            uint32_t sh = i * 8, m0 = (c[0] >> sh) & 0xFFu, m1 = (c[1] >> sh) & 0xFFu;
+            c[2] |= ((m0 + m1) / 2) << sh;
+        }
+    }
+
+    bits32 = (uint32_t)b[4] | ((uint32_t)b[5] << 8)
+           | ((uint32_t)b[6] << 16) | ((uint32_t)b[7] << 24);
+    for (i = 0; i < 16; i++) {
+        uint32_t idx = (bits32 >> (2 * i)) & 3u, a = alpha[i];
+        if (dxt1 && c0 <= c1 && idx == 3)
+            a = 0;                         /* DXT1's one bit of alpha */
+        px[i] = (a << 24) | (c[idx] & 0x00FFFFFFu);
+    }
+}
+
 static inline int d3d8_format_is_swizzled(uint32_t fmt)
 {
     /* Linear formats (0x10-0x41 range excludes the non-LIN 0x19-0x3C range) */

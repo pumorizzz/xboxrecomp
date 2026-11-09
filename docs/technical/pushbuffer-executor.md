@@ -348,6 +348,20 @@ Two more steps took the readback out of the frame altogether:
   Cost is GPU time per pixel (the combiner ubershader): Fallout's menu,
   uncapped on an RTX 3080 Ti, 1x ~1,800 fps, 3x3 + 4x MSAA ~122, 4x3 + 4x ~85.
   `tests/nv2a_gpu_backend` runs a second time at 3x3 + 4x MSAA.
+- **Texture decodes off the frame.** A texture new to the back end's cache is
+  decoded on the executor's thread mid-frame. Texel by texel through the
+  executor's sampler that ran at ~19 Mtexel/s: Fallout's first street in
+  Carbon decoded 16 textures (1.45 Mpixel) in 76 ms and 5 (1.08 Mpixel) in
+  65 ms, hitches of 81 and 74 ms. `nv2a_backend_decode_texture_face` now
+  decodes a whole face -- the swizzled index by masked increment, each DXT
+  block once, the colour conversion shared with the sampler
+  (`texel_convert`) -- bit for bit what the sampler gives
+  (`tests/nv2a_tex_decode` against `nv2a_backend_decode_texture_face_ref`),
+  ~350 Mtexel/s: the same two frames decode in 7 and 5 ms and stay at the
+  frame limit. DXT1/3/5 that are not cubes and have sides in whole blocks are
+  not decoded at all: they upload as BC1/2/3 and the GPU decodes them
+  (within 1 of `d3d8_dxt_decode_texel` per channel on WARP, the test allows
+  2). Fallout's streets use none (`DXT as BC` in `[GPURAST]`).
   Headless there is nothing to show, so nothing is read back. Reading the
   frame a flip later from a ring of staging textures had not helped (1.6 s
   per 10 s, same fps); not reading it at all does.

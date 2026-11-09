@@ -42,6 +42,7 @@
 #include <string.h>
 #include "nv2a_backend.h"
 #include "d3d/nv2a_gpu_d3d11.h"
+#include "d3d/d3d8_swizzle.h"
 
 #define W 64
 #define H 64
@@ -80,6 +81,7 @@ extern void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
 extern void nv2a_pb_exec_sync(void);
 extern void nv2a_pb_exec_report(void);
 extern int nv2a_gpu_test_fail_maps;
+extern int nv2a_gpu_test_bc_uploads;
 
 static void m(uint32_t method, uint32_t param) { nv2a_pb_exec_method(0, method, param); }
 static void mf(uint32_t method, float f) { uint32_t u; memcpy(&u, &f, 4); m(method, u); }
@@ -107,7 +109,9 @@ static void fixed_state(uint32_t tex, uint32_t fmt, const float (*P)[3], uint32_
     m(0x1E94, 0);                            /* fixed function */
     for (i = 0; i < n; i++) {
         float tc[2];
-        tc[0] = P[i][0]; tc[1] = P[i][1];
+        /* Texels for a linear texture, 0..1 for the rest (W == H). */
+        float sc = fmt == 0x12 ? 1.0f : 1.0f / W;
+        tc[0] = P[i][0] * sc; tc[1] = P[i][1] * sc;
         memcpy(s_mem + POS_AT + 12u * i, P[i], 12);
         memcpy(s_mem + DIFF_AT + 4u * i, &white, 4);
         memcpy(s_mem + TC_AT + 8u * i, tc, 8);
@@ -281,6 +285,42 @@ int main(void)
         draw_textured_at(SURF(13), SURF(24));
         write_back_all();
         CHECK(memcmp(s_mem + SURF(13), s_mem + SURF(24), PITCH * H) == 0);
+    }
+
+    /* DXT1, DXT3 and DXT5 go to the GPU as their blocks (BC1/2/3) and the
+     * GPU decodes them: a quad texel for pixel over random blocks -- DXT1's
+     * three-colour mode with its transparent black among them -- comes back
+     * within 2 per channel of the CPU's decode (d3d8_dxt_decode_texel; the
+     * two round 5:6:5 endpoints and the thirds each their own way). */
+    {
+        static const uint32_t fmts[3] = { 0x0C, 0x0E, 0x0F };
+        uint32_t k, x, y, v, want, bc0 = (uint32_t)nv2a_gpu_test_bc_uploads;
+        uint32_t s = 0x9E3779B9u, tex = SURF(11);
+        for (k = 0; k < 3; k++) {
+            uint32_t bytes = (W / 4) * (H / 4) * d3d8_format_dxt_block_bytes(fmts[k]);
+            uint32_t worst = 0, ch;
+            for (x = 0; x < bytes; x++) {
+                s ^= s << 13; s ^= s >> 17; s ^= s << 5;
+                s_mem[tex + x] = (uint8_t)s;
+            }
+            clear_surface_to(SURF(13), 0xFF000000u);
+            draw_quad(SURF(13), tex, fmts[k], 1);
+            write_back_all();
+            for (y = 0; y < H; y++)
+                for (x = 0; x < W; x++) {
+                    memcpy(&v, s_mem + SURF(13) + y * PITCH + 4 * x, 4);
+                    d3d8_dxt_decode_texel(s_mem + tex, fmts[k], x, y, W, &want);
+                    for (ch = 0; ch < 32; ch += 8) {
+                        int d = (int)((v >> ch) & 0xFF) - (int)((want >> ch) & 0xFF);
+                        if ((uint32_t)abs(d) > worst)
+                            worst = (uint32_t)abs(d);
+                    }
+                }
+            printf("DXT 0x%02X on the GPU: worst channel off by %u\n", fmts[k], worst);
+            CHECK(worst <= 2);
+            tex += 0x4000;
+        }
+        CHECK((uint32_t)nv2a_gpu_test_bc_uploads == bc0 + 3);
     }
 
     /* Device loss at the third flip. */
