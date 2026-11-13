@@ -4096,14 +4096,44 @@ static void draw_immediate(void)
     s_gpu.inline_count = 0;
 }
 
+/* Vertices per primitive of a list topology; 0 for a strip, fan, loop or
+ * polygon, whose primitives share vertices with their neighbours. */
+static uint32_t imm_list_size(uint32_t prim)
+{
+    switch (prim) {
+    case NV_PRIM_POINTS:    return 1;
+    case NV_PRIM_LINES:     return 2;
+    case NV_PRIM_TRIANGLES: return 3;
+    case NV_PRIM_QUADS:     return 4;
+    default:                return 0;
+    }
+}
+
 /* A vertex is complete: append all 16 attributes in the layout
- * draw_immediate describes. */
+ * draw_immediate describes.
+ *
+ * The buffer holds NV_MAX_INLINE / IMM_VERTEX_DWORDS = 1024 vertices; the
+ * GPU has no such limit. A list that would run past it draws what it has
+ * and goes on with an empty buffer: two batches of whole primitives draw
+ * exactly what one would. Fallout draws a frame's 8-bit text in one
+ * BEGIN(QUADS), and its credits, 4 vertices a glyph, ran past 256 glyphs:
+ * the lower lines went missing. A strip or fan cannot be cut like that, and
+ * its vertices past the limit are still dropped. */
 static void imm_emit_vertex(void)
 {
-    uint32_t at = s_gpu.imm_count * IMM_VERTEX_DWORDS;
+    const uint32_t cap = NV_MAX_INLINE / IMM_VERTEX_DWORDS;
+    uint32_t n, at;
 
-    if (!s_gpu.prim || at + IMM_VERTEX_DWORDS > NV_MAX_INLINE)
+    if (!s_gpu.prim)
         return;
+    n = imm_list_size(s_gpu.prim);
+    if (n && s_gpu.imm_count % n == 0 && s_gpu.imm_count + n > cap) {
+        draw_immediate();
+        s_gpu.imm_count = 0;
+    }
+    if (s_gpu.imm_count >= cap)
+        return;
+    at = s_gpu.imm_count * IMM_VERTEX_DWORDS;
     memcpy(&s_gpu.inline_buf[at], s_gpu.imm_attr, sizeof s_gpu.imm_attr);
     s_gpu.imm_count++;
 }

@@ -35,6 +35,11 @@
  *   - A flip with a back end that presents the frame itself (present()
  *     returns 1) neither writes the surface back nor hands it to the window;
  *     with present() returning 0 it does both.
+ *   - 300 immediate-mode quads (SET_VERTEX4F, 1200 vertices) in one
+ *     BEGIN(QUADS) all reach the back end, the last one included. The
+ *     executor keeps 1024 immediate vertices; past them it dropped the rest,
+ *     and Fallout's credits, all its 8-bit text in one batch, lost their
+ *     lower lines.
  *
  * Harness as tests/nv2a_near_clip. */
 #include <math.h>
@@ -83,6 +88,8 @@ static struct {
     uint32_t n;
     Nv2aVertexEx v[MAX_V];
     uint32_t swizzled;                  /* the surface of the last draw */
+    uint32_t total;                     /* every vertex, past MAX_V too */
+    float    max_y;
 } s_be;
 
 static void be_clear(const Nv2aSurface *s, const Nv2aRenderState *rs,
@@ -97,8 +104,13 @@ static void be_draw(const Nv2aSurface *s, const Nv2aBatch *b)
     s_be.swizzled = s->swizzled;
     if (!b->vertices_ex)
         return;
-    for (i = 0; i < b->count && s_be.n < MAX_V; i++)
-        s_be.v[s_be.n++] = b->vertices_ex[i];
+    for (i = 0; i < b->count; i++) {
+        s_be.total++;
+        if (b->vertices_ex[i].y > s_be.max_y)
+            s_be.max_y = b->vertices_ex[i].y;
+        if (s_be.n < MAX_V)
+            s_be.v[s_be.n++] = b->vertices_ex[i];
+    }
 }
 
 static void be_flip(void) {}
@@ -345,6 +357,31 @@ int main(void)
             CHECK(s_be.v[k].d0[0] == (float)(2 << k));
         m(0x1E98, 0);
         m(0x1E94, 0);                                        /* fixed function again */
+    }
+
+    /* 300 immediate quads, 2 px each, 20 to a row: quad k is at
+     * x 10 + 3 * (k % 20), y 10 + 3 * (k / 20), so the last row (14) ends at
+     * y 52 + 2 = 54; cut at 256 quads, the last would be row 12, y 48.
+     * Each quad reaches the back end as two triangles, 6 vertices. */
+    {
+        static const float CX[4] = { 0, 2, 2, 0 }, CY[4] = { 0, 0, 2, 2 };
+        int k, c;
+
+        s_be.n = s_be.total = 0;
+        s_be.max_y = 0.0f;
+        m(0x17FC, 8);                                    /* BEGIN_END: quads */
+        for (k = 0; k < 300; k++)
+            for (c = 0; c < 4; c++) {
+                mf(0x1518, 10.0f + 3.0f * (float)(k % 20) + CX[c]);   /* SET_VERTEX4F */
+                mf(0x151C, 10.0f + 3.0f * (float)(k / 20) + CY[c]);
+                mf(0x1520, 100.0f);
+                mf(0x1524, 1.0f);
+            }
+        m(0x17FC, 0);
+        nv2a_pb_exec_sync();
+        CHECK(s_be.total == 300 * 6);
+        CHECK(fabsf(s_be.max_y - 54.0f) < 1e-3f);
+        CHECK(s_be.n == MAX_V && s_be.v[0].y < 13.0f);   /* row 0 first */
     }
 
     /* present() 1: the back end showed the frame -- no writeback, no window
