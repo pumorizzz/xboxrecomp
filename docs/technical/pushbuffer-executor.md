@@ -353,7 +353,7 @@ Two more steps took the readback out of the frame altogether:
   `bps_down`), and that is what is scaled to the window; the writeback still
   averages the whole block, and MSAA is resolved first.
   `tests/nv2a_gpu_backend` runs a second time at 3x3 + 4x MSAA and a third at 2x
-  with 3x3 SSAA.
+  with 3x3 SSAA; each also reads a linear target and a swizzled one as swizzled textures.
 - **Texture decodes off the frame.** A texture new to the back end's cache is
   decoded on the executor's thread mid-frame. Texel by texel through the
   executor's sampler that ran at ~19 Mtexel/s: Fallout's first street in
@@ -490,4 +490,5 @@ executor has yet to read.
   re-reads the fence and spins.
 
 The event qualifies for a host shadow even without `RECOMP_TITLE_KEVENTS`.
+`tests/nv2a_fence_wake` waits on it on one thread and sets it from another, and checks it does not qualify without `RECOMP_PB_EXEC`.
 Fallout registers `(0xB5E58, 0x1DBC)` and runs the walk.
