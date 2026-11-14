@@ -262,7 +262,8 @@ typedef struct {
  * that needs them will say so. */
 typedef struct {
     uint32_t offset;                    /* guest address of texel (0,0)  */
-    uint32_t width, height;             /* from IMAGE_RECT               */
+    uint32_t width, height;             /* FORMAT or IMAGE_RECT, by format */
+    uint32_t rect_w, rect_h;            /* IMAGE_RECT as last written    */
     uint32_t pitch;                     /* bytes per row, from CONTROL1  */
     uint32_t color;                     /* NV097 colour-format code      */
     uint32_t addr_u, addr_v;            /* wrap mode per axis            */
@@ -4264,6 +4265,9 @@ static void tex_stage_method(uint32_t method, uint32_t param)
         if (tex_size_from_format(t->color)) {
             t->width  = 1u << ((param >> 20) & 0xF);
             t->height = 1u << ((param >> 24) & 0xF);
+        } else {
+            t->width  = t->rect_w;
+            t->height = t->rect_h;
         }
         break;
     case NV097_SET_TEXTURE_PALETTE:
@@ -4280,8 +4284,16 @@ static void tex_stage_method(uint32_t method, uint32_t param)
         t->pitch = param >> 16;          /* linear formats only */
         break;
     case NV097_SET_TEXTURE_IMAGE_RECT:
-        t->width  = param >> 16;
-        t->height = param & 0xFFFF;
+        /* A register of its own, as on the hardware, which reads it only for
+         * a linear format: a swizzled or DXT texture keeps FORMAT's size
+         * whatever rectangle the stage last held, and a linear one takes this
+         * rectangle in whichever order the two methods arrive. */
+        t->rect_w = param >> 16;
+        t->rect_h = param & 0xFFFF;
+        if (!tex_size_from_format(t->color)) {
+            t->width  = t->rect_w;
+            t->height = t->rect_h;
+        }
         break;
     case 0x1B14:                                  /* SET_TEXTURE_FILTER */
         t->filter = param;

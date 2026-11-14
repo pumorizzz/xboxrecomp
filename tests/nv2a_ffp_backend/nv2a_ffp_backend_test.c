@@ -14,7 +14,9 @@
  *     wait, and clears and flips reach the back end;
  *   - a batch carries every interpolant (Nv2aVertexEx) and the combiner
  *     words, the back end is asked to sync before a flip is presented, and
- *     a visibility test reports the back end's pixel count.
+ *     a visibility test reports the back end's pixel count;
+ *   - a stage's texture size is FORMAT's for swizzled and DXT formats
+ *     whatever IMAGE_RECT says, and IMAGE_RECT's for a linear one.
  *
  * Guest memory is a buffer, addressed by the offsets the title would use
  * (the executor treats a DMA offset below the image as a plain address when
@@ -63,6 +65,7 @@ static struct {
     uint32_t count;
     Nv2aVertex v[8];
     int textured;
+    Nv2aTexture st0;            /* the batch's stage 0, valid or not */
     uint32_t clear_flags, clear_argb;
     uint32_t kind;
     int has_ex, has_rc;
@@ -90,6 +93,7 @@ static void be_draw(const Nv2aSurface *s, const Nv2aBatch *b)
     s_be.rs = *b->state;
     s_be.count = b->count;
     s_be.textured = b->texture != NULL;
+    s_be.st0 = b->stages[0];
     for (i = 0; i < b->count && i < 8; i++)
         s_be.v[i] = b->vertices[i];
     s_be.kind = b->kind;
@@ -282,6 +286,28 @@ int main(void)
         CHECK(s_be.kind == NV2A_BATCH_SCREEN);
         CHECK(memcmp(&expected, &actual, sizeof expected) == 0);
     }
+
+    /* A texture's size comes from FORMAT for a swizzled or DXT format and
+     * from IMAGE_RECT for a linear one, as on the hardware, which keeps both
+     * registers and reads the one the format names. IMAGE_RECT after a
+     * swizzled FORMAT used to overwrite the size, and a title that sends it
+     * for every texture sampled the swizzled one at the wrong size. */
+    m(0x1B00, 0x9000);                                /* SET_TEXTURE_OFFSET */
+    m(0x1B04, (0x06u << 8) | (1u << 16) | (5u << 20) | (4u << 24)); /* SZ_A8R8G8B8 32x16 */
+    m(0x1B1C, (640u << 16) | 480u);                   /* IMAGE_RECT 640x480 */
+    m(0x17FC, 5); m(0x1810, 2u << 24); m(0x17FC, 0);
+    CHECK(s_be.st0.width == 32 && s_be.st0.height == 16);
+    m(0x1B04, (0x0Cu << 8) | (1u << 16) | (6u << 20) | (6u << 24)); /* DXT1 64x64 */
+    m(0x1B1C, (300u << 16) | 200u);
+    m(0x17FC, 5); m(0x1810, 2u << 24); m(0x17FC, 0);
+    CHECK(s_be.st0.width == 64 && s_be.st0.height == 64);
+    /* Back to linear: the rectangle sent while the stage was DXT counts. */
+    m(0x1B04, (0x12u << 8) | (1u << 16));             /* LIN_A8R8G8B8 */
+    m(0x17FC, 5); m(0x1810, 2u << 24); m(0x17FC, 0);
+    CHECK(s_be.st0.width == 300 && s_be.st0.height == 200);
+    m(0x1B1C, (100u << 16) | 50u);
+    m(0x17FC, 5); m(0x1810, 2u << 24); m(0x17FC, 0);
+    CHECK(s_be.st0.width == 100 && s_be.st0.height == 50);
 
     /* A garbage index (the walk is 32 bits wide now) must not reach outside
      * guest memory: start 0xFFFFFF at a 12-byte stride is 200 MB past the
