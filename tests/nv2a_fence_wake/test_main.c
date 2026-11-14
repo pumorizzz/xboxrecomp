@@ -21,6 +21,10 @@
  *   no-exec  it is not: a wait fails at once rather than sleep on an event
  *            nothing would set.
  *
+ * Both modes: xbox_KeSignalTitleEvent on a value that is no event the bridge
+ * knows -- here the number of a live host event -- leaves it alone; it used
+ * to fall back to SetEvent on the value itself.
+ *
  * Both modes also step the lost-kick recovery (xbox_Nv2aLostKickPoll) through
  * a fake DMA_PUT:
  *
@@ -297,12 +301,27 @@ int main(int argc, char **argv)
                "xbox_KeSignalTitleEvent from another thread releases it; the wait consumes the signal",
                "done %d status 0x%08X SignalState %u", done, s_wst, G(va)[1]);
     } else if (!exec) {
-        /* 4. Not a host event: a wait fails at once, never sleeps. Do not
-         * signal it here: without the executor that would SetEvent a guest VA. */
+        /* 4. Not a host event: a wait fails at once, never sleeps. Not
+         * signalled here: a wait must fail on its own. */
         uint32_t st = ke_wait_on(STACK_MAIN, dev + 0x40, ZERO_VA, NULL);
         checkd(st != 0 && st != STATUS_TIMEOUT && G(dev + 0x40)[1] == 0,
                "no executor: the fence event is no host event (a wait fails at once, never sleeps)",
                "status 0x%08X", st);
+    }
+
+    /* 5. Only an event the bridge knows is set: handed the number of a live
+     * host event, the old fallback (bridge_resolve_handle passes an untagged
+     * value through as a HANDLE) set that event. */
+    {
+        HANDLE h = CreateEventA(NULL, TRUE, FALSE, NULL);
+        int ok = h && (uintptr_t)h <= 0xFFFFFFFFu;
+        if (ok) {
+            xbox_KeSignalTitleEvent((uint32_t)(uintptr_t)h);
+            ok = WaitForSingleObject(h, 0) == WAIT_TIMEOUT;
+        }
+        checkd(ok, "KeSignalTitleEvent leaves a value that is no known event alone",
+               "handle %p", (void *)h);
+        if (h) CloseHandle(h);
     }
 
     lost_kick();

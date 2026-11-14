@@ -952,6 +952,18 @@ static int  bridge_handle_is_async(uint32_t token);
 static void   bridge_write_handle(uint32_t handle_va, HANDLE h);
 static HANDLE bridge_take_handle(uint32_t token);
 
+/* A token the title is done with: its asynchronous-I/O mark, its thread
+ * object and its table slot go, in that order. Returns the host handle the
+ * slot held (NULL for an untagged value), for the caller to close -- or,
+ * after DUPLICATE_CLOSE_SOURCE, to know the host closed already. One place,
+ * because the two copies had drifted apart once (cfd827d). */
+static HANDLE bridge_release_token(uint32_t token)
+{
+    bridge_forget_async_handle(token);
+    thobj_detach_token(token);
+    return bridge_take_handle(token);
+}
+
 static void bridge_NtClose(void)
 {
     uint32_t raw_handle = STACK_ARG(0);
@@ -961,12 +973,9 @@ static void bridge_NtClose(void)
         fflush(stderr);
     }
 
-    bridge_forget_async_handle(raw_handle);
-    thobj_detach_token(raw_handle);
-
-    /* Close real handles but skip fake/synthetic ones */
-    if (raw_handle && raw_handle != 0xDEAD0001u && raw_handle != 0xBEEF0010u) {
-        HANDLE h = bridge_take_handle(raw_handle);
+    /* Untagged values (synthetic handles) are not in the table: nothing to close. */
+    {
+        HANDLE h = bridge_release_token(raw_handle);  /* NULL for synthetic values */
         if (h && h != INVALID_HANDLE_VALUE)
             xbox_NtClose(h);   /* settles a pending overwrite; drops a dir context */
     }
@@ -1978,35 +1987,54 @@ static HANDLE ke_guest_event_prepare(uint32_t guest_va, int *type)
     return h;
 }
 
-/* KeSetEvent's work, for the bridge and for the runtime itself (a modelled
- * GPU interrupt). Returns what KeSetEvent puts in eax. */
-static uint32_t ke_set_event(uint32_t guest_va)
+/* Set an event the bridge knows: one the title built itself (ke_guest_event)
+ * or a KeInitializeEvent shadow. *ret gets what KeSetEvent puts in eax.
+ * Returns 0 for anything else, which the caller decides about. */
+static int ke_set_known_event(uint32_t guest_va, uint32_t *ret)
 {
-    HANDLE h;
-
-    {   /* An event the title built itself (see ke_guest_event). */
-        int type;
-        HANDLE ge = ke_guest_event(guest_va, &type);
-        if (ge) {
-            uint32_t prev = BRIDGE_MEM32(guest_va + 4) != 0;
-            BRIDGE_MEM32(guest_va + 4) = 1;
-            SetEvent(ge);
-            return prev;
-        }
+    int type;
+    HANDLE h = ke_guest_event(guest_va, &type);
+    if (h) {
+        *ret = BRIDGE_MEM32(guest_va + 4) != 0;
+        BRIDGE_MEM32(guest_va + 4) = 1;
+        SetEvent(h);
+        return 1;
     }
     h = ke_shadow_lookup(guest_va);
-    if (!h)
-        h = bridge_resolve_handle(guest_va);
+    if (h) {
+        *ret = (uint32_t)SetEvent(h);
+        return 1;
+    }
+    return 0;
+}
+
+/* KeSetEvent's work for the bridge. Returns what KeSetEvent puts in eax. */
+static uint32_t ke_set_event(uint32_t guest_va)
+{
+    uint32_t ret;
+    HANDLE h;
+
+    if (ke_set_known_event(guest_va, &ret))
+        return ret;
+    h = bridge_resolve_handle(guest_va);
     if (!h)
         h = XBOX_TO_NATIVE(guest_va);
     return h ? (uint32_t)SetEvent(h) : 0;
 }
 
 /* Set a guest event from the runtime: what the title's interrupt handler
- * would do (xbox_Nv2aFenceWakeEvent). */
+ * would do (xbox_Nv2aFenceWakeEvent). Only an event the bridge knows: the
+ * guest address itself is no host handle, and SetEvent on it could hit an
+ * unrelated host event that happens to have that value. */
 void xbox_KeSignalTitleEvent(uint32_t guest_va)
 {
-    ke_set_event(guest_va);
+    uint32_t ret;
+    if (!ke_set_known_event(guest_va, &ret)) {
+        static int shown;
+        if (shown++ < 4)
+            fprintf(stderr, "  [KERNEL] KeSignalTitleEvent 0x%08X: no event the bridge"
+                            " knows there; not set\n", guest_va);
+    }
 }
 
 /* ── KeSetEvent (ordinal 145) ────────────────────────────── */
@@ -5846,9 +5874,7 @@ static void bridge_NtDuplicateObject(void)
     if (opts & DUPLICATE_CLOSE_SOURCE) {
         /* As NtClose: the token goes back without the asynchronous-I/O mark
          * of the file it named, or the next owner's reads answer PENDING. */
-        bridge_forget_async_handle(src_token);
-        thobj_detach_token(src_token);
-        bridge_take_handle(src_token);         /* the host closed it */
+        bridge_release_token(src_token);       /* the host closed it */
     }
     g_eax = ok ? 0 : 0xC0000001u;              /* STATUS_UNSUCCESSFUL */
 }
