@@ -2046,6 +2046,18 @@ static int batch_is_screen_space(void)
 #define FB_DUMP_AFTER_DRAW 8
 static int s_drawn_dumps;
 
+/* RECOMP_FB_DUMP for the capture after a batch that drew, read once: it is
+ * asked on every such batch (Switches Read Once). The periodic report and
+ * dump_surface_bmp still read it each time -- once a report, and tests turn
+ * it on there to force a READ sync. */
+static int fb_dump_after_draw(void)
+{
+    static int on = -1;
+    if (on < 0)
+        on = getenv("RECOMP_FB_DUMP") != NULL;
+    return on;
+}
+
 static void dump_surface_bmp(void);
 
 /* A fixed-function batch without texture coordinates is drawn untextured, as
@@ -2055,14 +2067,27 @@ static int s_xf_no_tex;
 /* Triangles bound for a back end: collected for the whole batch, handed over
  * in one draw() call by backend_flush(). Whatever feeds them -- the program
  * and fixed-function paths here, or the screen-space path below -- the back
- * end only ever sees surface pixels. Past the cap the rest of the batch is
- * dropped. */
+ * end only ever sees surface pixels. A batch past the cap goes over in more
+ * than one draw() (a point is 6 vertices: 32768 points filled it). */
 #define NV_BACKEND_MAX_VERTS (NV_MAX_INDICES * 3)
 static Nv2aVertex *s_bverts;     /* about 5.5 MB: allocated by the first vertex */
 /* The same vertices with every interpolant (Nv2aBatch.vertices_ex), slot for
  * slot: about 25 MB, allocated with s_bverts. */
 static Nv2aVertexEx *s_bverts_ex;
 static uint32_t   s_bcount;
+
+/* What the batch being collected will be flushed as: backend_slot() hands
+ * a full buffer over mid-batch, and the rest of the batch goes on. */
+static int      s_bflush_textured;
+static uint32_t s_bflush_kind;
+
+static void backend_flush(int textured, uint32_t kind);
+
+static void backend_begin(int textured, uint32_t kind)
+{
+    s_bflush_textured = textured;
+    s_bflush_kind = kind;
+}
 
 static Nv2aVertex *backend_slot(void)
 {
@@ -2074,7 +2099,7 @@ static Nv2aVertex *backend_slot(void)
                                                   sizeof *s_bverts_ex)))
         return NULL;
     if (s_bcount + 3 > NV_BACKEND_MAX_VERTS)
-        return NULL;
+        backend_flush(s_bflush_textured, s_bflush_kind);   /* s_bcount is 0 after */
     return &s_bverts[s_bcount];
 }
 
@@ -3356,9 +3381,13 @@ static void xf_set_viewport(void)
  * centred on it, in surface pixels. The size is the program's oPts.x, or
  * SET_POINT_SIZE (6.3 fixed point) when nothing wrote one. With point sprites
  * on (SET_POINT_SMOOTH_ENABLE is what D3D's POINTSPRITEENABLE sets) every
- * stage's texture coordinates run 0..1 across the square, top left at 0,0.
- * Sizes stop at 63.875, the most SET_POINT_SIZE holds (D3D's MaxPointSize):
- * Fallout's programs grow a particle as 1/w, past that next to the camera.
+ * stage's texture coordinates run 0..1 across the square, top left at 0,0
+ * (D3D's convention; not checked on hardware). The orientation does not depend
+ * on the program's constants: s_xf is surface pixels, y down, and what a
+ * title keeps in c[58] is its own data (Fallout's .y changes sign with the
+ * camera). Sizes stop at 63.875, the most SET_POINT_SIZE holds (D3D's
+ * MaxPointSize): Fallout's programs grow a particle as 1/w, past that next to
+ * the camera.
  *
  * Fallout's particles -- the steam over the Tutorial's grates, the glow of
  * its laser emitters, the radiation puddles -- are point sprites; dropping
@@ -3371,12 +3400,9 @@ static void raster_points(uint32_t n)
 {
     float fixed = (float)(s_reg[NV097_SET_POINT_SIZE / 4] & 0x1FFu) / 8.0f;
     int sprite = s_reg[NV097_SET_POINT_SMOOTH_ENABLE / 4] != 0;
-    float ty = s_xf_k[1] < 0.0f ? -1.0f : 1.0f;     /* which way is down */
     uint32_t i;
     int k, s;
 
-    if (s_xf_k[0] == 0.0f || s_xf_k[1] == 0.0f)
-        return;
     for (i = 0; i < n; i++) {
         const Nv2aVshOutput *v = &s_xf[i];
         float size = v->pts > 0.0f ? v->pts : fixed;
@@ -3394,7 +3420,7 @@ static void raster_points(uint32_t n)
         for (k = 0; k < 4; k++) {
             q[k] = *v;
             q[k].pos[0] += (cu[k] * 2.0f - 1.0f) * hx;
-            q[k].pos[1] += (cv[k] * 2.0f - 1.0f) * hy * ty;
+            q[k].pos[1] += (cv[k] * 2.0f - 1.0f) * hy;
             if (sprite)
                 for (s = 0; s < 4; s++) {
                     q[k].tex[s][0] = cu[k];
@@ -3486,7 +3512,11 @@ transformed:
     xf_set_viewport();
     {
         const VertexAttr *tc = texcoord_attr();
-        s_xf_no_tex = !batch_uses_program() && !(tc->offset && tc->stride);
+        /* A point sprite's texture coordinates come from the rasteriser, not
+         * from an array: textured whatever the arrays say. */
+        int sprite = s_gpu.prim == NV_PRIM_POINTS
+                     && s_reg[NV097_SET_POINT_SMOOTH_ENABLE / 4] != 0;
+        s_xf_no_tex = !batch_uses_program() && !(tc->offset && tc->stride) && !sprite;
     }
     if (batch_uses_program()) {
         s_gpu.batches_program++;
@@ -3581,6 +3611,8 @@ transformed:
     if (RS.texs[0].valid)
         note_texture_use();
 
+    if (backend_draws())
+        backend_begin(!s_xf_no_tex, NV2A_BATCH_XF);
     switch (s_gpu.prim) {
     case NV_PRIM_TRIANGLES:
         for (i = 0; i + 2 < n; i += 3)
@@ -3656,6 +3688,8 @@ static void raster_batch(void)
         }
     }
 
+    if (backend_draws())
+        backend_begin(textured, NV2A_BATCH_SCREEN);
     switch (s_gpu.prim) {
     case NV_PRIM_TRIANGLES:
         for (i = 0; i + 2 < s_gpu.idx_count; i += 3)
@@ -3712,7 +3746,7 @@ static void raster_batch(void)
      * triangles went down correctly just before it. A few frames that actually
      * contain geometry are worth more than any number of clears. */
     if (s_gpu.tris_drawn != before && s_drawn_dumps < FB_DUMP_AFTER_DRAW
-        && !s_flip_dumping && getenv("RECOMP_FB_DUMP")) {
+        && !s_flip_dumping && fb_dump_after_draw()) {
         s_drawn_dumps++;
         if (s_backend && s_backend->sync)
             s_backend->sync(NV2A_BACKEND_SYNC_READ);

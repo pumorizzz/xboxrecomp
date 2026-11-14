@@ -22,7 +22,9 @@
  *     green radioactive liquid opaque black.
  *   - The periodic report asks the back end for a READ sync (a download of
  *     every target it drew) only when RECOMP_FB_DUMP will write the picture.
- *     It used to ask every report, a 10-120 ms hitch every ten seconds.
+ *     It used to ask every report, a 10-120 ms hitch every ten seconds. The
+ *     capture after a drawing batch reads RECOMP_FB_DUMP once: set later, a
+ *     batch asks for no download, the report still does.
  *   - An index list that names a vertex twice gets it as that vertex both
  *     times, and the next batch's vertices are its own even with the same
  *     indices. (The executor transforms such a vertex once and reuses it;
@@ -40,6 +42,17 @@
  *     executor keeps 1024 immediate vertices; past them it dropped the rest,
  *     and Fallout's credits, all its 8-bit text in one batch, lost their
  *     lower lines.
+ *
+ *   - A point sprite through a vertex program has texcoord v growing down the
+ *     screen whatever the program's c[58] holds (it is the game's data, not a
+ *     viewport: Fallout's .y changes sign with the camera, and a sign-keyed
+ *     square flipped asymmetric particles with it), and a zero c[58] does not
+ *     drop the point.
+ *   - A fixed-function sprite without a texcoord array is textured when stage
+ *     0 has a texture: the rasteriser supplies the coordinates.
+ *   - 40000 points in one batch, 240000 vertices, past the 196608 a back end's
+ *     buffer holds: all reach the back end, in more than one draw(). Past the
+ *     cap the rest used to be dropped.
  *
  * Harness as tests/nv2a_near_clip. */
 #include <math.h>
@@ -89,6 +102,10 @@ static struct {
     Nv2aVertexEx v[MAX_V];
     uint32_t swizzled;                  /* the surface of the last draw */
     uint32_t total;                     /* every vertex, past MAX_V too */
+    uint32_t draws;                     /* draw() calls */
+    uint32_t non_xf;                    /* draws whose kind is not NV2A_BATCH_XF */
+    uint32_t textured_draws;            /* draws with textured set */
+    uint32_t textured;                  /* Nv2aBatch.textured of the last draw */
     float    max_y;
 } s_be;
 
@@ -101,7 +118,13 @@ static void be_clear(const Nv2aSurface *s, const Nv2aRenderState *rs,
 static void be_draw(const Nv2aSurface *s, const Nv2aBatch *b)
 {
     uint32_t i;
+    s_be.draws++;
+    if (b->kind != NV2A_BATCH_XF)
+        s_be.non_xf++;
+    if (b->textured)
+        s_be.textured_draws++;
     s_be.swizzled = s->swizzled;
+    s_be.textured = b->textured;
     if (!b->vertices_ex)
         return;
     for (i = 0; i < b->count; i++) {
@@ -236,6 +259,27 @@ int main(void)
     draw(1, 1);
     check_point(0);
 
+    /* 40000 points in one batch: 240000 vertices, past the cap of the back
+     * end's buffer. (attribute 0 is still float4, the point at POS_AT.) */
+    {
+        uint32_t before = s_be.total, draws = s_be.draws, k;
+        uint32_t non_xf = s_be.non_xf, tex = s_be.textured_draws;
+        s_be.n = 0;
+        m(0x17FC, 1);                                /* BEGIN_END: points */
+        for (k = 0; k < 40000; k += 2)
+            m(0x1800, 0);                            /* ARRAY_ELEMENT16: vertex 0, twice */
+        m(0x17FC, 0);
+        nv2a_pb_exec_sync();
+        CHECK(s_be.total - before == 40000u * 6);
+        CHECK(s_be.draws - draws >= 2);
+        /* Every draw of the batch is what the batch is: an XF batch, and
+         * untextured as the first (no texture on stage 0 here). A flush from
+         * backend_slot() used to take the kind and textured of whatever
+         * batch came before. */
+        CHECK(s_be.non_xf == non_xf);
+        CHECK(s_be.textured_draws == tex);
+    }
+
     /* Polygon offset: dz/dx = 1, dz/dy = 0, so z moves by 2 * 1 + 3. */
     m(0x1760, 2 | (3 << 4) | (12 << 8));     /* attr 0: float3 again */
     put_vertices(TRI, 3);
@@ -359,6 +403,65 @@ int main(void)
         m(0x1E94, 0);                                        /* fixed function again */
     }
 
+    /* A point sprite through a vertex program, mov oPos, v0 (final), v0 =
+     * (100, 80, 50, 2) already in surface pixels -- what the XDK's appended
+     * screen transform hands the rasteriser. The surface's y runs down
+     * whatever the program's viewport scale c[58] holds (Fallout's c[58] is
+     * data that changes with the camera), so texcoord v must still grow
+     * downward: 0 at y 76, 1 at y 84. c[58].y = +1, then -1 (the XDK's
+     * viewport), then c[58] = (0, 0, 1, 0): the point is drawn all the same. */
+    {
+        static const float V0[4] = { 100.0f, 80.0f, 50.0f, 2.0f };
+        static const float C58[3][4] = {
+            { 1.0f, 1.0f, 1.0f, 0.0f }, { 1.0f, -1.0f, 1.0f, 0.0f }, { 0.0f, 0.0f, 1.0f, 0.0f },
+        };
+        uint32_t w[4] = { 0, (1u << 21) | (0u << 9) | 0x1Bu, 2u << 26,
+                          (0xFu << 12) | (1u << 11) | 1u };   /* mov oPos, v0; final */
+        int k, pass;
+
+        m(0x1E9C, 0);                                        /* PROGRAM_LOAD 0 */
+        for (k = 0; k < 4; k++)
+            m(0x0B00 + 4u * (uint32_t)k, w[k]);
+        m(0x1EA0, 0);                                        /* PROGRAM_START 0 */
+        m(0x1E94, 2);                                        /* program mode */
+        m(0x1760, 2 | (4 << 4) | (16 << 8));                 /* attr 0: float4 */
+        memcpy(s_mem + POS_AT, V0, 16);
+        m(0x043C, 64);                                       /* SET_POINT_SIZE 8 */
+        m(0x031C, 1);                                        /* sprites */
+        for (pass = 0; pass < 3; pass++) {
+            m(0x1EA4, 58);                                   /* c[58]: viewport scale */
+            for (k = 0; k < 4; k++)
+                mf(0x0B80 + 4u * (uint32_t)k, C58[pass][k]);
+            m(0x1EA4, 59);                                   /* c[59]: offset */
+            for (k = 0; k < 4; k++)
+                mf(0x0B80 + 4u * (uint32_t)k, 0.0f);
+            draw(1, 1);
+            check_point(1);
+        }
+        m(0x031C, 0);
+        m(0x1E94, 0);                                        /* fixed function again */
+        m(0x1760, 2 | (3 << 4) | (12 << 8));                 /* attr 0: float3 */
+    }
+
+    /* A fixed-function sprite with no texcoord array: its texture coordinates
+     * come from the rasteriser, so with a valid stage 0 texture the batch is
+     * textured. */
+    {
+        static const float PT4[4] = { 200.0f, 160.0f, 100.0f, 2.0f };
+
+        m(0x1B00, 0x20000u);                                 /* stage 0 offset */
+        m(0x1B04, (0x06u << 8) | (3u << 20) | (3u << 24));   /* swizzled A8R8G8B8 8x8 */
+        m(0x1760, 2 | (4 << 4) | (16 << 8));                 /* attr 0: float4 */
+        memcpy(s_mem + POS_AT, PT4, 16);
+        m(0x043C, 64);
+        m(0x031C, 1);
+        draw(1, 1);
+        CHECK(s_be.n == 6 && s_be.textured == 1);
+        m(0x031C, 0);
+        m(0x1B00, 0);
+        m(0x1760, 2 | (3 << 4) | (12 << 8));                 /* attr 0: float3 */
+    }
+
     /* 300 immediate quads, 2 px each, 20 to a row: quad k is at
      * x 10 + 3 * (k % 20), y 10 + 3 * (k / 20), so the last row (14) ends at
      * y 52 + 2 = 54; cut at 256 quads, the last would be row 12, y 48.
@@ -406,6 +509,25 @@ int main(void)
 #else
     setenv("RECOMP_FB_DUMP", "nv2a_points_no_such_dir/f_", 1);
 #endif
+    /* A batch that draws, now that it is on: the capture after a drawing batch
+     * read the variable once, at the quads above, when it was off -- it asks
+     * for no download. The report still does. The quad is 40 px: a batch
+     * that spans less than OBJECT_SPACE_SPAN is taken for model units, not
+     * screen space, and never reaches the capture. */
+    m(0x17FC, 8);                                        /* BEGIN_END: quads */
+    {
+        int c;
+        static const float CX[4] = { 0, 40, 40, 0 }, CY[4] = { 0, 0, 40, 40 };
+        for (c = 0; c < 4; c++) {
+            mf(0x1518, 10.0f + CX[c]);                   /* SET_VERTEX4F */
+            mf(0x151C, 10.0f + CY[c]);
+            mf(0x1520, 100.0f);
+            mf(0x1524, 1.0f);
+        }
+    }
+    m(0x17FC, 0);
+    nv2a_pb_exec_sync();
+    CHECK(s_read_syncs == 0);
     nv2a_pb_exec_report();
     CHECK(s_read_syncs == 1);
 
