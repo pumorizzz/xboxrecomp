@@ -220,6 +220,8 @@ int usb_gamepad_control(int pad, const UsbSetup *setup, uint8_t *out, int max)
 /* The host's own pad, through the layer that already maps one to XInput.
  * A real controller plugged into the PC drives this emulated one. */
 #include "../input/xinput_xbox.h"
+#include "../input/keyboard.h"             /* xbox_FramebufferKeyDown */
+#include "../kernel/xbox_memory_layout.h"  /* xbox_Nv2aFlipCount */
 
 /*
  * The Xbox report is 20 bytes and fixed:
@@ -566,7 +568,7 @@ static void pad_script_apply(int pad, uint8_t *out)
 /* Record what a player does on pad 1 and play it back, to repeat a route
  * through a level without a script written by hand.
  *
- * RECOMP_PAD_RECORD=<file> names the recording. In the window, F9 starts and
+ * RECOMP_PAD_RECORD=<file> names the recording. In the window, F8 starts and
  * stops recording into it, F10 plays it back from that moment; a line
  * "replay" appended to RECOMP_PAD_LIVE does the same as F10.
  * RECOMP_PAD_RECORD_FROM_START=1 records from the first report, =play plays
@@ -578,7 +580,7 @@ static void pad_script_apply(int pad, uint8_t *out)
  * of the report in hex>", written only when the report changes. Playback
  * overlays the recorded report on the live one -- buttons OR'ed, a stick the
  * recording deflects replaces the live one -- so a pad or the keyboard can
- * still take over, and the last line (everything released, F9 pressed with
+ * still take over, and the last line (everything released, F8 pressed with
  * nothing held) ends it. */
 #define PAD_REC_BYTES 18                 /* report bytes 2..19 */
 
@@ -587,15 +589,31 @@ typedef struct {
     uint8_t  r[PAD_REC_BYTES];
 } PadRecStep;
 
-extern uint32_t xbox_Nv2aFlipCount(void);   /* src/kernel/xbox_memory_layout.c */
-extern int xbox_FramebufferKeyDown(int vk); /* src/video/fb_present.c */
+#define PAD_REC_KEY  0x77   /* F8: F9 is RECOMP_MKB's capture toggle (mkb_input.c) */
+#define PAD_PLAY_KEY 0x79   /* F10 */
 
 static FILE       *s_rec;
 static uint32_t    s_rec_f0;
 static uint8_t     s_rec_last[PAD_REC_BYTES];
 static PadRecStep *s_play;
-static int         s_play_len, s_play_on;
+static int         s_play_len, s_play_on, s_play_pos;
 static uint32_t    s_play_f0;
+
+/* Time is kept in flips, and only the pushbuffer executor flips
+ * (xbox_Nv2aFrameCounterFlip). Without RECOMP_PB_EXEC every step would be
+ * at 0 and a replay would never move past its first step: say so instead. */
+static int pad_rec_clock(const char *what)
+{
+    static int exec = -1;
+    if (exec < 0)
+        exec = getenv("RECOMP_PB_EXEC") != NULL;
+    if (!exec) {
+        fprintf(stderr, "  PAD: no %s without RECOMP_PB_EXEC: time is kept in flips, "
+                        "and nothing flips\n", what);
+        fflush(stderr);
+    }
+    return exec;
+}
 
 static void pad_replay_start(void)
 {
@@ -605,6 +623,8 @@ static void pad_replay_start(void)
     int cap = 0;
 
     if (s_rec || !path || !*path)
+        return;
+    if (!pad_rec_clock("replay"))
         return;
     f = fopen(path, "rb");
     if (!f) {
@@ -646,6 +666,7 @@ static void pad_replay_start(void)
     }
     fclose(f);
     s_play_f0 = xbox_Nv2aFlipCount();
+    s_play_pos = 0;
     s_play_on = s_play_len > 0;
     fprintf(stderr, "  PAD: playing %d step(s) from %s, %u flip(s) long\n",
             s_play_len, path, s_play_len ? s_play[s_play_len - 1].flip : 0u);
@@ -673,6 +694,8 @@ static void pad_record_toggle(void)
     }
     if (!path || !*path || s_play_on)
         return;
+    if (!pad_rec_clock("recording"))
+        return;
     s_rec = fopen(path, "wb");
     if (!s_rec) {
         fprintf(stderr, "  PAD: cannot write %s\n", path);
@@ -683,17 +706,17 @@ static void pad_record_toggle(void)
     memset(s_rec_last, 0xFF, sizeof s_rec_last);   /* the first report is a change */
     fprintf(s_rec, "# pad 1, <flips> <report bytes 2..19>; RECOMP_PAD_RECORD, F10 replays\n");
     fflush(s_rec);
-    fprintf(stderr, "  PAD: recording into %s (F9 stops)\n", path);
+    fprintf(stderr, "  PAD: recording into %s (F8 stops)\n", path);
     fflush(stderr);
 }
 
 static void pad_record_apply(uint8_t *out)
 {
-    static int f9, f10, started;
-    int k9 = xbox_FramebufferKeyDown(0x78), k10 = xbox_FramebufferKeyDown(0x79);
+    static int f8, f10, started;
+    int k8 = xbox_FramebufferKeyDown(PAD_REC_KEY), k10 = xbox_FramebufferKeyDown(PAD_PLAY_KEY);
 
     /* RECOMP_PAD_RECORD_FROM_START=1: record from the first report on, as
-     * if F9 were pressed then; =play plays the recording from there. */
+     * if F8 were pressed then; =play plays the recording from there. */
     if (!started) {
         const char *e = getenv("RECOMP_PAD_RECORD_FROM_START");
         started = 1;
@@ -703,18 +726,19 @@ static void pad_record_apply(uint8_t *out)
             pad_record_toggle();
     }
 
-    if (k9 && !f9)
+    if (k8 && !f8)
         pad_record_toggle();
     if (k10 && !f10)
         pad_replay_start();
-    f9 = k9;
+    f8 = k8;
     f10 = k10;
 
     if (s_play_on) {
         uint32_t t = xbox_Nv2aFlipCount() - s_play_f0;
-        int i, j = -1;
-        for (i = 0; i < s_play_len && s_play[i].flip <= t; i++)
-            j = i;
+        int i, j;
+        while (s_play_pos + 1 < s_play_len && s_play[s_play_pos + 1].flip <= t)
+            s_play_pos++;
+        j = s_play_len && s_play[0].flip <= t ? s_play_pos : -1;
         if (j >= 0) {
             const uint8_t *r = s_play[j].r;
             for (i = 0; i < 10; i++)              /* digital, analog buttons */
@@ -773,7 +797,6 @@ int usb_gamepad_report(int pad, uint8_t *out, int max)
         if (diag < 0)
             diag = getenv("RECOMP_INPUT_DIAG") != NULL;
         if (diag) {
-            extern int xbox_FramebufferKeyDown(int vk);
             static unsigned long last;
             unsigned long now = (unsigned long)GetTickCount();
             if (now - last > 1000) {
