@@ -16,8 +16,7 @@ ptrdiff_t xbox_GetMemoryOffset(void) { return 0; }
 void xbox_InputKeySet(int vk, int down) { (void)vk; (void)down; }
 void xbox_InputKeysClear(void) {}
 
-void xbox_FramebufferWindowSetAspect(uint32_t n, uint32_t d);
-void xbox_FramebufferWindowFit(uint32_t cw, uint32_t ch, int32_t out[4]);
+#include "video/video_player.h"
 
 static int failures;
 

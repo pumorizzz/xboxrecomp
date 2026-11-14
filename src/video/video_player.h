@@ -67,6 +67,18 @@ int  xbox_FramebufferDumpBmp(const char *path);
  * UTF-16 title (40 chars max); the stats come from each flip. */
 void xbox_FramebufferWindowSetTitle(const uint16_t *name, int max_chars);
 void xbox_FramebufferWindowFrameStats(uint32_t draws);
+/* The window for a presenter that draws into it itself (the D3D11 back end
+ * puts a swap chain on it): its HWND while it runs, else NULL; while
+ * External is on, the window thread keeps title, keys and close button and
+ * stops blitting. */
+void *xbox_FramebufferWindowHandle(void);
+void  xbox_FramebufferWindowExternal(int on);
+/* Display aspect (4:3 by default, RECOMP_FB_ASPECT) and the picture's size
+ * (RECOMP_FB_SIZE); a game project calls these when it knows better. */
+void  xbox_FramebufferWindowSetAspect(uint32_t n, uint32_t d);
+void  xbox_FramebufferWindowSetSize(uint32_t w, uint32_t h);
+/* Where the frame goes in a cw x ch client area: x, y, w, h. */
+void  xbox_FramebufferWindowFit(uint32_t cw, uint32_t ch, int32_t out[4]);
 
 #if !defined(_WIN32)
 /* POSIX hosts: the framebuffer window needs the process main thread (AppKit
@@ -78,4 +90,4 @@ void xbox_FramebufferWindowFrameStats(uint32_t draws);
 int  xbox_HostWindowMain(int (*guest_main)(void));
 #endif
 
-#endif /* BURNOUT3_VIDEO_PLAYER_H */
+#endif /* XBOXRECOMP_VIDEO_PLAYER_H */

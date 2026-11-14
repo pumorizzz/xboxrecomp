@@ -14,6 +14,9 @@ if(WIN32)
         nv2a_gpu_d3d11.c        # RECOMP_GPU_RASTER: NV2A rasterisation on D3D11
     )
     target_link_libraries(xbox_d3d8 PUBLIC platform d3d11 dxgi dxguid d3dcompiler)
+    # nv2a_gpu_d3d11.c presents into the framebuffer window (src/video/fb_present.c).
+    # xbox_video links xbox_d3d8 too; CMake allows the cycle between static libraries.
+    target_link_libraries(xbox_d3d8 PUBLIC xbox_video)
 
     # Offline smoke test for the pure format layer (no D3D11 device needed).
     add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/../../tests/d3d8_smoke

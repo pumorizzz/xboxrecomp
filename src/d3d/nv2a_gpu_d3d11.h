@@ -18,6 +18,15 @@
  * RECOMP_GPU_RASTER_SYNC=all -- write back at every executor sync (for a
  *   title whose CPU reads what the GPU drew); RECOMP_GPU_RASTER_RTTEX=0 --
  *   read every texture through guest RAM.
+ * RECOMP_GPU_RASTER_SCALE=<n>|<x>x<y> -- render at n (1-8) times the surface
+ *   each way, the title still sees its own size in guest RAM;
+ *   RECOMP_GPU_RASTER_MSAA=<2|4|8> -- samples, lowered to what the device has;
+ *   RECOMP_GPU_RASTER_SSAA=<n> -- 1-4: drawn at scale x n, each n x n block
+ *   averaged down before the window (scale x n at most 8 a side).
+ * RECOMP_GPU_RASTER_PRESENT=0 -- leave the framebuffer window to GDI and
+ *   guest RAM instead of a swap chain on it;
+ *   RECOMP_GPU_RASTER_PRESENT_DUMP=<prefix> -- every
+ *   RECOMP_GPU_RASTER_PRESENT_DUMP_EVERY-th (default 30) shown frame as BMP.
  * A lost device (driver reset) hands the frame back to the software
  * rasteriser at the next flip; RECOMP_GPU_RASTER_LOSE_AT=<flip> acts it out.
  * Needs RECOMP_PB_EXEC=1 to have any effect.

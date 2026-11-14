@@ -30,6 +30,7 @@
  * is the thing that receives the keys, so that is what has to remember
  * them. */
 #include "keyboard.h"   /* src/input */
+#include "video_player.h"
 
 extern ptrdiff_t xbox_GetMemoryOffset(void);
 

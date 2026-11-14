@@ -51,6 +51,11 @@
  *     through the linear view, the shadows were scattered dots.
  *   Both straight from the GPU: the target's guest RAM stays untouched.
  *
+ * A visibility count at an internal scale is the samples of all draws divided
+ * once: three draws of a rectangle 10 1/3 x 1 px give 30 at 1x and 31 when each
+ * surface pixel is 36 samples (3x3 with 4x MSAA, or 2x with 3x3 SSAA), where
+ * dividing per draw gave 30.
+ *
  * Harness as tests/nv2a_points; Windows only. */
 #include <math.h>
 #include <stddef.h>
@@ -476,6 +481,29 @@ int main(void)
             printf("swizzled view of a swizzled target: %u pixels off, first (%u,%u): "
                    "want %08X got %08X\n", bad, fx, fy, fw, fg);
         CHECK(bad == 0);
+    }
+
+    /* Visibility counts: samples of all draws, divided into pixels once. Three
+     * draws of a rectangle 10 1/3 x 1 px: 30 pixels at 1x. At 36 samples a pixel
+     * (3x3 with 4x MSAA, or 2x with 3x3 SSAA) the rectangle's edges sit on the
+     * target's pixel boundaries, so it is 31 x 3 x 4 = 372 samples a draw
+     * (62 x 6 either way): 1116 / 36 = 31 divided once, 30 divided per draw. */
+    {
+        const uint32_t at = 0x230000u;
+        uint32_t got, k;
+        const char *sc = getenv("RECOMP_GPU_RASTER_SCALE");
+        uint32_t want = sc && strcmp(sc, "1") ? 31 : 30;
+
+        m(0x17CC, 1);                        /* SET_ZPASS_PIXEL_COUNT_ENABLE */
+        m(0x17C8, 0);                        /* CLEAR_REPORT_VALUE */
+        for (k = 0; k < 3; k++)
+            draw_rect(SURF(33), WHITE_TEX, 0x12, 6, 0.0f, 0.0f, 10.0f + 1.0f / 3, 1.0f);
+        m(0x17D0, at);                       /* GET_REPORT */
+        memcpy(&got, s_mem + at + 8, 4);
+        m(0x17CC, 0);
+        if (got != want)
+            printf("visibility count %u, want %u\n", got, want);
+        CHECK(got == want);
     }
 
     /* Device loss at the third flip. */

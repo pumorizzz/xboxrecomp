@@ -4,12 +4,14 @@
  *
  * Everything below runs on the NV2A poll thread, one call at a time, except
  * nv2a_gpu_d3d11_install(), which creates the device on the main thread
- * before the title starts. There is no window and no swap chain: colour
- * surfaces live in offscreen render targets that mirror guest RAM.
+ * before the title starts. Colour surfaces live in offscreen render targets
+ * that mirror guest RAM; with the framebuffer window open (RECOMP_FB_WINDOW)
+ * a swap chain on it shows the presented target directly (see "presenting
+ * from the GPU").
  *
- * Colour surfaces. One 1280x1024 BGRA8 render target per (guest address,
- * pitch, bytes per pixel), with a CPU copy (the shadow) of what guest RAM
- * held when the target last matched it. The first time a target is used in
+ * Colour surfaces. One BGRA8 render target per (guest address,
+ * pitch, bytes per pixel; size: see "Internal resolution" below), with a CPU
+ * copy (the shadow) of what guest RAM held when the target last matched it. The first time a target is used in
  * an epoch -- epochs end at every executor sync and every flip -- the guest
  * rows are compared with the shadow and the rows the title (or the CPU) has
  * changed are uploaded. A target goes back into guest RAM (and the shadow)
@@ -39,8 +41,9 @@
  * the register combiners, ported line by line from nv2a_rc_eval /
  * rc_stage_fetch / rc_texel. Constants are the raw combiner words.
  *
- * ponytail: one render-target size (1280x1024, the executor's depth-buffer
- * size); bigger surfaces are clamped. Level 0 only, no mip selection, as the
+ * ponytail: every target and depth buffer has one size, RT_W native pixels
+ * wide and s_gh high (RT_W x RT_H at scale 1 without MSAA), times the internal
+ * scale; bigger surfaces are clamped. Level 0 only, no mip selection, as the
  * software path. A swizzled colour surface is drawn linearly on the GPU and
  * sampled as such (rt_as_texture); written back to guest RAM it stays linear.
  */
@@ -63,11 +66,9 @@
 #include "../kernel/nv2a_backend.h"
 #include "d3d8_swizzle.h"
 #include "nv2a_gpu_d3d11.h"
+#include "../video/video_player.h"   /* the framebuffer window it presents into */
 
 extern ptrdiff_t xbox_GetMemoryOffset(void);
-extern void *xbox_FramebufferWindowHandle(void);       /* src/video/fb_present.c */
-extern void xbox_FramebufferWindowExternal(int on);
-extern void xbox_FramebufferWindowFit(uint32_t cw, uint32_t ch, int32_t out[4]);
 
 #define RT_W 1280                       /* = NV_ZBUF_W in nv2a_pb_exec.c */
 #define RT_H 1024                       /* = NV_ZBUF_H */
@@ -516,7 +517,7 @@ static int s_qfree;                     /* entries [0, s_qfree) are free */
 static int s_qmade;
 static ID3D11Query *s_qpend[MAX_QUERIES];
 static int s_npend;
-static uint64_t s_zpass_acc;            /* resolved, not yet reported */
+static uint64_t s_zpass_acc;            /* resolved samples, not yet reported */
 
 /* Internal resolution and anti-aliasing (RECOMP_GPU_RASTER_SCALE=<n> or
  * <x>x<y>, RECOMP_GPU_RASTER_MSAA=<samples>).
@@ -1579,8 +1580,10 @@ static void query_resolve_one(ID3D11Query *q)
     while ((hr = ID3D11DeviceContext_GetData(s_ctx, (ID3D11Asynchronous *)q, &n,
                                              sizeof n, 0)) == S_FALSE)
         YieldProcessor();
-    if (hr == S_OK)                     /* samples at the internal scale -> pixels */
-        s_zpass_acc += n / ((UINT64)s_sx * s_sy * s_msaa);
+    if (hr == S_OK)                     /* samples at the internal scale: divided into
+                                         * pixels once, in gpu_report -- per query, each
+                                         * lost up to a pixel */
+        s_zpass_acc += n;
     s_qpool[s_qfree++] = q;
 }
 
@@ -2058,7 +2061,7 @@ static uint32_t gpu_report(void)
     if (s_compare)
         return 0;
     query_resolve_all();
-    n = s_zpass_acc;
+    n = s_zpass_acc / ((uint64_t)s_sx * s_sy * s_msaa);
     s_zpass_acc = 0;
     return n > 0xFFFFFFFFull ? 0xFFFFFFFFu : (uint32_t)n;
 }
@@ -2218,7 +2221,7 @@ static int gpu_lost(void)
     if (SUCCEEDED(why) && !(s_lose_at && s_flip_no >= s_lose_at))
         return 0;
     fprintf(stderr, "[GPURAST] D3D11 device lost (0x%08lX) at flip %u; the software"
-                    " rasteriser takes over%c", (unsigned long)why, s_flip_no, 10);
+                    " rasteriser takes over\n", (unsigned long)why, s_flip_no);
     nv2a_backend_register(NULL);
     xbox_FramebufferWindowExternal(0);
     release_all();
@@ -2365,8 +2368,9 @@ static ID3DBlob *compile(const char *entry, const char *target)
  * frames with GDI from guest RAM, which with this back end meant reading the
  * presented frame back from the GPU at every flip. Instead a swap chain goes
  * on that window and the presented target is drawn into its back buffer
- * directly: 640x480 like the GDI window, every other pixel of a 2x-wide
- * anti-aliased surface and every aa_sy-th row, as fb_present takes them.
+ * directly: the whole frame -- 640x480 times the surface's anti-aliasing
+ * factor and the internal scale, or s_ss under SSAA -- filtered into the
+ * rectangle xbox_FramebufferWindowFit gives (the display aspect, bars around it).
  * The window thread keeps the title bar, the keyboard and the close button.
  * Without a window there is nothing to show, so nothing is read back at all.
  * The frame reaches guest RAM only when something reads it there (the
