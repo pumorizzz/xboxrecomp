@@ -126,6 +126,27 @@ int main(void)
         }
         nv2a_vsh_set_start_slot(0);
     }
+
+    /* The same in MUL: mul oD0, v0, c[61] gives (0, 6, 0, 0); MAD alone was
+     * checked, and the MUL case could go back to IEEE unseen. */
+    {
+        uint32_t k4[4] = {0};
+        float vin[NV2A_VSH_INPUTS][4] = {{0}};
+
+        k4[1] = (2u << 21) | (61u << 13);                      /* MAC mul, c[61] */
+        src(k4, 0, V, 0, XYZW); src(k4, 1, C, 0, XYZW);
+        k4[3] |= (0xFu << 12) | (1u << 11) | (3u << 3) | 1u;   /* oD0.xyzw, final */
+        nv2a_vsh_set_instruction(11, k4);
+        nv2a_vsh_set_start_slot(11);
+        vin[0][1] = 2.0f; vin[0][3] = 1.0f;
+        if (!nv2a_vsh_run((const float (*)[4])vin, &o)
+            || o.d0[0] != 0.0f || o.d0[1] != 6.0f || o.d0[2] != 0.0f || o.d0[3] != 0.0f) {
+            printf("FAIL: zero times inf/NaN in MUL: d0 %g %g %g %g, want 0 6 0 0\n",
+                   o.d0[0], o.d0[1], o.d0[2], o.d0[3]);
+            return 1;
+        }
+        nv2a_vsh_set_start_slot(0);
+    }
     puts("ok");
     return 0;
 }
