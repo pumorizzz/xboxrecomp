@@ -39,6 +39,18 @@
  * shows (nv2a_gpu_test_ssaa_frame) is each n x n block averaged to k -- so each
  * k x k block of the shown frame matches the writeback's pixel.
  *
+ * A target read as a swizzled A8R8G8B8 texture, in all three configurations:
+ *   - a linear target (Fallout's HUD atlas at 0x821E4000): texel (u,v) is
+ *     dword swizzle_offset(u,v) from its base, so a 32x32 view of a 64-wide
+ *     target lands where the CPU sampler would find it; at an internal scale
+ *     each texel is the block's centre -- a rectangle whose left and top edges
+ *     sit a third into a pixel reads white, as on the Xbox, not the corner's
+ *     colour. Wrong bits or a wrong row and the HUD is scrambled.
+ *   - a target drawn as a swizzled surface (SET_SURFACE_FORMAT type 2,
+ *     Fallout's character shadows): sampled as it is, pixel for pixel. Read
+ *     through the linear view, the shadows were scattered dots.
+ *   Both straight from the GPU: the target's guest RAM stays untouched.
+ *
  * Harness as tests/nv2a_points; Windows only. */
 #include <math.h>
 #include <stddef.h>
@@ -54,10 +66,16 @@
 #define H 64
 #define PITCH (W * 4)
 #define SURF(i) (0x10000u + (uint32_t)(i) * 0x10000u)
-#define MEM_BYTES 0x200000u
+#define MEM_BYTES 0x240000u
 #define POS_AT  0x1A0000u
 #define DIFF_AT 0x1B0000u
 #define TC_AT   0x1C0000u
+#define PAT_TEX   SURF(28)               /* 0x1D0000: the pattern, linear 64x64 */
+#define WHITE_TEX (SURF(28) + 0x8000u)   /* white, linear 64x64 */
+#define SWZ_L     SURF(29)               /* a linear target */
+#define SWZ_DA    SURF(30)
+#define SWZ_S     SURF(31)               /* a swizzled target (SET_SURFACE_FORMAT type 2) */
+#define SWZ_DB    SURF(32)               /* ends 0x214000 */
 static uint8_t s_mem[MEM_BYTES];
 
 /* ---- what the executor and the back end expect the runtime to provide -- */
@@ -103,7 +121,8 @@ static void draw_textured_at(uint32_t va, uint32_t tex) { draw_quad(va, tex, 0x1
 
 /* Fixed function, white diffuse, stage 0 the W x H texture at tex; vertices
  * `n` of P (positions, texcoords = positions). */
-static void fixed_state(uint32_t tex, uint32_t fmt, const float (*P)[3], uint32_t n)
+static void fixed_state_lg(uint32_t tex, uint32_t fmt, const float (*P)[3], uint32_t n,
+                           uint32_t lg)
 {
     static const float I[16] = { 1, 0, 0, 0,  0, 1, 0, 0,  0, 0, 1, 0,  0, 0, 0, 1 };
     uint32_t i, white = 0xFFFFFFFFu;
@@ -117,8 +136,8 @@ static void fixed_state(uint32_t tex, uint32_t fmt, const float (*P)[3], uint32_
     m(0x1E94, 0);                            /* fixed function */
     for (i = 0; i < n; i++) {
         float tc[2];
-        /* Texels for a linear texture, 0..1 for the rest (W == H). */
-        float sc = fmt == 0x12 ? 1.0f : 1.0f / W;
+        /* Texels for a linear texture, 0..1 for the rest (a 2^lg square). */
+        float sc = fmt == 0x12 ? 1.0f : 1.0f / (float)(1u << lg);
         tc[0] = P[i][0] * sc; tc[1] = P[i][1] * sc;
         memcpy(s_mem + POS_AT + 12u * i, P[i], 12);
         memcpy(s_mem + DIFF_AT + 4u * i, &white, 4);
@@ -128,9 +147,15 @@ static void fixed_state(uint32_t tex, uint32_t fmt, const float (*P)[3], uint32_
     m(0x172C, DIFF_AT); m(0x176C, 0 | (4 << 4) | (4 << 8));    /* attr 3: D3DCOLOR */
     m(0x1744, TC_AT);   m(0x1784, 2 | (2 << 4) | (8 << 8));    /* attr 9: float2 */
     m(0x1B00, tex);                          /* SET_TEXTURE_OFFSET */
-    m(0x1B04, (fmt << 8) | (1u << 16) | (6u << 20) | (6u << 24));  /* FORMAT, 1 level, 64x64 */
+    m(0x1B04, (fmt << 8) | (1u << 16) | (lg << 20) | (lg << 24));  /* FORMAT, 1 level, 2^lg square */
     m(0x1B10, (uint32_t)PITCH << 16);        /* CONTROL1: pitch */
-    m(0x1B1C, ((uint32_t)W << 16) | H);      /* IMAGE_RECT */
+    if (fmt == 0x12 || fmt == 0x1E)           /* linear: the size is IMAGE_RECT (as the XDK); else FORMAT */
+        m(0x1B1C, ((uint32_t)W << 16) | H);  /* IMAGE_RECT */
+}
+
+static void fixed_state(uint32_t tex, uint32_t fmt, const float (*P)[3], uint32_t n)
+{
+    fixed_state_lg(tex, fmt, P, n, 6);
 }
 
 static void draw_quad(uint32_t va, uint32_t tex, uint32_t fmt, int sync)
@@ -147,6 +172,27 @@ static void draw_quad(uint32_t va, uint32_t tex, uint32_t fmt, int sync)
     m(0x17FC, 0);
     if (sync)
         nv2a_pb_exec_sync();
+}
+
+/* A rectangle (x0,y0)-(x1,y1) on the surface at va, as draw_quad: stage 0 the
+ * 2^lg-square texture at tex (texcoords = positions; normalised for a
+ * swizzled one). */
+static void draw_rect(uint32_t va, uint32_t tex, uint32_t fmt, uint32_t lg,
+                      float x0, float y0, float x1, float y1)
+{
+    const float P[6][3] = { {x0,y0,0},{x1,y0,0},{x0,y1,0},{x1,y0,0},{x1,y1,0},{x0,y1,0} };
+
+    fixed_state_lg(tex, fmt, P, 6, lg);
+    m(0x0210, va);                           /* SET_SURFACE_COLOR_OFFSET (a new epoch) */
+    m(0x17FC, 5);                            /* BEGIN_END: triangles */
+    m(0x1810, (5u << 24) | 0);               /* DRAW_ARRAYS 6 from 0 */
+    m(0x17FC, 0);
+    nv2a_pb_exec_sync();
+}
+
+static uint32_t pat(uint32_t x, uint32_t y)
+{
+    return 0xFF000000u | (y << 16) | (x << 8) | ((x * 37u + y * 101u) & 0xFFu);
 }
 
 /* A triangle (0,0) (W,0) (0,H) on the surface at va, as draw_quad. */
@@ -372,6 +418,64 @@ int main(void)
             tex += 0x4000;
         }
         CHECK((uint32_t)nv2a_gpu_test_bc_uploads == bc0 + 3);
+    }
+
+    /* A target read as a swizzled A8R8G8B8 texture, straight from the GPU. */
+    {
+        uint32_t x, y, u, v, bad, fx = 0, fy = 0, fw = 0, fg = 0, got, want;
+
+        for (y = 0; y < H; y++)
+            for (x = 0; x < W; x++) {
+                uint32_t p = pat(x, y);
+                memcpy(s_mem + PAT_TEX + y * PITCH + 4 * x, &p, 4);
+            }
+        memset(s_mem + WHITE_TEX, 0xFF, PITCH * H);
+
+        /* (a) a linear target, read as a swizzled 32x32 texture. */
+        clear_surface_to(SWZ_L, 0xFF000000u);
+        draw_quad(SWZ_L, PAT_TEX, 0x12, 1);
+        draw_rect(SWZ_L, WHITE_TEX, 0x12, 6, 8.0f + 1.0f / 3, 4.0f + 1.0f / 3, 12.0f, 8.0f);
+        clear_surface_to(SWZ_DA, 0xFF000000u);
+        draw_rect(SWZ_DA, SWZ_L, 0x06, 5, 0, 0, 32, 32);
+        CHECK(surface_is(SWZ_L, 0));         /* read on the GPU, RAM untouched */
+        write_back_all();
+        bad = 0;
+        for (v = 0; v < 32; v++)
+            for (u = 0; u < 32; u++) {
+                uint32_t idx = swizzle_offset(u, v, 32, 32);
+                uint32_t lx = idx % W, ly = idx / W;
+                want = (lx >= 8 && lx < 12 && ly >= 4 && ly < 8) ? 0xFFFFFFFFu : pat(lx, ly);
+                memcpy(&got, s_mem + SWZ_DA + v * PITCH + 4 * u, 4);
+                if (got != want && bad++ == 0) { fx = u; fy = v; fw = want; fg = got; }
+            }
+        if (bad)
+            printf("swizzled view of a linear target: %u texels off, first (%u,%u) -> "
+                   "target (%u,%u): want %08X got %08X\n", bad, fx, fy,
+                   swizzle_offset(fx, fy, 32, 32) % W, swizzle_offset(fx, fy, 32, 32) / W,
+                   fw, fg);
+        CHECK(bad == 0);
+
+        /* (b) a target drawn as a swizzled surface (type 2), read as one. */
+        m(0x0208, 0x0008u | (2u << 8) | (6u << 16) | (6u << 24));
+        clear_surface_to(SWZ_S, 0xFF000000u);
+        draw_quad(SWZ_S, PAT_TEX, 0x12, 1);
+        m(0x0208, 0x0008);                   /* back to a linear target before Db */
+        clear_surface_to(SWZ_DB, 0xFF000000u);
+        draw_quad(SWZ_DB, SWZ_S, 0x06, 1);
+        CHECK(surface_is(SWZ_S, 0));
+        write_back_all();
+        bad = 0;
+        for (y = 0; y < H; y++)
+            for (x = 0; x < W; x++) {
+                got = 0;
+                memcpy(&got, s_mem + SWZ_DB + y * PITCH + 4 * x, 4);
+                want = pat(x, y);
+                if (got != want && bad++ == 0) { fx = x; fy = y; fw = want; fg = got; }
+            }
+        if (bad)
+            printf("swizzled view of a swizzled target: %u pixels off, first (%u,%u): "
+                   "want %08X got %08X\n", bad, fx, fy, fw, fg);
+        CHECK(bad == 0);
     }
 
     /* Device loss at the third flip. */
