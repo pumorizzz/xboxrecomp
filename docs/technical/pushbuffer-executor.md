@@ -95,6 +95,10 @@ survey's and the unhandled-method ranking) are indexed by method instead of
 searched: the survey's search was about 40% of the thread in a *X-Men Legends*
 level.
 
+`RECOMP_FB_DUMP` is read once for the capture after each batch that drew; the
+periodic report reads it every time (once a report — tests turn it on there to
+make the report download what a back end drew).
+
 ## Fixed-Function Transform
 
 Batches drawn with `SET_TRANSFORM_EXECUTION_MODE` (`0x1E94`) on "fixed" used to
@@ -242,7 +246,8 @@ reads, so a back end can shade exactly as the CPU rasteriser does:
 
 The surface carries its clip origin (`clip_x`, `clip_y`) as well as its size.
 
-Four optional members let a back end draw somewhere other than guest RAM:
+Five optional members (`sync`, `sync_surface`, `present`, `report`, `shadow`)
+let a back end draw somewhere other than guest RAM:
 
 - `sync(reason)`: make guest RAM hold what was drawn. Called at every method
   that drains the executor's pipeline (surfaces, flips — so before a flip is
@@ -267,10 +272,9 @@ Four optional members let a back end draw somewhere other than guest RAM:
 All calls come from the NV2A poll thread, one at a time, so a back end can
 create its window and device lazily and pump messages from `flip`.
 
-Things a back end should get right. These come from a Direct3D 11 back end
-written against this interface for one title; that back end is not in this
-tree, so treat them as advice from one implementation, not as tested behaviour
-of the code here:
+Things a back end should get right. These come from the Direct3D 11 back end
+in `src/d3d/nv2a_gpu_d3d11.c`, written for *Fallout: Brotherhood of Steel*
+(`tests/nv2a_gpu_backend` runs it on WARP):
 
 - **Window z is compared as it is.** `SET_CLIP_MIN`/`MAX` only clip -- a pixel
   whose window z falls outside them is not drawn, on the executor's own
@@ -440,6 +444,8 @@ frames Carbon compares at 0.00–0.02%.
 | `RECOMP_GPU_RASTER_PRESENT=0` | the D3D11 back end leaves the framebuffer window to GDI and guest RAM (the presented surface is written back at every flip) |
 | `RECOMP_GPU_RASTER_PRESENT_DUMP=<prefix>` | every `RECOMP_GPU_RASTER_PRESENT_DUMP_EVERY`-th (default 30) presented frame as `<prefix>NNNNNN.bmp`, 640x480 as the window shows it, HUD and menus included |
 | `RECOMP_GPU_RASTER_RTTEX=0` | the D3D11 back end reads every texture through guest RAM, render targets included |
+| `RECOMP_GPU_RASTER_LOSE_AT=<flip>` | act out a lost D3D11 device at that flip: the software rasteriser takes over from the next frame, as after a driver reset |
+| `RECOMP_FPS_LIMIT=<hz>` | the flip stall waits for the next 1/hz tick, standing in for vblank (default 60; `0` off — a title pacing itself on the flip then runs its menus at hundreds of fps) |
 | `RECOMP_FFP_FLIP_NORMALS` | light the side of a fixed-function mesh that faces the viewer, even when the title left two-sided lighting off. Not hardware behaviour: a compatibility option for a game project to turn on, off by default |
 
 ## The DMA Walk Is Opt-In
@@ -492,3 +498,26 @@ executor has yet to read.
 The event qualifies for a host shadow even without `RECOMP_TITLE_KEVENTS`.
 `tests/nv2a_fence_wake` waits on it on one thread and sets it from another, and checks it does not qualify without `RECOMP_PB_EXEC`.
 Fallout registers `(0xB5E58, 0x1DBC)` and runs the walk.
+
+### Lost kicks
+
+Guest threads run on several host cores at once, which the Xbox's one CPU
+never did, and XDK D3D is not thread-safe. In Fallout a loader thread and the
+main thread raced: a fence marker went into the pushbuffer, D3D's write
+pointer moved past it, and no `DMA_PUT` was ever stored for it -- the main
+thread then slept in `BlockOnFence` for a fence the GPU could not reach (the
+Tutorial froze on its loading screen).
+
+With the fence owned by the executor, the ack thread watches D3D's write
+pointer (`xbox_Nv2aLostKickPoll`): when the GPU has consumed everything it was
+given and the pointer has stood further on, in the contiguous window and
+within 64 KB of `DMA_PUT`, for 250 ms, it stores `DMA_PUT` itself -- by
+compare-and-swap, so a kick D3D makes meanwhile wins. The bytes are complete
+(D3D moves its pointer after writing them). Not hardware behaviour: recovery
+from a race the hardware never sees, logged as `[NV2A] lost kick`.
+
+The write pointer is read at `device + 0`, the device being the one
+`xbox_Nv2aFenceWakeEvent` names -- XDK D3D's layout. A title whose D3D keeps
+it elsewhere gets no recovery and no harm: the value read is not a pointer
+ahead of `DMA_PUT` in the window, and nothing is kicked.
+`tests/nv2a_fence_wake` steps the poll through a fake `DMA_PUT`.
