@@ -23,3 +23,8 @@ add_test(NAME nv2a-gpu-backend COMMAND nv2a-gpu-backend-test)
 add_test(NAME nv2a-gpu-backend-scaled COMMAND nv2a-gpu-backend-test)
 set_tests_properties(nv2a-gpu-backend-scaled PROPERTIES
     ENVIRONMENT "RECOMP_GPU_RASTER_SCALE=3;RECOMP_GPU_RASTER_MSAA=4")
+# And at 2x shown with 3x3 SSAA (RECOMP_GPU_RASTER_SSAA): drawn at 6x, what the
+# presenter shows is each 3x3 block averaged (nv2a_gpu_test_ssaa_frame).
+add_test(NAME nv2a-gpu-backend-ssaa COMMAND nv2a-gpu-backend-test)
+set_tests_properties(nv2a-gpu-backend-ssaa PROPERTIES
+    ENVIRONMENT "RECOMP_GPU_RASTER_SCALE=2;RECOMP_GPU_RASTER_SSAA=3")

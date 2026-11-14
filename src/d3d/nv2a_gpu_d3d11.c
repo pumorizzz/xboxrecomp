@@ -539,8 +539,20 @@ static uint64_t s_zpass_acc;            /* resolved, not yet reported */
  * s_gh, which starts at 512 and grows (every target goes back to guest RAM and
  * is made again) when a surface reaches further down. Scale 1 without MSAA is
  * the old path exactly: RT_W x RT_H, uploads and readbacks direct. compare
- * forces it. */
+ * forces it.
+ *
+ * SSAA (RECOMP_GPU_RASTER_SSAA=<n>): the targets are drawn at scale x n, so
+ * s_sx/s_sy above are the drawn scale; the writeback still averages the whole
+ * s_sx x s_sy block. The presenter first averages each n x n block into s_ss
+ * (ssaa_reduce) at the shown scale s_ox x s_oy, then scales that to the
+ * window. */
 static uint32_t s_sx = 1, s_sy = 1, s_msaa = 1;
+static uint32_t s_ox = 1, s_oy = 1;     /* the shown scale: s_sx / s_ssaa */
+static uint32_t s_ssaa = 1;             /* RECOMP_GPU_RASTER_SSAA: n x n drawn per shown texel */
+static ID3D11Texture2D *s_ss;           /* RT_W*s_ox x RT_H*s_oy: the frame averaged down */
+static ID3D11ShaderResourceView *s_ss_srv;   /* Texture2DArray, as the presenter reads */
+static ID3D11RenderTargetView *s_ss_rtv;
+#define MAX_SIDE 8                      /* scale x SSAA a side: 1280*8 = 10240 wide */
 static int s_scaled;                    /* s_sx * s_sy * s_msaa > 1 */
 static uint32_t s_gh = RT_H;            /* native height every target has */
 static ID3D11Texture2D *s_up, *s_down;  /* native size: rows going up, blocks coming down */
@@ -628,10 +640,10 @@ static uint32_t rt_dirty_hi(const GpuRt *r)
 
 /* bps_up: a native texel drawn over its s_sx x s_sy block of the target.
  * bps_down: the block averaged back to one texel -- the anti-aliased colour
- * guest RAM gets. */
+ * guest RAM gets; also the SSAA reduction for the presenter. */
 static const char s_blit_hlsl[] =
 "Texture2DArray<float4> bsrc : register(t0);\n"
-"cbuffer B : register(b3) { float4 bk; };\n"   /* s_sx, s_sy */
+"cbuffer B : register(b3) { float4 bk; };\n"   /* the block: s_sx, s_sy, or s_ssaa twice */
 "float4 bvs(uint i : SV_VertexID) : SV_Position {\n"
 "    float2 q = float2((i << 1) & 2, i & 2);\n"
 "    return float4(q * float2(2, -2) + float2(-1, 1), 0, 1);\n"
@@ -656,7 +668,8 @@ static void bind_pipeline(void);
 /* A full-target triangle through `ps`, reading `src`, into `rtv` (vw x vh),
  * inside `rc`; then the rasteriser's pipeline back. */
 static void blit(ID3D11RenderTargetView *rtv, ID3D11ShaderResourceView *src,
-                 ID3D11PixelShader *ps, uint32_t vw, uint32_t vh, const D3D11_RECT *rc)
+                 ID3D11PixelShader *ps, uint32_t vw, uint32_t vh, const D3D11_RECT *rc,
+                 uint32_t bx, uint32_t by)
 {
     static const float zero[4] = { 0, 0, 0, 0 };
     ID3D11ShaderResourceView *none = NULL;
@@ -664,7 +677,7 @@ static void blit(ID3D11RenderTargetView *rtv, ID3D11ShaderResourceView *src,
     D3D11_VIEWPORT vp;
     float bk[4];
 
-    bk[0] = (float)s_sx; bk[1] = (float)s_sy; bk[2] = bk[3] = 0.0f;
+    bk[0] = (float)bx; bk[1] = (float)by; bk[2] = bk[3] = 0.0f;
     if (SUCCEEDED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)s_cb_blit, 0,
                                           D3D11_MAP_WRITE_DISCARD, 0, &m))) {
         memcpy(m.pData, bk, sizeof bk);
@@ -715,11 +728,23 @@ static void rt_read_native(GpuRt *r, uint32_t x0, uint32_t y0, uint32_t x1, uint
         D3D11_RECT rc;
         rt_resolve(r);
         rc.left = (LONG)x0; rc.top = (LONG)y0; rc.right = (LONG)x1; rc.bottom = (LONG)y1;
-        blit(s_down_rtv, r->srv, s_bps_down, RT_W, RT_H, &rc);
+        blit(s_down_rtv, r->srv, s_bps_down, RT_W, RT_H, &rc, s_sx, s_sy);
         from = (ID3D11Resource *)s_down;
     }
     ID3D11DeviceContext_CopySubresourceRegion(s_ctx, (ID3D11Resource *)s_staging, 0,
                                               x0, y0, 0, from, 0, &box);
+}
+
+/* SSAA: the presented frame, ow x oh texels at the shown scale, each the
+ * average of its s_ssaa x s_ssaa block of the target -- into s_ss. */
+static void ssaa_reduce(GpuRt *r, uint32_t ow, uint32_t oh)
+{
+    D3D11_RECT rc;
+    rt_resolve(r);
+    rc.left = 0; rc.top = 0;
+    rc.right = (LONG)(ow < RT_W * s_ox ? ow : RT_W * s_ox);
+    rc.bottom = (LONG)(oh < RT_H * s_oy ? oh : RT_H * s_oy);
+    blit(s_ss_rtv, r->srv, s_bps_down, RT_W * s_ox, RT_H * s_oy, &rc, s_ssaa, s_ssaa);
 }
 
 /* Guest rows [y0, y1) into the target and the shadow. */
@@ -751,7 +776,7 @@ static void rt_upload_rows(GpuRt *r, uint32_t y0, uint32_t y1)
         D3D11_RECT rc;
         rc.left = 0; rc.right = (LONG)(r->W * s_sx);
         rc.top = (LONG)(y0 * s_sy); rc.bottom = (LONG)(y1 * s_sy);
-        blit(r->rtv, s_up_srv, s_bps_up, RT_W * s_sx, s_gh * s_sy, &rc);
+        blit(r->rtv, s_up_srv, s_bps_up, RT_W * s_sx, s_gh * s_sy, &rc, s_sx, s_sy);
         r->stale = 1;
     }
     for (y = y0; y < y1; y++)
@@ -978,6 +1003,17 @@ static void rt_grow(GpuRt *r, uint32_t x0, uint32_t y0, uint32_t x1, uint32_t y1
     if (y1 > r->dy1) r->dy1 = y1;
 }
 
+/* A target or depth buffer that could not be made: said once. */
+static void say_no_mem(uint32_t w, uint32_t h)
+{
+    static int said_mem;
+    if (said_mem)
+        return;
+    said_mem = 1;
+    fprintf(stderr, "[GPURAST] a %ux%u target (%ux MSAA) could not be made: "
+                    "out of video memory? lower the scale, SSAA or MSAA\n", w, h, s_msaa);
+}
+
 /* The target for a surface, matched to guest RAM. NULL: cannot draw. */
 static GpuRt *rt_acquire(const Nv2aSurface *s)
 {
@@ -1054,6 +1090,7 @@ static GpuRt *rt_acquire(const Nv2aSurface *s)
             || FAILED(ID3D11Device_CreateTexture2D(s_dev, &d, NULL, &r->tex))
             || FAILED(ID3D11Device_CreateShaderResourceView(s_dev, (ID3D11Resource *)r->tex,
                                                             &vd, &r->srv))) {
+            say_no_mem(d.Width, d.Height);
             rt_release(r);
             return NULL;
         }
@@ -1061,6 +1098,7 @@ static GpuRt *rt_acquire(const Nv2aSurface *s)
             d.SampleDesc.Count = s_msaa;
             d.BindFlags = D3D11_BIND_RENDER_TARGET;
             if (FAILED(ID3D11Device_CreateTexture2D(s_dev, &d, NULL, &r->mtex))) {
+                say_no_mem(d.Width, d.Height);
                 rt_release(r);
                 return NULL;
             }
@@ -1132,6 +1170,7 @@ static GpuZ *z_acquire(uint32_t va)
     if (FAILED(ID3D11Device_CreateTexture2D(s_dev, &d, NULL, &z->tex))
         || FAILED(ID3D11Device_CreateDepthStencilView(s_dev, (ID3D11Resource *)z->tex,
                                                       NULL, &z->dsv))) {
+        say_no_mem(d.Width, d.Height);
         REL(z->dsv);
         REL(z->tex);
         return NULL;
@@ -2251,6 +2290,9 @@ static void release_all(void)
     REL(s_white);
     present_release();
     REL(s_cb_blit);
+    REL(s_ss_rtv);
+    REL(s_ss_srv);
+    REL(s_ss);
     REL(s_bps_down);
     REL(s_bps_up);
     REL(s_bvs);
@@ -2339,8 +2381,8 @@ static ID3DBlob *compile(const char *entry, const char *target)
  * into the rectangle xbox_FramebufferWindowFit gives (the display aspect,
  * bars around it), bilinear between the target's texels -- exactly the
  * frame's pixels when the rectangle is the target's size. vp: the rectangle;
- * fs: the frame in target texels (640x480 times a 2x-wide anti-aliased
- * surface's 2, aa_sy and the internal scale). */
+ * fs: the frame in texels of what is drawn: the target, or s_ss under SSAA
+ * (640x480 times a 2x-wide anti-aliased surface's 2, aa_sy and the scale). */
 static const char s_present_hlsl[] =
 "Texture2DArray<float4> src : register(t0);\n"
 "cbuffer P : register(b2) { float4 pk; float4 vp; float4 fs; };\n"
@@ -2506,6 +2548,7 @@ static int gpu_present(uint32_t va, uint32_t pitch, uint32_t aa_sy)
     D3D11_VIEWPORT vp;
     D3D11_RECT rc;
     GpuRt *r = NULL;
+    ID3D11ShaderResourceView *src;
     HWND hwnd;
     float pk[12];
     int32_t fit[4];
@@ -2579,9 +2622,14 @@ static int gpu_present(uint32_t va, uint32_t pitch, uint32_t aa_sy)
     pk[2] = pk[3] = 0.0f;
     pk[4] = (float)fit[0]; pk[5] = (float)fit[1];
     pk[6] = (float)fit[2]; pk[7] = (float)fit[3];
-    pk[8] = (float)PRESENT_W * pk[0] * (float)s_sx;
-    pk[9] = (float)PRESENT_H * pk[1] * (float)s_sy;
+    pk[8] = (float)PRESENT_W * pk[0] * (float)s_ox;
+    pk[9] = (float)PRESENT_H * pk[1] * (float)s_oy;
     rt_resolve(r);
+    src = r->srv;
+    if (s_ssaa > 1) {                   /* before the presenter takes over the pipeline */
+        ssaa_reduce(r, (uint32_t)pk[8], (uint32_t)pk[9]);
+        src = s_ss_srv;
+    }
     pk[10] = pk[11] = 0.0f;
     if (SUCCEEDED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)s_cb_present, 0,
                                           D3D11_MAP_WRITE_DISCARD, 0, &m))) {
@@ -2604,7 +2652,7 @@ static int gpu_present(uint32_t va, uint32_t pitch, uint32_t aa_sy)
     ID3D11DeviceContext_VSSetShader(s_ctx, s_pvs, NULL, 0);
     ID3D11DeviceContext_PSSetShader(s_ctx, s_pps, NULL, 0);
     ID3D11DeviceContext_PSSetConstantBuffers(s_ctx, 2, 1, &s_cb_present);
-    ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 1, &r->srv);
+    ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 1, &src);
     ID3D11DeviceContext_Draw(s_ctx, 3, 0);
     IDXGISwapChain_Present(s_chain, 0, 0);
     present_dump(r, (uint32_t)pk[0], (uint32_t)pk[1]);
@@ -2612,6 +2660,48 @@ static int gpu_present(uint32_t va, uint32_t pitch, uint32_t aa_sy)
     s_st.presents++;
     return 1;
 }
+
+#ifdef NV2A_GPU_TEST_HOOKS
+/* tests/nv2a_gpu_backend: what the presenter shows for the W x H surface at
+ * va under SSAA -- (W*s_ox) x (H*s_oy) texels into out. 0 without SSAA or
+ * without that target. */
+int nv2a_gpu_test_ssaa_frame(uint32_t va, uint32_t pitch, uint32_t W, uint32_t H,
+                             uint32_t *out, uint32_t *ow, uint32_t *oh)
+{
+    D3D11_MAPPED_SUBRESOURCE m;
+    D3D11_BOX box;
+    GpuRt *r = NULL;
+    uint32_t y;
+    int i;
+
+    if (s_ssaa < 2)
+        return 0;
+    for (i = 0; i < MAX_RTS; i++)
+        if (s_rt[i].used && s_rt[i].va == va && s_rt[i].pitch == pitch) {
+            r = &s_rt[i];
+            break;
+        }
+    if (!r)
+        return 0;
+    *ow = W * s_ox;
+    *oh = H * s_oy;
+    if (*ow > RT_W || *oh > RT_H)       /* s_staging's size */
+        return 0;
+    ssaa_reduce(r, *ow, *oh);
+    box.left = 0; box.top = 0; box.front = 0;
+    box.right = *ow; box.bottom = *oh; box.back = 1;
+    ID3D11DeviceContext_CopySubresourceRegion(s_ctx, (ID3D11Resource *)s_staging, 0,
+                                              0, 0, 0, (ID3D11Resource *)s_ss, 0, &box);
+    if (FAILED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)s_staging, 0,
+                                       D3D11_MAP_READ, 0, &m)))
+        return 0;
+    for (y = 0; y < *oh; y++)
+        memcpy(out + (size_t)y * *ow, (const uint8_t *)m.pData + (size_t)y * m.RowPitch,
+               (size_t)*ow * 4);
+    ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)s_staging, 0);
+    return 1;
+}
+#endif
 
 static int create_pipeline(void)
 {
@@ -2733,6 +2823,16 @@ static int create_pipeline(void)
         bd.ByteWidth = 16;
         if (FAILED(ID3D11Device_CreateBuffer(s_dev, &bd, NULL, &s_cb_blit)))
             goto done;
+        if (s_ssaa > 1) {               /* the frame averaged down, as presented */
+            td.Width = RT_W * s_ox; td.Height = RT_H * s_oy;
+            td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+            if (FAILED(ID3D11Device_CreateTexture2D(s_dev, &td, NULL, &s_ss))
+                || FAILED(ID3D11Device_CreateShaderResourceView(s_dev, (ID3D11Resource *)s_ss,
+                                                                &vd, &s_ss_srv))
+                || FAILED(ID3D11Device_CreateRenderTargetView(s_dev, (ID3D11Resource *)s_ss,
+                                                              &rv, &s_ss_rtv)))
+                goto done;
+        }
         td.BindFlags = D3D11_BIND_SHADER_RESOURCE;   /* as the white texture below wants */
     }
 
@@ -2820,9 +2920,12 @@ int nv2a_gpu_d3d11_install(void)
         fprintf(stderr, "[GPURAST] warning: %ls is a Microsoft software adapter;"
                         " expect it to be slow\n", ad.Description);
     {
-        /* RECOMP_GPU_RASTER_SCALE=<n> | <x>x<y> (1-8), RECOMP_GPU_RASTER_MSAA=
-         * <samples>, lowered to what the device has for both formats. */
+        /* RECOMP_GPU_RASTER_SCALE=<n> | <x>x<y> (1-8), RECOMP_GPU_RASTER_SSAA=<n> (1-4),
+         * RECOMP_GPU_RASTER_MSAA=<samples>, lowered to what the device has for both
+         * formats. */
         const char *sc = getenv("RECOMP_GPU_RASTER_SCALE"), *ms = getenv("RECOMP_GPU_RASTER_MSAA");
+        const char *sa = getenv("RECOMP_GPU_RASTER_SSAA");
+        unsigned ss = sa ? (unsigned)atoi(sa) : 1;
         unsigned a = 1, b = 1, n = 1;
         UINT q1 = 0, q2 = 0;
         if (sc && sscanf(sc, "%ux%u", &a, &b) != 2) {
@@ -2835,6 +2938,16 @@ int nv2a_gpu_d3d11_install(void)
             n = (unsigned)atoi(ms);
         s_sx = a < 1 ? 1 : a > 8 ? 8 : a;
         s_sy = b < 1 ? 1 : b > 8 ? 8 : b;
+        a = s_sx; b = s_sy;
+        ss = ss < 1 ? 1 : ss > 4 ? 4 : ss;
+        if (a * ss > MAX_SIDE || b * ss > MAX_SIDE) {
+            unsigned m = MAX_SIDE / (a > b ? a : b);
+            fprintf(stderr, "[GPURAST] SSAA %ux lowered to %ux: scale x SSAA is at most %u a side\n",
+                    ss, m, MAX_SIDE);
+            ss = m;
+        }
+        s_ox = a; s_oy = b; s_ssaa = ss;
+        s_sx = a * ss; s_sy = b * ss;
         s_msaa = n >= 8 ? 8 : n >= 4 ? 4 : n >= 2 ? 2 : 1;
         while (s_msaa > 1
                && (FAILED(ID3D11Device_CheckMultisampleQualityLevels(s_dev,
@@ -2842,13 +2955,18 @@ int nv2a_gpu_d3d11_install(void)
                    || FAILED(ID3D11Device_CheckMultisampleQualityLevels(s_dev,
                               DXGI_FORMAT_D32_FLOAT_S8X24_UINT, s_msaa, &q2)) || !q2))
             s_msaa /= 2;
-        if (s_compare)                  /* compares with the software path pixel for pixel */
+        if (s_compare) {                /* compares with the software path pixel for pixel */
             s_sx = s_sy = s_msaa = 1;
+            s_ox = s_oy = s_ssaa = 1;
+        }
         s_scaled = s_sx * s_sy * s_msaa > 1;
         s_gh = s_scaled ? 512 : RT_H;
         if (s_scaled)
             fprintf(stderr, "[GPURAST] internal resolution %ux%u per surface pixel,"
                             " %ux MSAA\n", s_sx, s_sy, s_msaa);
+        if (s_ssaa > 1)
+            fprintf(stderr, "[GPURAST] SSAA %ux: each %ux%u block averaged, shown at"
+                            " %ux%u per surface pixel\n", s_ssaa, s_ssaa, s_ssaa, s_ox, s_oy);
     }
     if (!create_pipeline()) {
         fprintf(stderr, "[GPURAST] pipeline setup failed; software rasteriser stays\n");

@@ -347,7 +347,13 @@ Two more steps took the readback out of the frame altogether:
   divided back to pixels. Scale 1 without MSAA is the old path exactly.
   Cost is GPU time per pixel (the combiner ubershader): Fallout's menu,
   uncapped on an RTX 3080 Ti, 1x ~1,800 fps, 3x3 + 4x MSAA ~122, 4x3 + 4x ~85.
-  `tests/nv2a_gpu_backend` runs a second time at 3x3 + 4x MSAA.
+  `RECOMP_GPU_RASTER_SSAA=<n>` (1-4) draws the targets at scale x n (at most 8
+  a side, otherwise n is lowered with a log line); the presenter first averages
+  each n x n block into a texture of the shown scale (`ssaa_reduce`, the same
+  `bps_down`), and that is what is scaled to the window; the writeback still
+  averages the whole block, and MSAA is resolved first.
+  `tests/nv2a_gpu_backend` runs a second time at 3x3 + 4x MSAA and a third at 2x
+  with 3x3 SSAA.
 - **Texture decodes off the frame.** A texture new to the back end's cache is
   decoded on the executor's thread mid-frame. Texel by texel through the
   executor's sampler that ran at ~19 Mtexel/s: Fallout's first street in
@@ -428,6 +434,9 @@ frames Carbon compares at 0.00–0.02%.
 | `RECOMP_FFP_TRACE` | composite matrix and sample vertices of the first fixed-function batches |
 | `RECOMP_GPU_RASTER` | rasterise on the GPU through the D3D11 back end (`src/d3d/nv2a_gpu_d3d11.c`), once the game project calls `nv2a_gpu_d3d11_install()`: `1` a hardware adapter (WARP if none), `warp` the WARP adapter, `compare` the software path draws and the GPU draws alongside, printing per flip how far they differ and how many far-reaching triangles the frame had (`<RECOMP_FB_DUMP>gpu_/sw_<flip>_<surface>.bmp` for the first frames that differ by more than 1%). Unset or `0`: off |
 | `RECOMP_GPU_RASTER_SYNC=all` | the D3D11 back end writes its surfaces back at every executor sync, not only when they are read (for a title whose CPU reads what the GPU drew) |
+| `RECOMP_GPU_RASTER_SCALE=<n>\|<x>x<y>` | render resolution as a multiple of 640x480, 1-8 each way (see "Internal resolution and MSAA" above) |
+| `RECOMP_GPU_RASTER_MSAA=<n>` | 2, 4 or 8 samples, lowered to what the device supports |
+| `RECOMP_GPU_RASTER_SSAA=<n>` | 1-4: drawn at scale x n, each n x n block averaged down before the window; scale x n at most 8 a side |
 | `RECOMP_GPU_RASTER_PRESENT=0` | the D3D11 back end leaves the framebuffer window to GDI and guest RAM (the presented surface is written back at every flip) |
 | `RECOMP_GPU_RASTER_PRESENT_DUMP=<prefix>` | every `RECOMP_GPU_RASTER_PRESENT_DUMP_EVERY`-th (default 30) presented frame as `<prefix>NNNNNN.bmp`, 640x480 as the window shows it, HUD and menus included |
 | `RECOMP_GPU_RASTER_RTTEX=0` | the D3D11 back end reads every texture through guest RAM, render targets included |

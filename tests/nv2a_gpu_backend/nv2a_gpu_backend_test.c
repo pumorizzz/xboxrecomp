@@ -34,7 +34,13 @@
  * A readback whose Map fails keeps its target dirty: the next one writes it
  * (NV2A_GPU_TEST_HOOKS fails the Map, which WARP never does by itself).
  *
+ * Supersampling (RECOMP_GPU_RASTER_SSAA=n, at a shown scale k): the targets are
+ * drawn at k*n, the writeback averages the whole block, and what the presenter
+ * shows (nv2a_gpu_test_ssaa_frame) is each n x n block averaged to k -- so each
+ * k x k block of the shown frame matches the writeback's pixel.
+ *
  * Harness as tests/nv2a_points; Windows only. */
+#include <math.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -82,6 +88,8 @@ extern void nv2a_pb_exec_sync(void);
 extern void nv2a_pb_exec_report(void);
 extern int nv2a_gpu_test_fail_maps;
 extern int nv2a_gpu_test_bc_uploads;
+extern int nv2a_gpu_test_ssaa_frame(uint32_t va, uint32_t pitch, uint32_t w, uint32_t h,
+                                    uint32_t *out, uint32_t *ow, uint32_t *oh);
 
 static void m(uint32_t method, uint32_t param) { nv2a_pb_exec_method(0, method, param); }
 static void mf(uint32_t method, float f) { uint32_t u; memcpy(&u, &f, 4); m(method, u); }
@@ -250,14 +258,18 @@ int main(void)
     write_back_all();
     CHECK(surface_is(SURF(16), CLEAR_ARGB));
 
-    /* The internal scale (RECOMP_GPU_RASTER_SCALE, _MSAA; ctest runs this
-     * twice): a white triangle across black, cut along the diagonal, comes
+    /* The internal scale (RECOMP_GPU_RASTER_SCALE, _SSAA, _MSAA; ctest runs this
+     * three times): a white triangle across black, cut along the diagonal, comes
      * back to guest RAM with the edge pixels between the two -- each the
      * average of its block drawn at the higher resolution. At scale 1 a pixel
      * is either colour. The interior stays exact either way. */
     {
-        const char *sc = getenv("RECOMP_GPU_RASTER_SCALE");
-        int scaled = sc && atoi(sc) > 1;
+        const char *sc = getenv("RECOMP_GPU_RASTER_SCALE"), *ss = getenv("RECOMP_GPU_RASTER_SSAA");
+        int k = sc ? atoi(sc) : 1, n = ss ? atoi(ss) : 1;
+        int scaled;
+        if (k < 1) k = 1;
+        if (n < 1) n = 1;
+        scaled = k * n > 1;
         uint32_t x, y, v, mixed = 0, solid_ok = 1;
         memset(s_mem + SURF(12), 0xFF, PITCH * H);   /* a white texture */
         clear_surface_to(SURF(24), 0xFF000000u);
@@ -285,6 +297,45 @@ int main(void)
         draw_textured_at(SURF(13), SURF(24));
         write_back_all();
         CHECK(memcmp(s_mem + SURF(13), s_mem + SURF(24), PITCH * H) == 0);
+
+        {
+            static uint32_t shown[(W * 8) * (H * 8)];
+            uint32_t ow = 0, oh = 0, mixed_out = 0, yy, xx, j, i2;
+            int ch;
+            double worst = 0;
+            int got = nv2a_gpu_test_ssaa_frame(SURF(24), PITCH, W, H, shown, &ow, &oh);
+            CHECK(got == (n > 1));
+            if (got) {
+                CHECK(ow == W * (uint32_t)k && oh == H * (uint32_t)k);
+                /* each k x k block of what is shown, averaged, is the writeback's
+                 * pixel: both are the average of the same s_sx x s_sy texels,
+                 * rounded once or twice */
+                for (yy = 0; yy < H; yy++)
+                    for (xx = 0; xx < W; xx++) {
+                        uint32_t wb;
+                        memcpy(&wb, s_mem + SURF(24) + yy * PITCH + 4 * xx, 4);
+                        for (ch = 0; ch < 24; ch += 8) {
+                            double sum = 0, d;
+                            for (j = 0; j < (uint32_t)k; j++)
+                                for (i2 = 0; i2 < (uint32_t)k; i2++)
+                                    sum += (double)((shown[(yy * k + j) * ow + xx * k + i2] >> ch) & 0xFF);
+                            d = fabs(sum / (k * k) - (double)((wb >> ch) & 0xFF));
+                            if (d > worst)
+                                worst = d;
+                        }
+                    }
+                for (yy = 0; yy < oh; yy++)
+                    for (xx = 0; xx < ow; xx++) {
+                        uint32_t sv = shown[yy * ow + xx] & 0xFFFFFF;
+                        if (sv != 0 && sv != 0xFFFFFF)
+                            mixed_out++;
+                    }
+                printf("SSAA %d: shown %ux%u, a block off the writeback by at most %.2f, "
+                       "%u texels between\n", n, ow, oh, worst, mixed_out);
+                CHECK(worst <= 1.0);
+                CHECK(mixed_out > W);
+            }
+        }
     }
 
     /* DXT1, DXT3 and DXT5 go to the GPU as their blocks (BC1/2/3) and the
