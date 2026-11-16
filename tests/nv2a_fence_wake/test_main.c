@@ -34,6 +34,18 @@
  *   3. D3D kicking between the poll's read of DMA_PUT and its store: the
  *      store must not land. A plain store put DMA_PUT back behind D3D's
  *      kick, and the commands in between were never executed.
+ *
+ * Two more modes, the DMA walk (RECOMP_PB_WALK=dma) with the executor:
+ *
+ *   kick-flip RECOMP_PB_EXEC=1, RECOMP_PB_WALK=dma, RECOMP_FPS_LIMIT=1: a
+ *            kickoff (0x100410 bit 16) is answered while the executor waits for
+ *            a flip's vblank tick. D3D's KickOff spins on the bit; unanswered,
+ *            the title loses the rest of the frame (Fallout at 60 fps: game
+ *            frames in 4 + 29 ms pairs).
+ *   get-wake RECOMP_PB_EXEC=1, RECOMP_PB_WALK=dma: only NO_OPERATION 5 (and the
+ *            2 s heartbeat) sets the fence event; a walk's pass without it
+ *            leaves the event unset. A spurious wake releases Fallout's
+ *            BlockOnFence early, with the same 4 + 29 ms pairs as symptom.
  */
 #include "kernel.h"
 #include "xbox_memory_layout.h"
@@ -200,11 +212,126 @@ static void lost_kick(void)
     check(!kicked && put_reg == PHYS(ptr) + 0x80, "D3D kicked meanwhile: DMA_PUT not put back");
 }
 
+/* kick-flip: XDK D3D's KickOff sets 0x100410 bit 16 and spins until the GPU
+ * clears it (Fallout 0x000AB850). On hardware the FIFO answers at once, also
+ * while PGRAPH sits on a FLIP_STALL waiting for vblank. Here the executor
+ * waits for the flip's vblank tick in flip_pace; if nothing answers the kick
+ * meanwhile, the title spins in KickOff for the rest of the frame (Fallout at
+ * 60 fps: game frames in 4 + 29 ms pairs). RECOMP_FPS_LIMIT=1 makes the
+ * second flip wait a whole second, so the wait cannot be missed. */
+static void kick_during_flip(uint32_t scratch)
+{
+    volatile uint32_t *put = xbox_Nv2aRegPtr(0x800040u);
+    volatile uint32_t *get = xbox_Nv2aRegPtr(0x800044u);
+    volatile uint32_t *kick = xbox_Nv2aRegPtr(0x100410u);
+    volatile uint32_t *intr = xbox_Nv2aRegPtr(0x600100u);
+    uint32_t *pb = G(RING), get_at_kick, ms;
+    DWORD t0;
+
+    if (!put || !get || !kick || !intr) {
+        check(0, "NV2A registers mapped");
+        return;
+    }
+    pb[0] = 0x00040130u; pb[1] = 0;            /* FLIP_STALL */
+    pb[2] = 0x00040130u; pb[3] = 0;            /* FLIP_STALL: 60 ticks after the first at 1 Hz */
+    pb[4] = 0x00040100u; pb[5] = 0;            /* NO_OPERATION */
+    *get = PHYS(RING);
+    *put = PHYS(RING);                         /* the walk resyncs to GET */
+    Sleep(100);
+    *put = PHYS(RING) + 24;                    /* kick the three commands */
+    Sleep(200);                                /* first flip done (<= 17 ms), second waiting */
+    get_at_kick = *get;
+    *kick |= 0x10000u;                         /* D3D's KickOff handshake */
+    *intr |= 0x1u;                             /* a pending PCRTC interrupt: the poll loop's to clear, not the kick thread's */
+    Sleep(100);
+    check(*kick & 0x10000u,
+          "no fence event registered yet: the kick thread leaves the kick alone");
+    xbox_Nv2aFenceWakeEvent(scratch, 0x40);    /* the title registers it: the executor owns the fence */
+    t0 = GetTickCount();
+    while ((*kick & 0x10000u) && GetTickCount() - t0 < 500)
+        Sleep(1);
+    ms = GetTickCount() - t0;
+    checkd(get_at_kick != PHYS(RING) + 24,
+           "the executor is inside the second flip when the title kicks",
+           "GET 0x%08X", get_at_kick);
+    checkd(!(*kick & 0x10000u) && ms <= 50,
+           "a kickoff is answered while the executor waits for the flip's vblank tick",
+           "bit 16 %s after %u ms", (*kick & 0x10000u) ? "still set" : "cleared", ms);
+    Sleep(300);                                /* still inside the flip's wait (~0.8 s after the kick) */
+    checkd(*intr & 0x1u,
+           "only the kick bit is answered meanwhile: a pending interrupt is left for the poll loop",
+           "PCRTC_INTR_0 0x%08X", *intr);
+    t0 = GetTickCount();
+    while (*get != PHYS(RING) + 24 && GetTickCount() - t0 < 3000)
+        Sleep(5);
+    checkd(*get == PHYS(RING) + 24, "the flips complete and GET reaches PUT",
+           "GET 0x%08X", *get);
+
+    /* The kick thread stops with the layout: Shutdown waits for it before it
+     * frees the register file, which the thread reads. Left running it faults
+     * on the freed page a few ms later. */
+    xbox_MemoryLayoutShutdown();
+    Sleep(50);
+    check(1, "the layout shuts down with the kick thread running, and the process survives it");
+}
+
+/* get-wake: Fallout's BlockOnFence (0x000AB9E0), GPU far from the fence's
+ * marker, patches NO_OPERATION 5 after it and sleeps in KeWaitForSingleObject
+ * ONCE (0x000ABB30 loops only on a failed wait), then returns as if the fence
+ * had passed. So the event must mean "NOP 5 executed". With the DMA walk GET is
+ * published command by command; a wake at the end of every pass then only
+ * releases a sleeper whose fence is still ahead (Fallout: 233 of 710 sleeps,
+ * game frames in 4 + 29 ms pairs). The heartbeat (DMA_PUT standing for 2 s)
+ * stays: it recovers a NO_OPERATION 5 patched just behind the walk, and a
+ * title that sleeps submits nothing, so it fires only then. */
+static void get_wake(uint32_t va)
+{
+    volatile uint32_t *put = xbox_Nv2aRegPtr(0x800040u);
+    volatile uint32_t *get = xbox_Nv2aRegPtr(0x800044u);
+    uint32_t *pb = G(RING), st;
+    DWORD t0;
+    int beat = 0;
+
+    if (!put || !get) {
+        check(0, "NV2A registers mapped");
+        return;
+    }
+    *get = PHYS(RING);
+    *put = PHYS(RING);                         /* the walk resyncs to GET */
+    t0 = GetTickCount();                       /* take the ack thread's beat first */
+    while (GetTickCount() - t0 < 5000) {
+        if (ke_wait_on(STACK_MAIN, va, ZERO_VA, NULL) == 0) { beat = 1; break; }
+        Sleep(5);
+    }
+    checkd(beat, "while DMA_PUT stands the ack thread still sets the event every 2 s",
+           "no wake in %u ms", (unsigned)(GetTickCount() - t0));
+    pb[0] = 0x00040100u; pb[1] = 0;            /* NO_OPERATION 0: nothing to wake for */
+    *put = PHYS(RING) + 8;
+    t0 = GetTickCount();
+    while (*get != PHYS(RING) + 8 && GetTickCount() - t0 < 1000)
+        Sleep(1);
+    Sleep(20);
+    st = ke_wait_on(STACK_MAIN, va, ZERO_VA, NULL);
+    checkd(*get == PHYS(RING) + 8 && st == STATUS_TIMEOUT,
+           "a pass with no NO_OPERATION 5 leaves the fence event unset",
+           "GET 0x%08X wait status 0x%08X", *get, st);
+    pb[2] = 0x00040100u; pb[3] = 5;            /* NO_OPERATION 5: BlockOnFence's wake */
+    *put = PHYS(RING) + 16;
+    t0 = GetTickCount();
+    while (*get != PHYS(RING) + 16 && GetTickCount() - t0 < 1000)
+        Sleep(1);
+    Sleep(20);
+    st = ke_wait_on(STACK_MAIN, va, ZERO_VA, NULL);
+    checkd(st == 0, "NO_OPERATION 5 sets it", "wait status 0x%08X", st);
+}
+
 int main(int argc, char **argv)
 {
     const char *mode = argc > 1 ? argv[1] : "exec";
     const char *path = argc > 2 ? argv[2] : "tools/conformance/test.xbe";
-    int exec = !strcmp(mode, "exec");
+    int kickflip = !strcmp(mode, "kick-flip");
+    int getwake = !strcmp(mode, "get-wake");
+    int exec = !strcmp(mode, "exec") || kickflip || getwake;
     size_t xbe_len = 0;
     unsigned char *xbe;
     uint32_t scratch, dev, va;
@@ -216,6 +343,12 @@ int main(int argc, char **argv)
     }
     if (exec)
         set_env("RECOMP_PB_EXEC", "1");
+    if (getwake)
+        set_env("RECOMP_PB_WALK", "dma");
+    if (kickflip) {
+        set_env("RECOMP_PB_WALK", "dma");
+        set_env("RECOMP_FPS_LIMIT", "1");
+    }
     set_env("RECOMP_TITLE_KEVENTS", "");     /* the fence event must qualify on its own */
     xbe = load_file(path, &xbe_len);
     if (!xbe) {
@@ -227,6 +360,18 @@ int main(int argc, char **argv)
         return 2;
     }
     printf("mode: %s\n", mode);
+    if (kickflip) {
+        /* The kick thread answers only while the executor owns the fence: the
+         * title registers its fence event after the layout is up (main.c does), so
+         * the test registers it itself, once the kick has been left unanswered. */
+        scratch = xbox_HeapAlloc(0x1000, 16);
+        dev = scratch + 0x100;
+        *G(scratch) = dev;
+        build_event(dev + 0x40, 1, 0);
+        kick_during_flip(scratch);
+        printf(failures ? "FAIL (%d)\n" : "PASS\n", failures);
+        return failures ? 1 : 0;
+    }
 
     /* The title's kernel calls go through the thunk dispatcher. */
     blk = xbox_HeapAlloc(0x10000, 4096);
@@ -255,6 +400,12 @@ int main(int argc, char **argv)
     else
         check(va == 0, "no executor: no wake event to sleep on");
 
+    if (getwake) {
+        if (va == dev + 0x40)
+            get_wake(va);
+        printf(failures ? "FAIL (%d)\n" : "PASS\n", failures);
+        return failures ? 1 : 0;
+    }
     if (exec && va == dev + 0x40) {
         uint32_t st, esp = 0;
         HANDLE th;
@@ -273,6 +424,38 @@ int main(int argc, char **argv)
             }
             printf("  (ack thread's heartbeat %s after %lu ms)\n", beat ? "seen" : "not seen",
                    (unsigned long)(GetTickCount() - t0));
+        }
+
+        /* 0. The segment scan (no RECOMP_PB_WALK) sets the event whenever a
+         * submitted segment ends, not only at NO_OPERATION 5: a patch can
+         * land behind GET, which it publishes only after the whole segment.
+         * One NO_OPERATION 0 moves PUT; the event is set, though no marker
+         * asked for it. */
+        {
+            volatile uint32_t *put = xbox_Nv2aRegPtr(0x800040u);
+            volatile uint32_t *get = xbox_Nv2aRegPtr(0x800044u);
+            uint32_t *pb = G(RING);
+            DWORD t0;
+
+            if (!put || !get) {
+                check(0, "NV2A registers mapped");
+            } else {
+                *get = PHYS(RING);
+                *put = PHYS(RING);
+                Sleep(100);
+                while (ke_wait_on(STACK_MAIN, va, ZERO_VA, NULL) == 0)
+                    ;                              /* drain the pass's own wake */
+                pb[0] = 0x00040100u; pb[1] = 0;    /* NO_OPERATION 0 */
+                *put = PHYS(RING) + 8;
+                t0 = GetTickCount();
+                while (*get != PHYS(RING) + 8 && GetTickCount() - t0 < 1000)
+                    Sleep(1);
+                Sleep(20);
+                st = ke_wait_on(STACK_MAIN, va, ZERO_VA, NULL);
+                checkd(st == 0,
+                       "segment scan: a pass that moved PUT sets the fence event",
+                       "GET 0x%08X wait status 0x%08X", *get, st);
+            }
         }
 
         /* 1. A host event of its own: unset, a zero-timeout wait times out. */

@@ -12,3 +12,7 @@ set(XBE ${CMAKE_CURRENT_SOURCE_DIR}/../../tools/conformance/test.xbe)
 # One process per mode: RECOMP_PB_EXEC is read once.
 add_test(NAME nv2a_fence_wake_exec COMMAND nv2a_fence_wake_test exec ${XBE})
 add_test(NAME nv2a_fence_wake_no_exec COMMAND nv2a_fence_wake_test no-exec ${XBE})
+# kick-flip: a kickoff is answered while the executor waits for a flip's vblank tick.
+# get-wake: under the DMA walk only NO_OPERATION 5 (and the 2 s heartbeat) sets the fence event.
+add_test(NAME nv2a_fence_wake_kick_flip COMMAND nv2a_fence_wake_test kick-flip ${XBE})
+add_test(NAME nv2a_fence_wake_get_wake COMMAND nv2a_fence_wake_test get-wake ${XBE})

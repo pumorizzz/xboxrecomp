@@ -412,6 +412,7 @@ static size_t xbox_TiledApertureSize(void)
 
 static HANDLE g_nv2a_ack_thread = NULL;
 static volatile LONG g_nv2a_ack_stop = 0;
+static HANDLE g_nv2a_kick_thread = NULL;
 
 /*
  * NV2A busy-bit acknowledgement.
@@ -436,8 +437,10 @@ static volatile LONG g_nv2a_ack_stop = 0;
  * that is not listed still hangs -- run the title and the watchdog sample will
  * name the register.
  */
+#define NV2A_KICK_REG  0x100410u    /* PFB flush kick: D3D sets bit 16, spins until it clears */
+#define NV2A_KICK_BUSY 0x00010000u
 static const struct { uint32_t offset; uint32_t busy_mask; } NV2A_ACK[] = {
-    { 0x100410, 0x00010000u },  /* PFB flush kick, Halo 0x001EF930 */
+    { NV2A_KICK_REG, NV2A_KICK_BUSY },  /* PFB flush kick, Halo 0x001EF930 */
 
     /* Interrupt status registers. These are write-1-to-clear on hardware, so
      * an ISR "clearing" one writes the pending bit back -- against plain RAM
@@ -1285,7 +1288,11 @@ uint32_t xbox_Nv2aFenceWordVa(void)
  * every time DMA_GET is published: the segment scan publishes GET only after
  * a whole segment, so D3D can patch a marker the executor has already passed
  * while GET still says it has not, and that wake-up would otherwise be lost.
- * A spurious wake costs nothing -- D3D re-reads the fence and spins.
+ * Under the DMA walk GET is published before every command, so the event is
+ * set only at NO_OPERATION 5, plus a heartbeat when DMA_PUT has stood for 2 s.
+ * A spurious wake is not free: Fallout's BlockOnFence (0x000AB9E0) returns
+ * after one successful wait without re-reading the fence, so the title's
+ * Swap ran without waiting (game frames in 4 + 29 ms pairs).
  *
  * Opt-in, per project, because the event has to be named: without it the
  * honest fence would freeze the title at its first long frame.
@@ -1329,7 +1336,8 @@ static int fence_exec_owned(void)
 }
 
 /* Set the wake event (see above). Called from the executor at software method
- * 5, and here after DMA_GET is published. */
+ * 5, and from the poll loop: after every segment-scan pass, and under the DMA
+ * walk only as the 2 s heartbeat. */
 static void fence_wake(void)
 {
     extern void xbox_KeSignalTitleEvent(uint32_t guest_va);
@@ -1513,8 +1521,10 @@ static void framebuffer_probe_tick(void)
  * rendered frame; with the bits cleared only here, every XDK D3D kickoff --
  * which sets 0x100410 bit 16 and spins until it clears -- waited that long,
  * and a level load, thousands of kickoffs long, looked frozen. Clearing them
- * from inside the walk answers the kickoff within a few hundred commands,
- * without a thread of its own spinning on a host core. */
+ * from inside the walk answers the kickoff within a few hundred commands.
+ * Under the DMA walk the kick bit also has a thread of its own
+ * (nv2a_kick_thread): the executor's thread also sleeps in flip_pace and
+ * waits in Present, where nothing here runs. */
 void xbox_Nv2aAckBusyBits(void)
 {
     volatile uint32_t *regs = (volatile uint32_t *)g_nv2a_memory;
@@ -1538,6 +1548,45 @@ volatile uint32_t *xbox_Nv2aRegPtr(uint32_t offset)
     if (!g_nv2a_memory || offset + 4 > XBOX_NV2A_SIZE)
         return NULL;
     return (volatile uint32_t *)((char *)g_nv2a_memory + offset);
+}
+
+extern int nv2a_pb_dma_walk(void);  /* nv2a_pb_scan.c */
+
+/* The kickoff handshake, answered on a thread of its own under the DMA walk.
+ *
+ * On hardware the FIFO clears 0x100410 bit 16 at once, also while PGRAPH sits
+ * on a FLIP_STALL waiting for vblank. Here the thread that would answer it
+ * also executes the pushbuffer: it sleeps in flip_pace until the vblank tick,
+ * waits in the back end's Present, and acks only every 256 words of a walk.
+ * XDK D3D's KickOff spins on the bit meanwhile, so the title lost the rest of
+ * every frame and started the next one whenever the kick was let go, not at
+ * the flip (Fallout at 60 fps: game frames in 4 + 29 ms pairs).
+ *
+ * Only the kick bit: the interrupt-status words in NV2A_ACK stay with the poll
+ * loop, so a vblank raised by kernel_vblank_tick is not wiped before its ISR
+ * reads it. A host core spins here (Sleep(0)): ~450 kicks a second each spin
+ * the title until answered, so a 1 ms sleep would cost it more than the core.
+ *
+ * Only while the executor owns the fence (checked every pass, not once at
+ * start: the title registers the fence event after the layout is up). Without
+ * the registered event a kick answered ahead of the executor would let the
+ * title run on with nothing to hold its Swap back, so until then the poll
+ * loop's answer, which waits for the walk, stays the only one. Answered
+ * inside a flip's wait, a kick let the title run ahead of the executor by
+ * up to 31 frames in an experiment where the fence event was still set after
+ * every walk pass; with the event set only at NO_OPERATION 5 (fence_wake) the
+ * title's Swap waits for the fence as D3D intends. */
+static DWORD WINAPI nv2a_kick_thread(LPVOID param)
+{
+    volatile uint32_t *kick =
+        (volatile uint32_t *)((char *)param + NV2A_KICK_REG);
+
+    while (!InterlockedCompareExchange(&g_nv2a_ack_stop, 0, 0)) {
+        if ((*kick & NV2A_KICK_BUSY) && fence_exec_owned())
+            *kick &= ~NV2A_KICK_BUSY;
+        Sleep(0);
+    }
+    return 0;
 }
 
 static DWORD WINAPI nv2a_ack_thread(LPVOID param)
@@ -1680,7 +1729,22 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
                     *get = put;
                     get_written = put;
                 }
-                if (fence_exec_owned())
+                /* The segment scan publishes GET only here, after a whole
+                 * segment, so D3D may have patched NO_OPERATION 5 behind it:
+                 * wake on every pass. The DMA walk publishes GET before every
+                 * command and the executor sets the event at NO_OPERATION 5
+                 * itself, so a wake here would only release a BlockOnFence
+                 * whose fence is still ahead -- which Fallout does not
+                 * re-check (0x000ABB30 returns after one wake): its Swap ran
+                 * a frame early. That guards against a latent race: it was
+                 * harmless while kicks waited for the walk, but a kick
+                 * answered inside a flip's wait (the DTEXP experiment) let
+                 * the title run 31 frames ahead on such wakes. Under the walk
+                 * only the heartbeat stays (DMA_PUT standing 2 s): the
+                 * recovery for a wake lost to a patch that landed just behind
+                 * the walk; a sleeping title submits nothing, so it fires
+                 * only then. */
+                if (fence_exec_owned() && (put == last_put || !nv2a_pb_dma_walk()))
                     fence_wake();
                 last_put = put; last_put_ms = now_ms;
                 /* GET as well as PUT. A title that stops submitting has either
@@ -1746,6 +1810,14 @@ static void xbox_Nv2aAckStart(void)
     if (g_nv2a_ack_thread) {
         fprintf(stderr, "  NV2A busy-bit ack: %zu register(s) acknowledged\n",
                 sizeof(NV2A_ACK) / sizeof(NV2A_ACK[0]));
+    }
+    /* Only under the executor's DMA walk: the segment scan still sets the fence
+     * event after every pass (its GET lags), and that wake together with a
+     * kick answered at once would not hold the title's Swap back. */
+    if (getenv("RECOMP_PB_EXEC") && nv2a_pb_dma_walk()) {
+        g_nv2a_kick_thread = CreateThread(NULL, 0, nv2a_kick_thread, g_nv2a_memory, 0, NULL);
+        if (g_nv2a_kick_thread)
+            fprintf(stderr, "  NV2A kickoff ack: a thread of its own (DMA walk)\n");
     }
 }
 
@@ -3732,11 +3804,16 @@ void xbox_MemoryLayoutShutdown(void)
         VirtualFree(g_kernel_memory, 0, MEM_RELEASE);
         g_kernel_memory = NULL;
     }
+    InterlockedExchange(&g_nv2a_ack_stop, 1);
     if (g_nv2a_ack_thread) {
-        InterlockedExchange(&g_nv2a_ack_stop, 1);
         WaitForSingleObject(g_nv2a_ack_thread, 1000);
         CloseHandle(g_nv2a_ack_thread);
         g_nv2a_ack_thread = NULL;
+    }
+    if (g_nv2a_kick_thread) {
+        WaitForSingleObject(g_nv2a_kick_thread, 1000);
+        CloseHandle(g_nv2a_kick_thread);
+        g_nv2a_kick_thread = NULL;
     }
     if (g_nv2a_memory) {
         VirtualFree(g_nv2a_memory, 0, MEM_RELEASE);

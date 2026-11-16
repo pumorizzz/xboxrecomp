@@ -49,7 +49,9 @@ static int s_exec_enabled = -1;
 static int s_scan_enabled = -1;
 
 /* Clears the NV2A request bits (xbox_memory_layout.c); called every 256
- * words while executing, so kickoffs are answered mid-walk. */
+ * words while executing, so kickoffs are answered mid-walk. Under the walk the
+ * kick bit also has a thread of its own (nv2a_kick_thread); this keeps the
+ * interrupt-status words clear mid-walk. */
 extern void xbox_Nv2aAckBusyBits(void);
 static uint32_t s_ack_tick;
 
