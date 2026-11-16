@@ -1075,8 +1075,9 @@ uint64_t xbox_ReadTimeStampCounter(void)
  * and the XDK's XMV player only starts its clock on an even one: Burnout 3's
  * EA intro waited on its loading screen indefinitely.
  *
- * The count is xbox_VblankCount, the one vblank count, bumped once per tick
- * by the timer thread. Two regimes follow from it:
+ * The count is xbox_VblankCount, the one vblank count, set to the vblank
+ * grid's tick, published by the timer thread (it may step by two). Two
+ * regimes follow from it:
  *  - tick-driven (RECOMP_VBLANK=1, once the first vblank is counted): the pin
  *    is the count's parity and holds still between vblanks, however often
  *    it is read;

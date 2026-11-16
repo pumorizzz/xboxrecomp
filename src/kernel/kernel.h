@@ -1130,10 +1130,14 @@ void xbox_log(int level, const char* subsystem, const char* fmt, ...);
 #define XBOX_LOG_THUNK   "THUNK"
 #define XBOX_LOG_PATH    "PATH"
 
-/* Vblanks the runtime has raised since start (0 while RECOMP_VBLANK is off).
- * Interlaced output shows one field per vblank, so its low bit is the field
- * parity that the field pin (port 0x80C0) reports. */
+/* Vblanks since the vblank grid started (vblank_grid.h; 0 while RECOMP_VBLANK
+ * is off). Interlaced output shows one field per vblank, so its low bit is the
+ * field parity that the field pin (port 0x80C0) reports. */
 uint32_t xbox_VblankCount(void);
+
+/* The vblank grid's current tick (nv2a_pb_exec.c): the one the flip lands on
+ * and the vblank count follows. 0 at the grid's start. */
+uint64_t nv2a_pb_exec_vblank_tick(void);
 
 #ifdef __cplusplus
 }

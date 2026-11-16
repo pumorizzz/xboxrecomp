@@ -38,6 +38,7 @@
 #include "nv2a_vsh_interp.h"
 #include "nv2a_combiner.h"
 #include "nv2a_backend.h"
+#include "vblank_grid.h"
 #if defined(_WIN32)
 #include <windows.h>
 #define NV_TLS __declspec(thread)
@@ -205,9 +206,9 @@ static int surface_write_refused(uint32_t base, uint32_t bytes, const char *what
  * and burns no dispatch, which reads as a hang with no cause.
  *
  * There is no scanout to be in the middle of, so the flip completes on the
- * next tick of flip_pace (RECOMP_FPS_LIMIT, 60 Hz by default); with the limit
- * off it completes at once and a title that paces itself on the flip runs as
- * fast as it can draw. */
+ * vblank grid's tick (flip_pace: RECOMP_FPS_LIMIT, 60 Hz by default, at least
+ * ceil(60/hz) ticks apart); with the limit off it completes at once and a
+ * title that paces itself on the flip runs as fast as it can draw. */
 #define NV097_SET_FLIP_READ               0x0120
 #define NV097_SET_FLIP_WRITE              0x0124
 #define NV097_SET_FLIP_MODULO             0x0128
@@ -3754,25 +3755,49 @@ static void raster_batch(void)
     }
 }
 
-/* RECOMP_FPS_LIMIT=<hz> (default 60, 0 = off): the flip stall waits for the
- * next 1/hz tick, standing in for the vblank a real scanout would wait for.
- * Without it a flip completes at once, and a title that paces itself on the
- * flip -- menus, loading screens -- runs at whatever rate it can draw, which
- * reaches 1000 fps and breaks menu input timing. A late frame does not bank
- * time: the clock restarts from now rather than bursting to catch up. */
+/* The one vblank grid (vblank_grid.h): 60 Hz of the host's performance
+ * counter from the first time anyone asks -- the flip (flip_pace) and the
+ * guest's vblank count (kernel_bridge.c, RECOMP_VBLANK) read the same ticks. */
+static volatile LONGLONG s_vblank_base;
+static int64_t vblank_clock(int64_t *now, int64_t *freq)
+{
+    LARGE_INTEGER q, f;
+    QueryPerformanceFrequency(&f);
+    QueryPerformanceCounter(&q);
+    if (!s_vblank_base)
+        InterlockedCompareExchange64(&s_vblank_base, q.QuadPart, 0);
+    *now = q.QuadPart;
+    *freq = f.QuadPart;
+    return s_vblank_base;
+}
+
+/* The grid tick now: 0 at the grid's start. */
+uint64_t nv2a_pb_exec_vblank_tick(void)
+{
+    int64_t now, freq, base = vblank_clock(&now, &freq);
+    return vblank_grid_tick(now, base, freq);
+}
+
+/* RECOMP_FPS_LIMIT=<hz> (default 60, 0 = off): the flip stall completes on
+ * the vblank grid, ceil(60/hz) ticks after the previous flip; a late frame
+ * waits for the next tick, as on a vsynced console (intervals are whole
+ * 1/60 s: 39 fps shows as 30). Above 60 Hz the limit is 60. Without a limit
+ * a flip completes at once, and a title that paces itself on the flip --
+ * menus, loading screens -- runs at whatever rate it can draw, which reaches
+ * 1000 fps and breaks menu input timing. A late frame does not bank time:
+ * the next flip is the first tick after it, not a burst to catch up. */
 static void flip_pace(void)
 {
 #if defined(_WIN32)
     static int hz = -1;
-    static LARGE_INTEGER freq, next;
+    static uint64_t last;          /* grid tick of the previous flip */
     static HANDLE timer;
-    LARGE_INTEGER now;
-    LONGLONG period;
+    int64_t now, freq, base, target;
+    LARGE_INTEGER q;
 
     if (hz < 0) {
         const char *e = getenv("RECOMP_FPS_LIMIT");
         hz = e ? atoi(e) : 60;
-        QueryPerformanceFrequency(&freq);
         /* 0x2 = CREATE_WAITABLE_TIMER_HIGH_RESOLUTION (Windows 10 1803+);
          * an older system gets a plain timer and the spin below. */
         timer = CreateWaitableTimerExW(NULL, NULL, 0x2, TIMER_ALL_ACCESS);
@@ -3781,26 +3806,21 @@ static void flip_pace(void)
     }
     if (hz <= 0)
         return;
-    period = freq.QuadPart / hz;
-    QueryPerformanceCounter(&now);
-    if (next.QuadPart == 0 || now.QuadPart > next.QuadPart + period) {
-        next.QuadPart = now.QuadPart + period;
-        return;
-    }
+    base = vblank_clock(&now, &freq);
+    target = vblank_grid_flip_at(now, base, freq, hz, &last);
     if (timer) {
-        LONGLONG left = next.QuadPart - now.QuadPart - freq.QuadPart / 1000;
+        int64_t left = target - now - freq / 1000;
         if (left > 0) {
             LARGE_INTEGER due;
-            due.QuadPart = -(left * 10000000 / freq.QuadPart);   /* 100 ns, relative */
+            due.QuadPart = -(left * 10000000 / freq);   /* 100 ns, relative */
             if (SetWaitableTimer(timer, &due, 0, NULL, NULL, FALSE))
                 WaitForSingleObject(timer, INFINITE);
         }
     }
     do {
         YieldProcessor();
-        QueryPerformanceCounter(&now);
-    } while (now.QuadPart < next.QuadPart);
-    next.QuadPart += period;
+        QueryPerformanceCounter(&q);
+    } while (q.QuadPart < target);
 #endif
 }
 
@@ -4666,8 +4686,9 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
             fprintf(stderr, "[FTRACE] FLIP_STALL presenting %08X (color now %08X)%c",
                     s_gpu.drawn_offset, s_gpu.color_offset, 10);
         /* The stall ends when the buffer being read is the one just finished.
-         * There is no scanout here to wait for, so that is the next pacing
-         * tick (flip_pace). */
+         * There is no scanout here to wait for, so that is the next vblank
+         * tick (flip_pace); the swap count and present() below then land on
+         * it too. */
         flip_pace();
         s_gpu.flip_read = s_gpu.flip_write;
         /* And this is a completed swap, which is what a title's own swap

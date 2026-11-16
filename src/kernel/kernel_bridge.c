@@ -2745,8 +2745,10 @@ static int kernel_raise_interrupt(uint32_t vector)
  * bit 24 to say the PCRTC block is the source. Without those the handler looks,
  * finds nothing, and correctly declines.
  *
- * ponytail: a fixed 60 Hz off the timer tick rather than anything tied to the
- * display mode, and no field or interlace handling. A title that measures
+ * ponytail: the vblank grid's 60 Hz (vblank_grid.h), the ticks the flip lands
+ * on, rather than anything tied to the display mode, and no field or interlace
+ * handling; the timer thread publishes the tick on waking, so the count can
+ * step by two and the ISR runs once per wake. A title that measures
  * refresh rate from this will read 60; a title that needs the real one wants
  * the mode AvSetDisplayMode was given, which is recorded a few files away.
  */
@@ -2767,19 +2769,19 @@ uint32_t xbox_VblankCount(void)
 static void kernel_vblank_tick(void)
 {
     static int enabled = -1;
-    static long long next_ms;
-    long long now;
+    static uint64_t seen;                     /* the last grid tick raised */
+    uint64_t k;
 
     if (enabled < 0)
         enabled = getenv("RECOMP_VBLANK") != NULL;
     if (!enabled)
         return;
 
-    now = (long long)GetTickCount64();
-    if (now < next_ms)
+    k = nv2a_pb_exec_vblank_tick();
+    if (k <= seen)
         return;
-    next_ms = now + 16;                       /* ~60 Hz */
-    InterlockedIncrement(&g_vblank_total);
+    seen = k;
+    InterlockedExchange(&g_vblank_total, (LONG)(uint32_t)k);
 
     if (!xbox_GetConnectedInterrupt(NV2A_VECTOR))
         return;
