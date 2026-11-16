@@ -50,13 +50,21 @@ kickoff — the depth function, for one — is not lost.
 
 XDK D3D asks the GPU questions while it submits, and the executor has to
 answer them from inside the walk, because the thread that executes the ring is
-the thread that would otherwise answer.
+the thread that would otherwise answer. (Under the DMA walk the kickoff is the
+exception: a thread of its own answers it, see below.)
 
 - **Kickoff.** Every kickoff sets `0x100410` bit 16 and spins until it clears.
   With the bits cleared only between passes of the poll loop, one pass can be a
   whole rendered frame, so a level load — thousands of kickoffs — looked
   frozen. The walker now clears them every 256 words
-  (`xbox_Nv2aAckBusyBits`).
+  (`xbox_Nv2aAckBusyBits`). That still left the kick waiting whenever the
+  executor's thread was not walking: asleep in the flip stall until the vblank
+  tick, or in the back end's Present. In *Fallout* the title spun in KickOff
+  for the rest of each frame, and its frames came in 4 + 29 ms pairs although
+  the flips were on the grid. Under `RECOMP_PB_WALK=dma` a thread of its own
+  clears the kick bit, as the FIFO does on hardware. It costs a host core
+  spinning on `Sleep(0)`; a 1 ms sleep would make each of the ~450 kicks a
+  second spin the title that long.
 - **Fence mirrors.** A project that registers `xbox_Nv2aMirrorFence` has the
   poll thread copy the title's "submitted" fence into its "consumed" one. The
   walk now follows every CALL and JUMP, so a pass can be long, and a mirror
@@ -260,10 +268,11 @@ let a back end draw somewhere other than guest RAM:
 - `sync_surface(va, bytes)`: at `FLIP_STALL`, just before the presenter reads
   guest RAM, the surface it presents. Without it the executor calls
   `sync(NV2A_BACKEND_SYNC_PRESENT)`.
-- `present(va, pitch, aa_sy)`: at `FLIP_STALL`, show the presented surface
-  without guest RAM. When it returns 1 the executor neither syncs the surface
-  for the presenter nor copies it to the framebuffer window (the flip dumps
-  still get a `NV2A_BACKEND_SYNC_READ` first).
+- `present(va, pitch, aa_sy)`: at `FLIP_STALL`, on the executor's thread right
+  after the flip's vblank tick (or at once with no limit), show the presented
+  surface without guest RAM. When it returns 1 the executor neither syncs the
+  surface for the presenter nor copies it to the framebuffer window (the flip
+  dumps still get a `NV2A_BACKEND_SYNC_READ` first).
 - `report()`: the visibility-test pixel count since the previous call, added
   to what `GET_REPORT` writes; `CLEAR_REPORT_VALUE` discards it.
 - `shadow`: the executor keeps rasterising in software as well, into guest RAM,
@@ -388,7 +397,8 @@ Two more steps took the readback out of the frame altogether:
 
 The fps line counts with `RECOMP_FPS_LIMIT=200` (the cap is 60 by default; a
 completely uncapped run spins the menus at 2,000 flips per second and the
-scripted start press misses them). By the Ruby/bar area in Carbon the back end
+scripted start press misses them). These figures predate the vblank grid; a
+limit above 60 now counts as 60, so the same measurement needs `0`. By the Ruby/bar area in Carbon the back end
 went from 39-41 to 43-45 fps; what remained there was CPU work: the executor
 thread spent about 80% of its time in the vertex-program interpreter. Two
 exact changes took that down: the interpreter decodes a program once (a
@@ -432,7 +442,7 @@ frames Carbon compares at 0.00–0.02%.
 |---|---|
 | `RECOMP_PB_SCAN` | read-only survey of the pushbuffer; ranks what is not implemented |
 | `RECOMP_PB_EXEC` | execute it |
-| `RECOMP_PB_WALK=dma` | walk the pushbuffer like the DMA engine (JUMPs, wraps, GET per command, the `0x0310` latch) instead of scanning each submitted segment; see [The DMA Walk Is Opt-In](#the-dma-walk-is-opt-in) |
+| `RECOMP_PB_WALK=dma` | walk the pushbuffer like the DMA engine (JUMPs, wraps, GET per command, the `0x0310` latch) instead of scanning each submitted segment; see [The DMA Walk Is Opt-In](#the-dma-walk-is-opt-in); when the title registered the fence event (`xbox_Nv2aFenceWakeEvent`), kickoffs are answered by a thread of their own and the fence event is set only by `NO_OPERATION 5` (plus the 2 s heartbeat while `DMA_PUT` stands) |
 | `RECOMP_PB_EXEC_VERBOSE` | per-batch trace |
 | `RECOMP_VSH_THREADS=<n>` | threads that run a batch's vertex programs, the executor included (default half the logical processors, at most 16); `1` runs every vertex on the executor thread |
 | `RECOMP_FFP_TRACE` | composite matrix and sample vertices of the first fixed-function batches |
@@ -445,7 +455,7 @@ frames Carbon compares at 0.00–0.02%.
 | `RECOMP_GPU_RASTER_PRESENT_DUMP=<prefix>` | every `RECOMP_GPU_RASTER_PRESENT_DUMP_EVERY`-th (default 30) presented frame as `<prefix>NNNNNN.bmp`, 640x480 as the window shows it, HUD and menus included |
 | `RECOMP_GPU_RASTER_RTTEX=0` | the D3D11 back end reads every texture through guest RAM, render targets included |
 | `RECOMP_GPU_RASTER_LOSE_AT=<flip>` | act out a lost D3D11 device at that flip: the software rasteriser takes over from the next frame, as after a driver reset |
-| `RECOMP_FPS_LIMIT=<hz>` | the flip stall waits for the next 1/hz tick, standing in for vblank (default 60; `0` off — a title pacing itself on the flip then runs its menus at hundreds of fps) |
+| `RECOMP_FPS_LIMIT=<hz>` | the flip stall completes on a tick of the 60 Hz vblank grid (the host's performance counter from the first flip or vblank), at least ceil(60/hz) ticks after the previous flip; a frame that misses its tick waits for the next one, as on a vsynced console, so frame times are whole 1/60 s (39 fps shows as 30, never 4 + 28 ms pairs). Default 60; a limit above 60 counts as 60; `0` off — the flip completes at once and a title pacing itself on the flip runs its menus at hundreds of fps. With `RECOMP_VBLANK` the guest's vblank count follows the same grid |
 | `RECOMP_FFP_FLIP_NORMALS` | light the side of a fixed-function mesh that faces the viewer, even when the title left two-sided lighting off. Not hardware behaviour: a compatibility option for a game project to turn on, off by default |
 
 ## The DMA Walk Is Opt-In
@@ -490,13 +500,23 @@ executor has yet to read.
 - the `0x0310` marker is latched into `0x400B10` as the title wrote it, in the
   segment scan as well as in the walk, so the latch and the fence agree;
 - the event is set at `NO_OPERATION 5` (`nv2a_pb_set_wake`), where the GPU's
-  interrupt would set it, and again whenever `DMA_GET` is published: the
-  segment scan publishes GET only after a whole segment, so D3D can patch a
-  marker the executor has already passed. A spurious wake is harmless; D3D
-  re-reads the fence and spins.
+  interrupt would set it. The segment scan sets it again whenever `DMA_GET` is
+  published (GET only after a whole segment, so D3D can patch a marker the
+  executor has already passed). The DMA walk publishes GET before every
+  command, so there the event means `NO_OPERATION 5` was executed, plus a
+  heartbeat when `DMA_PUT` has stood for 2 s.
+
+A spurious wake is not harmless: *Fallout*'s `BlockOnFence` returns after one
+wake without re-reading the fence, so its Swap ran a frame early. Under the
+DMA walk, with the kick answered on its own thread, this guards against a
+latent race rather than a measured one. It showed in the experiment that
+answered the kick inside the flip's wait while the event was still set after
+every pass: the title then ran 31 frames ahead of the executor. Setting the
+event only at `NO_OPERATION 5` keeps its Swap behind the fence, as on
+hardware.
 
 The event qualifies for a host shadow even without `RECOMP_TITLE_KEVENTS`.
-`tests/nv2a_fence_wake` waits on it on one thread and sets it from another, and checks it does not qualify without `RECOMP_PB_EXEC`.
+`tests/nv2a_fence_wake` waits on it on one thread and sets it from another, and checks it does not qualify without `RECOMP_PB_EXEC`. `kick-flip` checks a kickoff is answered while the executor waits for a flip's tick, `get-wake` that a walk's pass without `NO_OPERATION 5` leaves the event unset.
 Fallout registers `(0xB5E58, 0x1DBC)` and runs the walk.
 
 ### Lost kicks

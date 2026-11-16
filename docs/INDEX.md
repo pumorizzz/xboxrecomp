@@ -105,3 +105,4 @@ Where to look when a title does something and says nothing about why.
 | runs out of memory as the CRT heap grows | [The Heap Grows Only on 487](technical/kernel-replacement.md#the-heap-grows-only-on-487) |
 | slows to 1 FPS some minutes into a level | [Counters Outlive 32 Bits](technical/kernel-replacement.md#counters-outlive-32-bits) |
 | reports ABI violations in CRT helpers | [Reports RECOMP_ABI_CHECK Always Gives](pipeline/06-debugging.md#reports-recomp_abi_check-always-gives) |
+| has flips on the vblank grid but frame times in pairs (4 + 29 ms) | [Answering the Title While It Runs](technical/pushbuffer-executor.md#answering-the-title-while-it-runs) |
