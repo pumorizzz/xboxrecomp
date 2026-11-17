@@ -30,6 +30,7 @@
 #include "kernel_missing.h"
 #include "xbox_memory_layout.h"
 #include "recomp_icall_feedback.h"
+#include "text_block.h"
 #include <stdio.h>
 /* stdlib.h is load-bearing, not tidiness. Without it C89 implicit declaration
  * makes malloc return `int`, so bridge_spawn_thread truncated its heap pointer
@@ -10207,8 +10208,11 @@ static void kernel_thunk_dispatch_body(void)
         DWORD now = GetTickCount();
         if (last_summary_tick == 0) last_summary_tick = now;
         if (now - last_summary_tick >= 2000 && g_kernel_call_count > 200) {
-            fprintf(stderr, "  [KERNEL] summary: %lld total calls, latest ordinal %u (slot %d) esp=0x%08X\n",
-                    g_kernel_call_count, ordinal, slot, g_esp);
+            char block[512];
+            TextBlock tb;
+            text_block_init(&tb, block, sizeof block, stderr);
+            text_block_printf(&tb, "  [KERNEL] summary: %lld total calls, latest ordinal %u (slot %d) esp=0x%08X\n",
+                              g_kernel_call_count, ordinal, slot, g_esp);
             /* And which ones, ranked. "Latest" names whatever the sample
              * happened to land on; the question behind this line is what a
              * title sitting still is actually asking the kernel for, and
@@ -10227,10 +10231,11 @@ static void kernel_thunk_dispatch_body(void)
                     if (best < 0)
                         break;
                     shown_ord[best] = 1;
-                    fprintf(stderr, "  [KERNEL]   ordinal %3d x%llu\n", best,
-                            (unsigned long long)g_ordinal_calls[best]);
+                    text_block_printf(&tb, "  [KERNEL]   ordinal %3d x%llu\n", best,
+                                      (unsigned long long)g_ordinal_calls[best]);
                 }
             }
+            text_block_flush(&tb);
             fflush(stderr);
             last_summary_tick = now;
         }

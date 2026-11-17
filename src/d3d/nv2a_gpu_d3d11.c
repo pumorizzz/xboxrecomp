@@ -64,6 +64,7 @@
 #include <string.h>
 
 #include "../kernel/nv2a_backend.h"
+#include "../kernel/text_block.h"
 #include "d3d8_swizzle.h"
 #include "nv2a_gpu_d3d11.h"
 #include "../video/video_player.h"   /* the framebuffer window it presents into */
@@ -2241,7 +2242,10 @@ static void gpu_flip(void)
     if (!s_st.last_tick)
         s_st.last_tick = now;
     if (now - s_st.last_tick >= 10000) {
-        fprintf(stderr, "[GPURAST] %.1fs: flips %u, draws %u, writebacks %u (%.1f MB),"
+        char line[768];
+        TextBlock tb;
+        text_block_init(&tb, line, sizeof line, stderr);
+        text_block_printf(&tb, "[GPURAST] %.1fs: flips %u, draws %u, writebacks %u (%.1f MB),"
                         " guest->rt uploads %u (%.1f MB), tex decodes %u, DXT as BC %u,"
                         " rt as texture %u, GPU presents %u, readback stall ms %.1f"
                         " (writebacks for: textures %u, dropped targets %u, syncs %u,"
@@ -2252,6 +2256,7 @@ static void gpu_flip(void)
                 s_st.decodes, s_st.bc_uploads, s_st.rt_tex, s_st.presents, s_st.stall_ms,
                 s_st.wb_why[0], s_st.wb_why[1], s_st.wb_why[2], s_st.wb_why[3],
                 s_st.taken);
+        text_block_flush(&tb);
         memset(&s_st, 0, sizeof s_st);
         s_st.last_tick = now;
     }

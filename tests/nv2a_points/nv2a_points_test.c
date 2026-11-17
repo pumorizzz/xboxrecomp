@@ -53,6 +53,14 @@
  *   - 40000 points in one batch, 240000 vertices, past the 196608 a back end's
  *     buffer holds: all reach the back end, in more than one draw(). Past the
  *     cap the rest used to be dropped.
+ *   - The periodic report reaches stderr in a few writes, not one per
+ *     character. fbos makes stderr unbuffered, and the UCRT then formats an
+ *     fprintf into a file or a pipe a character at a time, a WriteFile each:
+ *     the ~5 KB report stood the executor still for 300-400 ms every ten
+ *     seconds under a Start-Process redirect and 80 ms in a console. Counted
+ *     by hooking WriteFile in the C runtime's import table (crt_writes.c,
+ *     Windows only; the count is skipped when no entry is found); the text is
+ *     read back. text_block.h, which does it, is checked byte for byte.
  *
  * Harness as tests/nv2a_near_clip. */
 #include <math.h>
@@ -62,6 +70,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "nv2a_backend.h"
+#include "text_block.h"
 
 #define W 256
 #define H 256
@@ -530,6 +539,111 @@ int main(void)
     CHECK(s_read_syncs == 0);
     nv2a_pb_exec_report();
     CHECK(s_read_syncs == 1);
+
+    /* The report into an unbuffered stderr that is a
+     * file, as fbos sets it (main.c setvbuf _IONBF) and as the launcher and
+     * every script redirect it: a few writes, not one per character. The UCRT
+     * formats into an unbuffered non-console stream one character at a time
+     * (a WriteFile each), and at ~5 KB a report that was a 300 ms stall of
+     * the executor every ten seconds under a Start-Process redirect. */
+    {
+        extern int crt_writes_hook(void);
+        extern long crt_writes(void);
+        long before, writes;
+        int hooked = crt_writes_hook();
+#ifdef _WIN32
+        _putenv("RECOMP_FB_DUMP=");
+#else
+        unsetenv("RECOMP_FB_DUMP");
+#endif
+        if (freopen("nv2a_points_report.txt", "w", stderr)) {
+            setvbuf(stderr, NULL, _IONBF, 0);
+            before = crt_writes();
+            nv2a_pb_exec_report();
+            writes = crt_writes() - before;
+            printf("report: %ld WriteFile calls (%d import entries hooked)\n", writes, hooked);
+            if (hooked > 0)
+                CHECK(writes <= 16);
+            else
+                printf("report: no WriteFile import entry found -- write count not checked\n");
+
+            /* The text itself, read back: a flush that wrote nothing is
+             * 0 writes too. */
+            fflush(stderr);
+            {
+                static char text[65536];
+                FILE *rf = fopen("nv2a_points_report.txt", "rb");
+                size_t len = rf ? fread(text, 1, sizeof text - 1, rf) : 0;
+                size_t k, lines = 0;
+                const char *p_surf, *p_batch;
+                if (rf)
+                    fclose(rf);
+                text[len] = 0;
+                for (k = 0; k < len; k++)
+                    if (text[k] == '\n')
+                        lines++;
+                printf("report: %zu bytes, %zu lines\n", len, lines);
+                p_surf = strstr(text, "[GPU] surface 0x");
+                p_batch = strstr(text, "[GPU] batches: ");
+                CHECK(p_surf != NULL);
+                CHECK(p_batch != NULL);
+                CHECK(strstr(text, "blend pairs (src/dst):") != NULL);
+                CHECK(p_surf && p_batch && p_surf < p_batch);
+                CHECK(len > 0 && text[len - 1] == '\n');
+                CHECK(lines >= 20);   /* 20 lines, 21 when the fps line shows (clock() moved) */
+            }
+        }
+    }
+
+    /* text_block.h byte for byte against a stream built here, not through it:
+     * 20 short lines through a 64-byte block (a flush every 8), a line longer
+     * than the block (written directly after a flush), a line longer than
+     * TEXT_BLOCK_LINE (cut to 1023 bytes, still ending in a newline), a tail. */
+    {
+        static char expect[2048], got[2048], xs[101], ys[1501];
+        char small[64];
+        size_t elen = 0, glen = 0, k;
+        TextBlock tb;
+        FILE *f = fopen("nv2a_points_block.txt", "wb");
+        CHECK(f != NULL);
+        if (f) {
+            FILE *rf;
+            text_block_init(&tb, small, sizeof small, f);
+            for (k = 0; k < 20; k++)
+                text_block_printf(&tb, "line %02d\n", (int)k);
+            memset(xs, 'x', 100);
+            text_block_printf(&tb, "%s\n", xs);
+            memset(ys, 'y', 1500);
+            text_block_printf(&tb, "%s", ys);
+            text_block_printf(&tb, "tail\n");
+            text_block_flush(&tb);
+            fclose(f);
+
+            for (k = 0; k < 20; k++)
+                elen += (size_t)sprintf(expect + elen, "line %02d\n", (int)k);
+            memset(expect + elen, 'x', 100); elen += 100;
+            expect[elen++] = '\n';
+            memset(expect + elen, 'y', 1022); elen += 1022;
+            expect[elen++] = '\n';
+            memcpy(expect + elen, "tail\n", 5); elen += 5;
+
+            rf = fopen("nv2a_points_block.txt", "rb");
+            if (rf) {
+                glen = fread(got, 1, sizeof got, rf);
+                fclose(rf);
+            }
+            if (glen != elen || memcmp(got, expect, elen) != 0) {
+                size_t d = 0;
+                while (d < glen && d < elen && got[d] == expect[d])
+                    d++;
+                printf("text_block: got %zu bytes, expected %zu; first difference at %zu: got 0x%02x, expected 0x%02x\n",
+                       glen, elen, d, d < glen ? (unsigned char)got[d] : 0u,
+                       d < elen ? (unsigned char)expect[d] : 0u);
+                s_fail = 1;
+            }
+            CHECK(elen == 1289);
+        }
+    }
 
     nv2a_backend_register(NULL);
     printf(s_fail ? "FAIL\n" : "PASS\n");

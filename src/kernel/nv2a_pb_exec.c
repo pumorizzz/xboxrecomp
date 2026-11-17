@@ -39,6 +39,7 @@
 #include "nv2a_combiner.h"
 #include "nv2a_backend.h"
 #include "vblank_grid.h"
+#include "text_block.h"
 #if defined(_WIN32)
 #include <windows.h>
 #define NV_TLS __declspec(thread)
@@ -5055,6 +5056,12 @@ void nv2a_pb_exec_report(void)
         if (!done) { done = 1; find_quad_vertices(); }
     }
     int i, j;
+    /* One write for the whole report: stderr is unbuffered in fbos, and the
+     * UCRT writes a formatted line into a file or a pipe a character at a time
+     * (text_block.h). */
+    char block[8192];
+    TextBlock tb;
+    text_block_init(&tb, block, sizeof block, stderr);
 
     {
         /* Frames per second of guest time, from flips between reports. */
@@ -5062,18 +5069,18 @@ void nv2a_pb_exec_report(void)
         static unsigned long last_ms;
         unsigned long now = (unsigned long)(clock() * 1000.0 / CLOCKS_PER_SEC);
         if (last_ms && now > last_ms)
-            fprintf(stderr, "[GPU] %.2f fps (%u flips)%c",
+            text_block_printf(&tb, "[GPU] %.2f fps (%u flips)%c",
                     (s_gpu.flips - last_flips) * 1000.0 / (now - last_ms),
                     s_gpu.flips, 10);
         last_flips = s_gpu.flips;
         last_ms = now;
     }
-    fprintf(stderr, "[GPU] surface 0x%08X pitch %u clip %ux%u+%u+%u"
+    text_block_printf(&tb, "[GPU] surface 0x%08X pitch %u clip %ux%u+%u+%u"
                     " clears %u | %u unhandled methods (%d distinct)\n",
             s_gpu.color_offset, RS.pitch, RS.clip_w, RS.clip_h,
             RS.clip_x, RS.clip_y, s_gpu.clears,
             s_gpu.unhandled_total, s_unhandled_count);
-    fprintf(stderr, "[GPU] draws %u (%u with coordinates), %u indices;"
+    text_block_printf(&tb, "[GPU] draws %u (%u with coordinates), %u indices;"
                     " x %.1f..%.1f  y %.1f..%.1f\n",
             s_gpu.draws, s_gpu.nonzero_draws, s_gpu.verts,
             s_gpu.min_x, s_gpu.max_x, s_gpu.min_y, s_gpu.max_y);
@@ -5083,6 +5090,9 @@ void nv2a_pb_exec_report(void)
      * and without RECOMP_FB_DUMP nobody reads them -- it was a 10-120 ms
      * hitch every report for nothing. */
     if (!s_flip_dumping && getenv("RECOMP_FB_DUMP")) {
+        /* The dump and a back end's sync print lines of their own: what came
+         * before goes out first. */
+        text_block_flush(&tb);
         if (s_backend && s_backend->sync)
             s_backend->sync(NV2A_BACKEND_SYNC_READ);
         dump_surface_bmp();
@@ -5091,26 +5101,26 @@ void nv2a_pb_exec_report(void)
     /* Drawn and skipped separately: "nothing appeared" and "every batch needed
      * a vertex program we do not run" look identical on screen, and only one
      * of them means the rasteriser is broken. */
-    fprintf(stderr, "[GPU] brightest pixel written 0x%08X\n", s_gpu.pixel_max);
-    fprintf(stderr, "[GPU] %llu pixels written; draw surface 0x%08X"
+    text_block_printf(&tb, "[GPU] brightest pixel written 0x%08X\n", s_gpu.pixel_max);
+    text_block_printf(&tb, "[GPU] %llu pixels written; draw surface 0x%08X"
                     " -> 0x%08X, clear surface 0x%08X -> 0x%08X\n",
             (unsigned long long)s_gpu.pixels, s_gpu.drawn_offset,
             dma_resolve(s_gpu.drawn_offset), s_gpu.color_offset,
             dma_resolve(s_gpu.color_offset));
-    fprintf(stderr, "[GPU] rasterised %u triangles; %u batches skipped as not"
+    text_block_printf(&tb, "[GPU] rasterised %u triangles; %u batches skipped as not"
                     " screen-space, %u triangles fully off-surface\n",
             s_gpu.tris_drawn, s_gpu.batches_untransformed,
             s_gpu.tris_skipped_offscreen);
-    fprintf(stderr, "[GPU] vertex programs: %u batches, %u vertices;"
+    text_block_printf(&tb, "[GPU] vertex programs: %u batches, %u vertices;"
                     " %u triangles dropped behind the eye\n",
             s_gpu.batches_program, s_gpu.verts_program, s_gpu.tris_behind);
-    fprintf(stderr, "[GPU] vertex transform: %u run, %u of them on %d threads;"
+    text_block_printf(&tb, "[GPU] vertex transform: %u run, %u of them on %d threads;"
                     " %u in batches that write constants\n",
             s_gpu.verts_run, s_gpu.verts_threaded, vsh_threads(), s_gpu.verts_cxt);
     if (s_gpu.batches_ffp)
-        fprintf(stderr, "[GPU] fixed-function transform: %u batches\n",
+        text_block_printf(&tb, "[GPU] fixed-function transform: %u batches\n",
                 s_gpu.batches_ffp);
-    fprintf(stderr, "[GPU]   of the rest: %u degenerate/NaN, %u off-surface,"
+    text_block_printf(&tb, "[GPU]   of the rest: %u degenerate/NaN, %u off-surface,"
                     " %u drawn; pixels %llu written, %llu depth-failed;"
                     " x %.0f..%.0f y %.0f..%.0f z %g..%g\n",
             s_gpu.xf_degenerate, s_gpu.xf_offscreen, s_gpu.xf_drawn,
@@ -5119,27 +5129,27 @@ void nv2a_pb_exec_report(void)
             s_gpu.xf_min[0], s_gpu.xf_max[0], s_gpu.xf_min[1], s_gpu.xf_max[1],
             s_gpu.xf_min[2], s_gpu.xf_max[2]);
     {
-        fprintf(stderr, "[GPU]   blend pairs (src/dst):");
+        text_block_printf(&tb, "[GPU]   blend pairs (src/dst):");
         for (j = 0; j < s_gpu.blend_npairs; j++)
-            fprintf(stderr, " %X/%X", s_gpu.blend_pairs[j] >> 16,
+            text_block_printf(&tb, " %X/%X", s_gpu.blend_pairs[j] >> 16,
                     s_gpu.blend_pairs[j] & 0xFFFF);
-        fputc(10, stderr);
-        fprintf(stderr, "[GPU]   program attribute formats (slot:type/size):");
+        text_block_printf(&tb, "\n");
+        text_block_printf(&tb, "[GPU]   program attribute formats (slot:type/size):");
         for (j = 0; j < s_gpu.xf_nfmt; j++)
-            fprintf(stderr, " v%u:%u/%u", s_gpu.xf_fmt[j] >> 8,
+            text_block_printf(&tb, " v%u:%u/%u", s_gpu.xf_fmt[j] >> 8,
                     s_gpu.xf_fmt[j] & 15, (s_gpu.xf_fmt[j] >> 4) & 15);
-        fprintf(stderr, "\n");
+        text_block_printf(&tb, "\n");
     }
 
     /* And of the batches that did rasterise, how many sampled anything. A menu
      * that draws its background from one texture and its text from another
      * shows both as flat colour if either half is missing, so the split is
      * what says which half. */
-    fprintf(stderr, "[GPU] batches: %u textured, %u with no texcoords,"
+    text_block_printf(&tb, "[GPU] batches: %u textured, %u with no texcoords,"
                     " %u with texcoords but no usable stage\n",
             s_gpu.batches_textured, s_gpu.batches_no_uv, s_gpu.batches_no_tex);
     for (i = 0; i < s_tex_use_count; i++)
-        fprintf(stderr, "  [TEXUSE] 0x%08X %ux%u fmt 0x%02X%s: %u batches\n",
+        text_block_printf(&tb, "  [TEXUSE] 0x%08X %ux%u fmt 0x%02X%s: %u batches\n",
                 s_tex_use[i].offset, s_tex_use[i].width, s_tex_use[i].height,
                 s_tex_use[i].color,
                 d3d8_format_dxt_block_bytes(s_tex_use[i].color) ? " dxt"
@@ -5150,7 +5160,7 @@ void nv2a_pb_exec_report(void)
         uint32_t k;
         for (k = 0; k < sizeof s_tex_set / sizeof s_tex_set[0]; k++)
             if (s_tex_set[k])
-                fprintf(stderr, "  [TEX] 0x%04X = 0x%08X\n",
+                text_block_printf(&tb, "  [TEX] 0x%04X = 0x%08X\n",
                         (unsigned)(NV_TEX_FIRST + k * 4), s_tex_reg[k]);
     }
 
@@ -5182,7 +5192,7 @@ void nv2a_pb_exec_report(void)
              * is using. */
             union { uint32_t u; float f; } v;
             v.u = s_unhandled[i].last_param;
-            fprintf(stderr, "  [GPU]   0x%04X x%-8u last=0x%08X (%.4f)\n",
+            text_block_printf(&tb, "  [GPU]   0x%04X x%-8u last=0x%08X (%.4f)\n",
                     s_unhandled[i].method, s_unhandled[i].count,
                     v.u, v.f);
         }
@@ -5190,5 +5200,6 @@ void nv2a_pb_exec_report(void)
     }
     for (i = 0; i < s_unhandled_count; i++)       /* the sort moved them */
         s_unhandled_slot[(s_unhandled[i].method & 0x1FFC) / 4] = (uint16_t)(i + 1);
+    text_block_flush(&tb);
     fflush(stderr);
 }

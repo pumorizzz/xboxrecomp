@@ -107,6 +107,18 @@ level.
 periodic report reads it every time (once a report — tests turn it on there to
 make the report download what a back end drew).
 
+## The Report Is One Write
+
+A title may make stderr unbuffered (*Fallout: Brotherhood of Steel* does, so a
+crash loses nothing), and the UCRT then formats each `fprintf` into a file or
+a pipe a character at a time, one `WriteFile` per byte. The periodic report
+runs on the executor thread every ten seconds, and the game waits on its fence
+meanwhile: its ~5 KB stood the executor still for 300-400 ms under a
+PowerShell `Start-Process` redirect and 80 ms in a console. The report, the
+D3D11 back end's `[GPURAST]` line and the kernel's `[KERNEL] summary` are now
+collected by `text_block.h` and leave in one `fwrite`. Test: `tests/nv2a_points`
+counts the `WriteFile` calls of the C runtime.
+
 ## Fixed-Function Transform
 
 Batches drawn with `SET_TRANSFORM_EXECUTION_MODE` (`0x1E94`) on "fixed" used to

@@ -25,6 +25,7 @@
 #include <stddef.h>   /* ptrdiff_t */
 #include <stdlib.h>
 #include <string.h>
+#include "text_block.h"
 
 extern ptrdiff_t xbox_GetMemoryOffset(void);
 
@@ -159,20 +160,30 @@ void nv2a_pb_scan_report(void)
     int i;
 
     if (s_exec_enabled > 0) {
+        char b[128];
+        TextBlock tb;
         nv2a_pb_exec_report();
-        fprintf(stderr, "[PB] %u pushbuffer calls followed\n", s_tot_calls);
+        text_block_init(&tb, b, sizeof b, stderr);
+        text_block_printf(&tb, "[PB] %u pushbuffer calls followed\n", s_tot_calls);
+        text_block_flush(&tb);
     }
     if (!s_seen_count || !getenv("RECOMP_PB_SCAN"))
         return;
-    fprintf(stderr, "[PB] %u segments, %u words, %u jumps, %u calls,"
-                    " %u unrecognised -- %d distinct (subchannel, method)"
-                    " pairs\n",
-            s_tot_segments, s_tot_words, s_tot_jumps, s_tot_calls,
-            s_tot_unknown, s_seen_count);
-    for (i = 0; i < s_seen_count; i++)
-        fprintf(stderr, "  [PB]   subch %u  method 0x%04X  x%-6u %s\n",
-                s_seen[i].subch, s_seen[i].method, s_seen[i].count,
-                nv097_name(s_seen[i].method));
+    {
+        char block[8192];
+        TextBlock tb;
+        text_block_init(&tb, block, sizeof block, stderr);
+        text_block_printf(&tb, "[PB] %u segments, %u words, %u jumps, %u calls,"
+                               " %u unrecognised -- %d distinct (subchannel, method)"
+                               " pairs\n",
+                          s_tot_segments, s_tot_words, s_tot_jumps, s_tot_calls,
+                          s_tot_unknown, s_seen_count);
+        for (i = 0; i < s_seen_count; i++)
+            text_block_printf(&tb, "  [PB]   subch %u  method 0x%04X  x%-6u %s\n",
+                              s_seen[i].subch, s_seen[i].method, s_seen[i].count,
+                              nv097_name(s_seen[i].method));
+        text_block_flush(&tb);
+    }
     fflush(stderr);
 }
 

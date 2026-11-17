@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.20)
 project(nv2a_points_regression C)
 enable_testing()
-add_executable(nv2a-points-test nv2a_points_test.c
+add_executable(nv2a-points-test nv2a_points_test.c crt_writes.c
     ../../src/kernel/nv2a_pb_exec.c
     ../../src/kernel/nv2a_vsh_interp.c
     ../../src/kernel/nv2a_combiner.c)
