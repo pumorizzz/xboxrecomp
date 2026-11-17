@@ -95,6 +95,7 @@ Where to look when a title does something and says nothing about why.
 |---|---|
 | exits cleanly after two kernel calls | a thread start routine with no dispatch entry: `tools/seed_from_log`, [Functions the Detector Misses](pipeline/02-disassembly.md#functions-the-detector-misses) |
 | logs `[ICALL] Failed to resolve VA` between two functions | [Reached only through a pointer](pipeline/02-disassembly.md#reached-only-through-a-pointer) |
+| writes into a stack frame from the USB interrupt, or logs `[ICALL] … is not code` after a pad connects | [A KEVENT on the Stack Is an Event](technical/kernel-replacement.md#a-kevent-on-the-stack-is-an-event) |
 | splits one function at an interior branch target | [Recovering a Split Function](technical/function-coalescence.md) |
 | logs it for an address *inside* a function | [Back-to-back functions, merged](pipeline/02-disassembly.md#back-to-back-functions-merged), or a [jump table the lifter missed](pipeline/04-lifting.md#tables-the-pattern-match-misses) |
 | starts no CRT thread at all | [A no-return call swallows the next function](pipeline/02-disassembly.md#a-no-return-call-swallows-the-next-function) |
@@ -106,4 +107,4 @@ Where to look when a title does something and says nothing about why.
 | slows to 1 FPS some minutes into a level | [Counters Outlive 32 Bits](technical/kernel-replacement.md#counters-outlive-32-bits) |
 | reports ABI violations in CRT helpers | [Reports RECOMP_ABI_CHECK Always Gives](pipeline/06-debugging.md#reports-recomp_abi_check-always-gives) |
 | has flips on the vblank grid but frame times in pairs (4 + 29 ms) | [Answering the Title While It Runs](technical/pushbuffer-executor.md#answering-the-title-while-it-runs) |
-| stalls a few hundred ms exactly every 10 s, longer with its output redirected | [The Report Is One Write](technical/pushbuffer-executor.md#the-report-is-one-write) |
+| stalls 80 ms (console) to 400 ms (output redirected) exactly every 10 s | [The Report Is One Write](technical/pushbuffer-executor.md#the-report-is-one-write) |

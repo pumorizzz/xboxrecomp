@@ -362,3 +362,27 @@ calls within minutes. The call counter was an `int`; it wrapped negative, and
 `KERNEL_LOG_ON()`, which is `count <= budget`, turned "log the first N calls"
 into "log every call". The frame rate fell to about 1 FPS with every thread
 queued on the stderr lock. The counter is `long long`.
+
+### A KEVENT on the Stack Is an Event
+
+`XInputGetCapabilities` builds its URB and a KEVENT on the caller's stack, sends the request and waits 50 ms for the event. Without `RECOMP_TITLE_KEVENTS` the bridge treated any KEVENT the title had written itself as no event at all: the guest address went to Win32 as a `HANDLE`, the wait failed at once with `0xC0000001`, and the function returned. The URB stayed in the USB controller's schedule, and its completion (the driver's ISR and DPC, `URB+0x14 += bytes`, `URB+4 = 0`) landed 30–180 ms later in whatever frame then occupied that stack address. In Fallout that was the row counter of `BinkCopyToBuffer` on the first movie: at 1000+ fps (`RECOMP_FPS_LIMIT=0`) the counter stepped past zero and the copy ran on through the contiguous window until it hit the end of the mapping; at 60 fps it showed as `[ICALL] target … is not code`, a call through a pointer from a frame the write had spoiled.
+
+A KEVENT whose address is on a guest stack is therefore a real event without the switch. "On a guest stack" is the main stack region (`XBOX_STACK_BASE`, `XBOX_STACK_SIZE`, which contains the worker slices ISR, DPC and timer routines run on) plus every live `xbox_AllocThreadStack` slice. Those slices come from the heap, so only the registry of live slices (`xbox_IsGuestStackVa`) tells one from heap. The setter of such an event is the completion of the request the caller has just sent, which the runtime delivers (an ISR and a DPC). A slot made for an address by `KeInitialize*` and later rebuilt by hand is replaced; the shadow lookup returns only `KeInitialize*` objects, because a stack address is reused by every frame that lands on it.
+
+Why not the whole switch: it also admits events the runtime never sets. Fallout's D3D waits for the vblank on the event at device+0x1DAC with no timeout; with `RECOMP_TITLE_KEVENTS=1` that wait sleeps forever (the runtime delivers vblank only with `RECOMP_VBLANK`), and the game hangs at start. Those events are in the image's `.bss`, outside the stacks, and keep the old path.
+
+The executor's fence wake event (device + 0x1DBC in Fallout) is recognised from any guest thread: `fence_readable` bounds a guest address by the first mapped page (`XBOX_TIB_MAIN`), not by the calling thread's TIB, which for a spawned guest thread lies in the heap above the image's `.data`. Bounded by the TIB, the loading-screen thread at the end of the Carbon load did not see the event, waited on its address as a `HANDLE` and spun on the failure (`tests/nv2a_fence_wake`, 3b; `boot_check`, "flips after Carbon").
+
+Checked by `tests/kernel_events` (stack events in both modes) and, in the game, by the `[KERNEL] event 0x00F7…, on a guest stack` lines.
+
+### The USB Controller Answers Within a Frame
+
+A control transfer is one stage per TD (SETUP, IN, OUT) and the XDK driver waits for the whole request, with a 50 ms timeout in `XInputGetCapabilities`. The emulated OHCI used to give each stage at least two ticks of a loop that Windows stretches to its scheduler tick (about 15.6 ms; `Sleep(4)` and `Sleep(10)` without `timeBeginPeriod`): the controller thread found the work on its next pass, retired the TDs and raised the interrupt; the ISR queued a DPC, which the timer thread ran on its next tick; the DPC wrote the URB, set the event and acknowledged the done queue. Measured with `RECOMP_USB_STATS=1`: 15.5 ms from `ControlListFilled` to the retire, 31 ms to the acknowledgement, up to 62 ms for an enumeration request. Anything that held the interrupt off while a thread sat at DISPATCH_LEVEL added another tick.
+
+The controller now answers as the hardware does, within the frame:
+- **Wakes.** The controller thread waits on an event with the frame tick as the timeout. The driver's writes that give the controller work set it: CLF, BLF, the acknowledgement of WDH (the done queue is free again) and the master interrupt enable.
+- **DPC at once.** `KeInsertQueueDpc` wakes the timer thread to drain the queue, except where the console would not start the DPC yet: from an ISR it waits for the ISR to return (the OHCI model wakes the drain itself, `xbox_KeKickDpcs`), and at DISPATCH_LEVEL for the drop below DISPATCH (`xbox_IrqlDeferDpcKick`).
+- **Retry on IRQL.** An interrupt held back because a thread is at DISPATCH_LEVEL is retried the moment the IRQL drops (`xbox_IrqlWakeOnOpen`), not on the next tick.
+- **Frames stay on the tick.** The frame clock, SOF and the periodic list (the pad's interrupt endpoint) run only when a tick has passed, so the pad is polled once a tick (about 64 times a second, 53 before); the control and bulk lists are walked on every pass.
+
+The result is 0.2–1.3 ms from CLF to the retire and under 2 ms to the acknowledgement, well inside 50 ms. `RECOMP_USB_STATS` prints each control transfer's retire and acknowledgement times and a summary (`ctl n= max= >50ms=`). Checked by `tests/usb_ohci_control`.

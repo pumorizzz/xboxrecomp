@@ -1041,8 +1041,14 @@ static int fence_readable(uint32_t va, uint32_t bytes)
     /* Page zero is unmapped, so the bound is the first mapped page rather than
      * just "not null": the device pointer is zero until the title creates the
      * device, and this thread polls from before that. Rejecting only 0 let
-     * dev + get_ptr_off through as 0x34 and faulted on the very first tick. */
-    if (g_memory_base == NULL || va < XBOX_FS_BASE)
+     * dev + get_ptr_off through as 0x34 and faulted on the very first tick.
+     * The bound is XBOX_TIB_MAIN (the permanently mapped first page), not
+     * XBOX_FS_BASE: that is the calling thread's TIB, and a spawned guest
+     * thread's TIB lies in the heap above the image's .data. Bounded by it,
+     * the fence event (Fallout 0xB7C1C) was "not readable" from such a thread
+     * and its wait went to the raw VA as a handle -- an endless failed wait
+     * (Carbon's loading-screen thread). */
+    if (g_memory_base == NULL || va < XBOX_TIB_MAIN)
         return 0;
     /* The contiguous window is mapped separately and sits far above the main
      * range, so a size check against g_memory_size rejects it. The fence a
@@ -4057,6 +4063,13 @@ uint32_t xbox_HeapAlloc(uint32_t size, uint32_t alignment);
 
 static int g_thread_stacks_used = 0;
 
+/* Base of every live thread slice, 0 for a free entry. Slices come from the
+ * heap, so an address alone cannot say whether it is a stack: this registry
+ * can. Entries are claimed and released with a compare-exchange, readers take
+ * no lock, and a reader that misses a thread that is only just being born
+ * loses nothing. */
+static volatile uint32_t g_thread_stack_lo[XBOX_MAX_THREAD_STACKS];
+
 /* A TIB and TLS block for a newly spawned guest thread.
  *
  * A TIB is per-thread on the console and was per-process here: one address,
@@ -4131,6 +4144,12 @@ uint32_t xbox_AllocThreadStack(void)
     if (!base)
         return 0;
     g_thread_stacks_used++;
+    for (int i = 0; i < XBOX_MAX_THREAD_STACKS; i++) {
+        /* Two threads can be created at once: claim the entry atomically. */
+        if (InterlockedCompareExchange((volatile LONG *)&g_thread_stack_lo[i],
+                                       (LONG)base, 0) == 0)
+            break;
+    }
 
     /* Top of the slice, 16-byte aligned, growing down. */
     return base + XBOX_THREAD_STACK_SIZE - 16;
@@ -4154,9 +4173,29 @@ void xbox_FreeThreadStack(uint32_t stack_top)
 {
     if (!stack_top)
         return;
+    {
+        uint32_t base = stack_top + 16 - XBOX_THREAD_STACK_SIZE;
+        for (int i = 0; i < XBOX_MAX_THREAD_STACKS; i++)
+            InterlockedCompareExchange((volatile LONG *)&g_thread_stack_lo[i],
+                                       0, (LONG)base);
+    }
     xbox_HeapFree(stack_top + 16 - XBOX_THREAD_STACK_SIZE);
     if (g_thread_stacks_used > 0)
         g_thread_stacks_used--;
+}
+
+/* 1 if va lies on a guest stack: the main stack region (worker slices for
+ * ISRs, DPCs and timers included) or a live thread slice. */
+int xbox_IsGuestStackVa(uint32_t va)
+{
+    if (va >= XBOX_STACK_BASE && va < XBOX_STACK_BASE + XBOX_STACK_SIZE)
+        return 1;
+    for (int i = 0; i < XBOX_MAX_THREAD_STACKS; i++) {
+        uint32_t lo = g_thread_stack_lo[i];
+        if (lo && va >= lo && va < lo + XBOX_THREAD_STACK_SIZE)
+            return 1;
+    }
+    return 0;
 }
 
 /* Page allocator over the contiguous window mapped at XBOX_CONTIG_BASE.

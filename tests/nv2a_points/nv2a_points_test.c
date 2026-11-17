@@ -592,6 +592,8 @@ int main(void)
                 CHECK(len > 0 && text[len - 1] == '\n');
                 CHECK(lines >= 20);   /* 20 lines, 21 when the fps line shows (clock() moved) */
             }
+        } else {
+            CHECK(!"freopen stderr");
         }
     }
 

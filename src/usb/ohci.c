@@ -130,9 +130,10 @@ static void wr32(uint32_t va, uint32_t v);
  * the console's four front sockets, which is what a title enumerates over. */
 #define OHCI_PORTS              2
 
-/* Passes this thread will keep an interrupt back while the guest is at
- * DISPATCH_LEVEL or above. One pass is the OHCI_TICK_MS (4 ms) loop tick, so
- * this is two seconds.
+/* Frame ticks this thread will keep an interrupt back while the guest is at
+ * DISPATCH_LEVEL or above. One is the OHCI_TICK_MS (4 ms) loop tick, so this
+ * is two seconds when the wait lasts what it says -- Windows stretches it to
+ * its scheduler tick (about 15.6 ms), which makes it nearer eight.
  *
  * It was 80 ms, on the reasoning that no real critical section lasts longer.
  * True of the hardware and false here: recompiled code under an emulated
@@ -144,8 +145,8 @@ static void wr32(uint32_t va, uint32_t v);
  * it is long enough that a slow critical section is not mistaken for one. */
 #define OHCI_IRQ_HOLDOFF        500
 
-/* Milliseconds per pass of the controller thread, which is also how many USB
- * frames a pass is worth.
+/* Milliseconds per frame tick of the controller thread, which is also how many
+ * USB frames a tick is worth.
  *
  * It was 20. A control transfer needs a pass per stage and enumeration needs
  * several transfers, so twenty milliseconds put the whole sequence in the
@@ -153,7 +154,16 @@ static void wr32(uint32_t va, uint32_t v);
  * same build would enumerate fully on one run and stop half way on the next,
  * with nothing to tell the two apart but how many register reads happened.
  * Four is close enough to a real frame to stop losing that race and still
- * cheap -- this thread does nothing but read a few guest dwords per pass. */
+ * cheap -- this thread does nothing but read a few guest dwords per pass.
+ *
+ * Neither number is what the wait gives. Without timeBeginPeriod a 4 ms wait
+ * lasts until the next scheduler tick, about 15.6 ms on Windows, and the
+ * three stages of a control transfer used to pay it twice each (the pass, then
+ * the DPC), which put XInputGetCapabilities past its 50 ms timeout. Stages no
+ * longer depend on the tick: the thread is woken by the events that give the
+ * controller work (CLF, BLF, the acknowledgement of the done queue, MIE) and
+ * by the guest's IRQL dropping. The tick drives the frame clock, SOF and the
+ * periodic list only. */
 #define OHCI_TICK_MS            4u
 
 typedef struct {
@@ -182,6 +192,45 @@ static unsigned s_ndp = OHCI_PORTS;
 static int s_npads = 1;          /* RECOMP_USB_PADS */
 static int s_enabled;
 static int s_trace;
+
+/* Set whenever the driver gives the controller something to do: ControlListFilled
+ * or BulkListFilled written, the done queue handed back (WDH acknowledged), the
+ * interrupt master enable set. The controller thread waits on it with the frame
+ * tick as the timeout, so a transfer stage does not wait for the tick. Hardware
+ * does not either: it walks the control and bulk lists whenever they are
+ * filled. Auto-reset; SetEvent takes no lock, so it is safe on a guest thread
+ * inside the fault handler. */
+static HANDLE s_kick;
+static void ohci_kick(void)
+{
+    HANDLE k = s_kick;
+    if (k)
+        SetEvent(k);
+}
+
+/* RECOMP_USB_STATS: how long a control transfer takes from the driver's
+ * ControlListFilled to the acknowledgement of the done queue that carries its
+ * status stage. Without the variable none of this costs anything. */
+static int ohci_stats_on(void)
+{
+    static int on = -1;
+    if (on < 0)
+        on = getenv("RECOMP_USB_STATS") != NULL;
+    return on;
+}
+static LARGE_INTEGER s_qpf, s_t_clf, s_t_setup0;
+static int s_ctl_active;                /* 1 = in flight, 2 = awaiting ack */
+static double s_ctl_max_ms;
+static unsigned s_ctl_n, s_ctl_slow;
+
+static double ms_since(LARGE_INTEGER t)
+{
+    LARGE_INTEGER now;
+    if (!s_qpf.QuadPart)
+        QueryPerformanceFrequency(&s_qpf);
+    QueryPerformanceCounter(&now);
+    return (double)(now.QuadPart - t.QuadPart) * 1000.0 / (double)s_qpf.QuadPart;
+}
 
 static uint32_t *reg_of(OhciController *hc, uint32_t off)
 {
@@ -254,12 +303,16 @@ static void ohci_write(void *dev, uint32_t off, uint64_t val, int size)
          * is the first thing a driver does, so it would be the only thing
          * anyone ever saw of this file. */
         *r |= v;
+        if ((v & 0x02u) && ohci_stats_on())
+            QueryPerformanceCounter(&s_t_clf);
         if (*r & CS_HCR) {
             *r &= ~CS_HCR;
             hc->reg[HcControl / 4] &= ~0xC0u;    /* back to UsbReset state  */
             hc->reg[HcInterruptStatus / 4] = 0;
             hc->reg[HcInterruptEnable / 4] = 0;
         }
+        if (v & 0x06u)                  /* CLF or BLF: work for the lists   */
+            ohci_kick();
         return;
 
     case HcInterruptStatus:
@@ -277,6 +330,13 @@ static void ohci_write(void *dev, uint32_t off, uint64_t val, int size)
             if (hcca)
                 wr32(hcca + HCCA_DONE_HEAD, 0);
             hc->reg[HcDoneHead / 4] = 0;
+            if (s_ctl_active == 2) {
+                fprintf(stderr, "  [OHCI%d] control done queue acknowledged "
+                        "%.1f ms after CLF\n", hc->index,
+                        ms_since(s_t_setup0));
+                s_ctl_active = 0;
+            }
+            ohci_kick();                /* the done queue is free again     */
         }
         *r &= ~v;                       /* write 1 to clear                 */
         hc->ack_seq++;
@@ -284,6 +344,8 @@ static void ohci_write(void *dev, uint32_t off, uint64_t val, int size)
 
     case HcInterruptEnable:
         hc->reg[HcInterruptEnable / 4] |= v;
+        if (v & INTR_MIE)
+            ohci_kick();
         return;
 
     case HcInterruptDisable:
@@ -710,7 +772,42 @@ static int ohci_walk_eds(OhciController *hc, uint32_t ed, uint32_t *done_head)
             && guest_ok(head & ED_PTR_MASK, 16) && ++tguard < 64) {
             uint32_t td = head & ED_PTR_MASK;
             uint32_t next = rd32(td + 8) & ED_PTR_MASK;
+            uint32_t td_info = rd32(td);
+            uint32_t td_cbp  = rd32(td + 4);
             uint32_t cc = ohci_do_td(hc, ed0, td);
+
+            if (ohci_stats_on() && ((ed0 >> 7) & 0xFu) == 0
+                && ohci_pad_for(ed0) >= 0) {
+                int pad = ohci_pad_for(ed0);
+                static unsigned nprint;
+                uint32_t dp = (td_info >> 19) & 3u;
+                int status_stage = 0;
+                if (dp == TD_DP_SETUP) {
+                    s_t_setup0 = s_t_clf;
+                    s_ctl_active = 1;
+                } else if (dp == TD_DP_OUT) {
+                    status_stage = (g_setup.bmRequestType & 0x80) != 0;
+                } else if (dp == TD_DP_IN) {
+                    status_stage = (td_cbp == 0);
+                }
+                if (nprint++ < 200)
+                    fprintf(stderr, "  [OHCI%d] ctl %s retired %+.1f ms after "
+                            "its transfer's CLF\n", hc->index,
+                            dp == TD_DP_SETUP ? "SETUP" :
+                            dp == TD_DP_IN ? "IN" : "OUT",
+                            ms_since(s_t_setup0));
+                if (status_stage && s_ctl_active == 1) {
+                    double dt = ms_since(s_t_setup0);
+                    if (dt > s_ctl_max_ms) s_ctl_max_ms = dt;
+                    s_ctl_n++;
+                    if (dt > 50.0) s_ctl_slow++;
+                    if (nprint < 200)
+                        fprintf(stderr, "  [OHCI%d] control %02X %02X: status "
+                                "retired %.1f ms after CLF\n", hc->index,
+                                g_setup.bmRequestType, g_setup.bRequest, dt);
+                    s_ctl_active = 2;
+                }
+            }
 
             /* Report the outcome where the driver reads it, then put the
              * descriptor on the done queue, newest first. */
@@ -767,9 +864,10 @@ static int ohci_run_periodic_list(OhciController *hc, uint32_t *done_head)
         return 0;
     /* Every slot, not the one the frame counter happens to land on.
      *
-     * A tick covers twenty frames, and stepping the counter by twenty means
-     * only slots that are multiples of four are ever selected -- gcd(20,32)
-     * is 4, so twenty-four of the thirty-two are never looked at. An
+     * A tick covers several frames, and stepping the counter by that many
+     * means only slots that are multiples of four are ever selected -- the
+     * step and 32 share a factor of 4, so twenty-four of the thirty-two are
+     * never looked at. An
      * interrupt endpoint that lands in one of those is polled by the driver
      * and serviced by nobody. Sweeping all of them costs a guest read per
      * slot and cannot miss. */
@@ -798,13 +896,11 @@ static int ohci_run_periodic_list(OhciController *hc, uint32_t *done_head)
      * register trace is far too much to leave on for the minutes it takes to
      * reach one. */
     {
-        static int stats = -1;
+        int stats = ohci_stats_on();
         static unsigned long last;
         static unsigned total;
         unsigned long now;
         total += (unsigned)completed;
-        if (stats < 0)
-            stats = getenv("RECOMP_USB_STATS") != NULL;
         now = (unsigned long)GetTickCount();
         if (stats && now - last >= 5000) {
             uint32_t seen[8] = {0};
@@ -812,11 +908,13 @@ static int ohci_run_periodic_list(OhciController *hc, uint32_t *done_head)
             last = now;
             fprintf(stderr, "  [OHCI%d] stats: %u periodic transfers; "
                     "reports %lu setups %lu out0 %lu outN %lu; "
-                    "ctl=%08X ien=%08X ists=%08X irql-depth=%d",
+                    "ctl=%08X ien=%08X ists=%08X irql-depth=%d "
+                    "ctl n=%u max=%.1f ms >50ms=%u",
                     hc->index, total, s_n_report, s_n_ctrl, s_n_out_ep0,
                     s_n_out_other, hc->reg[HcControl / 4],
                     hc->reg[HcInterruptEnable / 4],
-                    hc->reg[HcInterruptStatus / 4], xbox_IrqlRaisedCount());
+                    hc->reg[HcInterruptStatus / 4], xbox_IrqlRaisedCount(),
+                    s_ctl_n, s_ctl_max_ms, s_ctl_slow);
             {
                 uint32_t c = hc->reg[HcControlHeadED / 4] & ED_PTR_MASK;
                 int n;
@@ -908,6 +1006,10 @@ static int ohci_call_isr(OhciController *hc)
     g_esp -= 4; *(uint32_t *)(mem + g_esp) = 0xDEADBEEFu;  /* return address */
 
     { int _irql = xbox_IrqlEnterInterrupt(16); fn(); xbox_IrqlLeaveInterrupt(_irql); }
+    /* The ISR queues its DPC and does not drain it: that waits for the timer
+     * thread's tick unless it is told. A DPC queued from an ISR is not woken
+     * by KeInsertQueueDpc (see there), so wake it here, once the ISR is out. */
+    xbox_KeKickDpcs();
 
     xbox_worker_stack_free(slot);
     return (int)(g_eax & 1u);
@@ -991,6 +1093,111 @@ static void ohci_reset(OhciController *hc, uint32_t base, int index)
     }
 }
 
+/* One pass over the schedule. `frame` says a frame has begun since the last
+ * pass: only then does the frame clock move, SF rise and the periodic list
+ * run -- as on hardware, where the interrupt endpoints are polled once a
+ * frame while the control and bulk lists are walked whenever they are filled.
+ * Returns the descriptors retired. */
+static int ohci_service(OhciController *hc, uint32_t control, int frame)
+{
+    uint32_t pass_done = 0;     /* this pass's done queue, newest first */
+    int retired = 0;
+
+    /* The frame clock.
+     *
+     * INTR_SF was defined and never raised, and HcFmNumber only moved when
+     * something read it. That is enough for a driver that polls, and not
+     * enough for one that waits: USB enumeration is full of delays counted
+     * in frames -- the recovery time after SET_ADDRESS is the first -- and
+     * the Xbox stack enables StartOfFrame precisely to count them. Without
+     * a frame ever starting, enumeration stops one transfer past
+     * SET_ADDRESS with the driver waiting for time to pass.
+     *
+     * A tick's worth of frames each time a frame has begun, because a
+     * frame is 1 ms and OHCI_TICK_MS is how many a tick covers. The count
+     * is what drivers compare; the rate is what they feel, and both are
+     * closer to right this way than a counter that never moves. */
+    if (frame) {
+        uint32_t hcca = hc->reg[HcHCCA / 4];
+
+        hc->reg[HcFmNumber / 4] =
+            (hc->reg[HcFmNumber / 4] + OHCI_TICK_MS) & 0xFFFFu;
+        /* HccaFrameNumber is 16 bits at +0x80 with a pad above it that the
+         * controller zeroes, so a dword write is what hardware does. */
+        if (hcca)
+            wr32(hcca + 0x80, hc->reg[HcFmNumber / 4]);
+        hc->reg[HcInterruptStatus / 4] |= INTR_SF;
+    }
+
+    /* Be the bus master. ControlListEnable in HcControl says the driver
+     * wants the list walked; ControlListFilled says it has put something
+     * on it. Walking on the tick rather than only when CLF is written
+     * costs a read of a guest dword and means a descriptor queued without
+     * rewriting CLF is still moved -- which is legal, and drivers do it. */
+    /* Not while the driver still owes us an acknowledgement.
+     *
+     * HccaDoneHead belongs to the driver from the moment WDH is set
+     * until it clears it. Writing a second done list over the first
+     * loses every descriptor on it -- the driver walks a chain whose
+     * links now point into the new list, and the structures it keeps
+     * alongside go with it. At a twenty-millisecond tick that overlap
+     * was rare enough to look like bad luck; at four it corrupted the
+     * host controller's pending list within a second or two of the
+     * gamepad's reports starting. Leaving the descriptors on their
+     * endpoints for another pass costs a few milliseconds of latency
+     * and is what the controller is specified to do. */
+    if (hc->reg[HcInterruptStatus / 4] & INTR_WDH)
+        return 0;
+
+    /* PeriodicListEnable, bit 2 of HcControl. */
+    if (frame && (control & 0x04u)) {
+        if (!hc->ple_seen) {
+            hc->ple_seen = 1;
+            fprintf(stderr, "  [OHCI%d] periodic list enabled "
+                    "(HcControl=%08X HCCA=%08X)\n",
+                    hc->index, control, hc->reg[HcHCCA / 4]);
+            fflush(stderr);
+        }
+        retired += ohci_run_periodic_list(hc, &pass_done);
+    }
+
+    /* BulkListEnable, bit 5. Nothing on this device uses bulk, but the
+     * list is walked the same way and a driver that puts a transfer
+     * there is owed the same service. */
+    if ((control & 0x20u)
+     && guest_ok(hc->reg[HcBulkHeadED / 4] & ED_PTR_MASK, 16)) {
+        int n = ohci_walk_eds(hc, hc->reg[HcBulkHeadED / 4] & ED_PTR_MASK,
+                              &pass_done);
+        retired += n;
+        if (n)
+            hc->reg[HcCommandStatus / 4] &= ~0x04u;   /* BLF consumed */
+    }
+
+    if ((control & 0x10u)
+     && guest_ok(hc->reg[HcControlHeadED / 4] & ED_PTR_MASK, 16)) {
+        int n = ohci_run_control_list(hc, &pass_done);
+        retired += n;
+        if (n)
+            hc->reg[HcCommandStatus / 4] &= ~0x02u;   /* CLF consumed */
+    }
+
+    /* One done queue per pass, covering all three lists.
+     *
+     * The lists used to publish one after another, so the control list
+     * wrote HccaDoneHead straight over what the periodic list had just
+     * put there. That stayed invisible until a title used both at once:
+     * Burnout 3 sends its pad a rumble report (SET_REPORT, 21 09) on the
+     * control pipe every frame once its menus are up, the input report
+     * completing in the same pass was lost, and the driver -- which
+     * re-arms the interrupt endpoint from that completion -- stopped
+     * polling the pad. A real controller accumulates everything that
+     * retires in a frame and writes the queue back once; so does this. */
+    if (pass_done)
+        ohci_publish_done(hc, pass_done);
+
+    return retired;
+}
+
 /* The controller, running on its own thread.
  *
  * It has to be its own thread for a reason that is easy to get wrong: the
@@ -1025,8 +1232,11 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
     int      held_off_warned = 0, held_off_forced = 0;
     unsigned last_ack = 0;
     unsigned first_port = 0, settle = 0;
+    LARGE_INTEGER qf, last_frame;
 
     (void)unused;
+    QueryPerformanceFrequency(&qf);
+    QueryPerformanceCounter(&last_frame);
     {
         uint32_t tib = xbox_AllocThreadTib();
         if (!tib) {
@@ -1041,16 +1251,27 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
     for (;;) {
         OhciController *hc = &s_hc[s_device_hc];
         uint32_t control, enable, status;
-        uint32_t pass_done = 0;     /* this pass's done queue, newest first */
+        LARGE_INTEGER now;
+        int frame;
 
-        Sleep(OHCI_TICK_MS);
+        /* Woken by the driver giving the controller work, or by the tick. A
+         * frame has begun when a tick has passed since the last one; the
+         * counters below count frames, not wakeups, so a burst of kicks does
+         * not shorten the 30 s and 1 s they stand for. */
+        WaitForSingleObject(s_kick, OHCI_TICK_MS);
+        xbox_IrqlWakeOnOpen(NULL);      /* registered only for one wait */
+        QueryPerformanceCounter(&now);
+        frame = (now.QuadPart - last_frame.QuadPart) * 1000
+                >= (LONGLONG)OHCI_TICK_MS * qf.QuadPart;
+        if (frame)
+            last_frame = now;
         control = hc->reg[HcControl / 4];
         enable  = hc->reg[HcInterruptEnable / 4];
 
         /* Operational is HCFS == 10b in bits 7:6. Interrupting a controller
          * the driver has not started yet is not a test of anything. */
         if ((control & 0xC0u) != 0x80u) {
-            if (++waited > 1500)              /* 30 s and it never started */
+            if (frame && ++waited > 1500)     /* 30 s and it never started */
                 break;
             continue;
         }
@@ -1086,7 +1307,7 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
          * RECOMP_USB_PADS sets how many (1-4). */
         if (plugged && s_plugged_pads < s_npads
             && usb_gamepad_configured(s_plugged_pads - 1)) {
-            if (++settle > 50) {                 /* ~1 s after the last */
+            if (frame && ++settle > 50) {        /* ~1 s after the last */
                 unsigned port = (first_port + (unsigned)s_plugged_pads) % s_ndp;
                 hc->reg[(HcRhPortStatus1 + port * 4) / 4] |= PORT_CCS | PORT_CSC;
                 hc->reg[HcInterruptStatus / 4] |= INTR_RHSC;
@@ -1098,99 +1319,12 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
             }
         }
 
-        /* The frame clock.
-         *
-         * INTR_SF was defined and never raised, and HcFmNumber only moved when
-         * something read it. That is enough for a driver that polls, and not
-         * enough for one that waits: USB enumeration is full of delays counted
-         * in frames -- the recovery time after SET_ADDRESS is the first -- and
-         * the Xbox stack enables StartOfFrame precisely to count them. Without
-         * a frame ever starting, enumeration stops one transfer past
-         * SET_ADDRESS with the driver waiting for time to pass.
-         *
-         * Twenty frames a tick because a frame is 1 ms and this loop sleeps
-         * 20. The count is what drivers compare; the rate is what they feel,
-         * and both are closer to right this way than a counter that never
-         * moves. */
-        {
-            uint32_t hcca = hc->reg[HcHCCA / 4];
-
-            hc->reg[HcFmNumber / 4] =
-                (hc->reg[HcFmNumber / 4] + OHCI_TICK_MS) & 0xFFFFu;
-            /* HccaFrameNumber is 16 bits at +0x80 with a pad above it that the
-             * controller zeroes, so a dword write is what hardware does. */
-            if (hcca)
-                wr32(hcca + 0x80, hc->reg[HcFmNumber / 4]);
-            hc->reg[HcInterruptStatus / 4] |= INTR_SF;
-        }
-
-        /* Be the bus master. ControlListEnable in HcControl says the driver
-         * wants the list walked; ControlListFilled says it has put something
-         * on it. Walking on the tick rather than only when CLF is written
-         * costs a read of a guest dword and means a descriptor queued without
-         * rewriting CLF is still moved -- which is legal, and drivers do it. */
-        /* Not while the driver still owes us an acknowledgement.
-         *
-         * HccaDoneHead belongs to the driver from the moment WDH is set
-         * until it clears it. Writing a second done list over the first
-         * loses every descriptor on it -- the driver walks a chain whose
-         * links now point into the new list, and the structures it keeps
-         * alongside go with it. At a twenty-millisecond tick that overlap
-         * was rare enough to look like bad luck; at four it corrupted the
-         * host controller's pending list within a second or two of the
-         * gamepad's reports starting. Leaving the descriptors on their
-         * endpoints for another pass costs a few milliseconds of latency
-         * and is what the controller is specified to do. */
-        if (hc->reg[HcInterruptStatus / 4] & INTR_WDH)
-            goto deliver;
-
-        /* PeriodicListEnable, bit 2 of HcControl. */
-        if (control & 0x04u) {
-            if (!hc->ple_seen) {
-                hc->ple_seen = 1;
-                fprintf(stderr, "  [OHCI%d] periodic list enabled "
-                        "(HcControl=%08X HCCA=%08X)\n",
-                        hc->index, control, hc->reg[HcHCCA / 4]);
-                fflush(stderr);
-            }
-            ohci_run_periodic_list(hc, &pass_done);
-        }
-
-        /* BulkListEnable, bit 5. Nothing on this device uses bulk, but the
-         * list is walked the same way and a driver that puts a transfer
-         * there is owed the same service. */
-        if ((control & 0x20u)
-         && guest_ok(hc->reg[HcBulkHeadED / 4] & ED_PTR_MASK, 16)) {
-            if (ohci_walk_eds(hc, hc->reg[HcBulkHeadED / 4] & ED_PTR_MASK,
-                              &pass_done))
-                hc->reg[HcCommandStatus / 4] &= ~0x04u;   /* BLF consumed */
-        }
-
-        if ((control & 0x10u)
-         && guest_ok(hc->reg[HcControlHeadED / 4] & ED_PTR_MASK, 16)) {
-            if (ohci_run_control_list(hc, &pass_done))
-                hc->reg[HcCommandStatus / 4] &= ~0x02u;   /* CLF consumed */
-        }
-
-        /* One done queue per pass, covering all three lists.
-         *
-         * The lists used to publish one after another, so the control list
-         * wrote HccaDoneHead straight over what the periodic list had just
-         * put there. That stayed invisible until a title used both at once:
-         * Burnout 3 sends its pad a rumble report (SET_REPORT, 21 09) on the
-         * control pipe every frame once its menus are up, the input report
-         * completing in the same pass was lost, and the driver -- which
-         * re-arms the interrupt endpoint from that completion -- stopped
-         * polling the pad. A real controller accumulates everything that
-         * retires in a frame and writes the queue back once; so does this. */
-        if (pass_done)
-            ohci_publish_done(hc, pass_done);
+        ohci_service(hc, control, frame);
 
         /* Level-triggered, which is what OHCI is: while an enabled source is
          * set, the line is asserted. The handler clears the status bit, so
          * this stops on its own -- and if it ever does not, the cap below says
          * so rather than spinning the ISR forever. */
-    deliver:
         status = hc->reg[HcInterruptStatus / 4] & enable & 0x7Fu;
         if (!status)
             continue;
@@ -1205,16 +1339,30 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
          * asserted anyway. The common case still holds the ISR out of the
          * guest's critical section; the pathological case costs a delay
          * instead of the device. */
-        if (xbox_IrqlBlocksInterrupts() && ++held_off <= OHCI_IRQ_HOLDOFF) {
-            if (!held_off_warned) {
-                held_off_warned = 1;
-                fprintf(stderr, "  [OHCI%d] irq held off by guest IRQL "
-                        "(depth %d, status=0x%02X)\n",
-                        hc->index, xbox_IrqlRaisedCount(), status);
-                fflush(stderr);
+        if (xbox_IrqlBlocksInterrupts()) {
+            if (frame)
+                held_off++;                         /* counted in ticks, as before */
+            if (held_off <= OHCI_IRQ_HOLDOFF) {
+                /* The IRQL dropping wakes this thread: the common case is a
+                 * DPC that queued the next stage while still at DISPATCH, and
+                 * waiting for the tick for it would cost the stage a tick. */
+                xbox_IrqlWakeOnOpen(s_kick);
+                if (xbox_IrqlBlocksInterrupts()) {  /* re-check: no lost wake */
+                    if (!held_off_warned) {
+                        held_off_warned = 1;
+                        fprintf(stderr, "  [OHCI%d] irq held off by guest IRQL "
+                                "(depth %d, status=0x%02X)\n",
+                                hc->index, xbox_IrqlRaisedCount(), status);
+                        fflush(stderr);
+                    }
+                    continue;
+                }
             }
-            continue;
         }
+        /* Registered only while holding off: every raise and lower of the
+         * guest's IRQL (thousands a second) would wake this thread otherwise,
+         * and the ISR below runs at IRQL 16 on this very thread. */
+        xbox_IrqlWakeOnOpen(NULL);
         if (held_off > OHCI_IRQ_HOLDOFF && !held_off_forced) {
             held_off_forced = 1;
             fprintf(stderr, "  [OHCI%d] guest IRQL never dropped (depth %d); "
@@ -1338,6 +1486,7 @@ void xbox_OhciInit(void)
             XBOX_OHCI0_BASE, XBOX_OHCI1_BASE, OHCI_PORTS);
     fflush(stderr);
 
+    s_kick = CreateEventW(NULL, FALSE, FALSE, NULL);
     {
         HANDLE th = CreateThread(NULL, 0, ohci_thread, NULL, 0, NULL);
         if (th)
@@ -1441,3 +1590,35 @@ void xbox_OhciReport(void)
                 s_hc[i].reg[HcRhPortStatus1 / 4]);
     fflush(stderr);
 }
+
+#ifdef OHCI_TEST_HOOKS
+/* For tests/usb_ohci_control: the registers and one service pass, without the
+ * controller thread or the trapped aperture. Same behaviour as the runtime's
+ * own paths; nothing here is reachable without the compile definition. */
+void ohci_test_begin(void)
+{
+    ohci_reset(&s_hc[0], XBOX_OHCI0_BASE, 0);
+    s_enabled = 1;
+    s_device_hc = 0;
+    s_plugged_pads = 1;
+    if (!s_kick)
+        s_kick = CreateEventW(NULL, FALSE, FALSE, NULL);
+    ResetEvent(s_kick);
+}
+void ohci_test_write(uint32_t off, uint32_t v)
+{
+    ohci_write(&s_hc[0], off, v, 4);
+}
+uint32_t ohci_test_reg(uint32_t off)
+{
+    return s_hc[0].reg[off / 4];
+}
+int ohci_test_pass(int frame)
+{
+    return ohci_service(&s_hc[0], s_hc[0].reg[HcControl / 4], frame);
+}
+int ohci_test_kicked(void)
+{
+    return s_kick && WaitForSingleObject(s_kick, 0) == WAIT_OBJECT_0;
+}
+#endif

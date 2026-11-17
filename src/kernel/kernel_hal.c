@@ -168,6 +168,32 @@ void xbox_IrqlDumpHolders(void)
     fflush(stderr);
 }
 
+int xbox_IrqlCurrent(void)
+{
+    return (int)g_current_irql;
+}
+
+/* Set when a device model is holding an interrupt back for the guest's IRQL,
+ * so the drop that lets it through can wake the model's thread at once. In a
+ * new thread the usual case is the next transfer stage already waiting while
+ * the DPC that queued it is still at DISPATCH_LEVEL: without the wake, the
+ * delivery waited for the model's next tick. */
+static void *volatile s_open_wake;
+
+void xbox_IrqlWakeOnOpen(void *ev)
+{
+    s_open_wake = ev;
+}
+
+/* A DPC this thread queued at DISPATCH_LEVEL waits for the thread to leave
+ * DISPATCH, as on the console, where the DPC starts only then. */
+static XBOX_THREAD_LOCAL int s_dpc_kick_deferred;
+
+void xbox_IrqlDeferDpcKick(void)
+{
+    s_dpc_kick_deferred = 1;
+}
+
 static void irql_track(KIRQL old_level, KIRQL new_level, void *ra)
 {
     int was = (old_level >= DISPATCH_LEVEL);
@@ -184,6 +210,15 @@ static void irql_track(KIRQL old_level, KIRQL new_level, void *ra)
         irql_holder_add(ra);
     else
         irql_holder_drop();
+    if (!now && s_dpc_kick_deferred) {
+        s_dpc_kick_deferred = 0;
+        xbox_KeKickDpcs();
+    }
+    if (!now && d == 0) {
+        void *ev = s_open_wake;
+        if (ev)
+            SetEvent((HANDLE)ev);
+    }
 
     /* RECOMP_IRQL_TRACE prints the first few transitions. The pairing is what
      * matters: a raise to 2 followed by a lower from 2 nets out, and a lower

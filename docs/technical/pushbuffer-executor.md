@@ -527,7 +527,7 @@ every pass: the title then ran 31 frames ahead of the executor. Setting the
 event only at `NO_OPERATION 5` keeps its Swap behind the fence, as on
 hardware.
 
-The event qualifies for a host shadow even without `RECOMP_TITLE_KEVENTS`.
+The event qualifies for a host shadow even without `RECOMP_TITLE_KEVENTS`. So does any KEVENT on a guest stack (kernel-replacement.md).
 `tests/nv2a_fence_wake` waits on it on one thread and sets it from another, and checks it does not qualify without `RECOMP_PB_EXEC`. `kick-flip` checks a kickoff is answered while the executor waits for a flip's tick, `get-wake` that a walk's pass without `NO_OPERATION 5` leaves the event unset.
 Fallout registers `(0xB5E58, 0x1DBC)` and runs the walk.
 

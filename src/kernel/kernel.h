@@ -832,6 +832,23 @@ int     xbox_IrqlRaisedCount(void);
 int     xbox_IrqlEnterInterrupt(int level);     /* around host-run ISRs and DPCs */
 void    xbox_IrqlLeaveInterrupt(int saved);
 
+/* The calling thread's own IRQL. */
+int     xbox_IrqlCurrent(void);
+
+/* Have `ev` (a host event HANDLE) set whenever any thread's IRQL drops below
+ * DISPATCH_LEVEL and the raised depth reaches zero. NULL unregisters. For a
+ * device model that held an interrupt back and wants to retry it at once. */
+void    xbox_IrqlWakeOnOpen(void *ev);
+
+/* The calling thread queued a DPC at DISPATCH_LEVEL: wake the drain
+ * (xbox_KeKickDpcs) when this thread's IRQL next drops below DISPATCH. */
+void    xbox_IrqlDeferDpcKick(void);
+
+/* Wake the timer thread to drain the DPC queue now instead of at its next
+ * tick. For a device model that has just returned from the ISR that queued the
+ * DPC; see bridge_KeInsertQueueDpc. */
+void    xbox_KeKickDpcs(void);
+
 /* Total crossings of the DISPATCH boundary, and who is holding it up.
  * A depth that is non-zero while this stops moving is stuck, not busy. */
 int     xbox_IrqlTransitions(void);

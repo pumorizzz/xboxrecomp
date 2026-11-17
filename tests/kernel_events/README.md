@@ -13,7 +13,7 @@ ctest --test-dir build/kernel-events -C Release --output-on-failure
 
 | Test | What it checks |
 |---|---|
-| `kernel_events_default` | No switch set. Pins what every title gets today: the guest address goes to Win32 as a `HANDLE`, so after `KeSetEvent` the wait still fails. |
+| `kernel_events_default` | No switch set. Pins what a title gets for an event off the guest stacks: the guest address goes to Win32 as a `HANDLE`, so after `KeSetEvent` the wait still fails. Events on a guest stack are real in this mode too. |
 | `kernel_events_title_kevents` | `RECOMP_TITLE_KEVENTS=1`. The table below. |
 
 Each check fails on v0.12.0 (every wait returns `0xC0000001`) and passes with
@@ -28,9 +28,18 @@ the switch:
 | A notification event stays set across two waits | Notification events are not consumed. |
 | `KeResetEvent` clears it | Host event and guest header agree. |
 
-Not covered: a wait that really blocks and is released from another thread
-(the bridges use a host event for exactly that, so a zero timeout checks the
-same state), and any title.
+A KEVENT on a guest stack is a real event in both modes (the main stack region,
+its worker slices, and a live `xbox_AllocThreadStack` slice): unset times out,
+`KeSetEvent` ends the wait, a wait on one thread is released from another, and
+a freed thread slice is no stack and keeps no stale shadow. The XDK builds the
+KEVENT of a synchronous request, such as `XInputGetCapabilities`, on the
+caller's stack.
+
+A wait that really blocks and is released from another thread is checked on a
+stack event only (the bridges use a host event for exactly that, so a zero
+timeout checks the same state elsewhere). The shadow table follows the object
+at a reused stack address: a hand-built event then `KeInitializeEvent`, the
+reverse, and `KeSetEventBoostPriority`. Not covered: any title.
 
 The fixture also checks `KeWaitForMultipleObjects` through the dispatcher:
 first access at a nonzero WaitAny index; only the selected synchronization
@@ -38,7 +47,8 @@ event being consumed; WaitAll success and timeout; header writes clearing a
 stale host signal; notification persistence; failed waits preserving guest
 state; and mixed header/explicitly initialized events. Every call checks
 stdcall stack cleanup. Explicit events resolve in both modes; header events
-remain opt-in, and the default multiple-wait rejection preserves their state.
+outside the guest stacks remain opt-in, and the default multiple-wait rejection
+preserves their state.
 
 The new multiple-wait checks fail against upstream main `193e2995` and pass
 with the bridge fix. These zero-timeout tests do not establish correctness for

@@ -2643,6 +2643,41 @@ static void dpc_lock(void)
     EnterCriticalSection(&g_dpc_lock);
 }
 
+/* Wakes the timer thread to drain the DPC queue. A DPC used to wait for the
+ * thread's 10 ms sleep, which Windows rounds up to its 15.6 ms tick: every USB
+ * transfer stage paid it, and XInputGetCapabilities' three stages outran the
+ * driver's 50 ms timeout. */
+static HANDLE g_dpc_wake;
+static INIT_ONCE g_dpc_wake_once = INIT_ONCE_STATIC_INIT;
+
+static BOOL CALLBACK dpc_wake_init(PINIT_ONCE o, PVOID p, PVOID *c)
+{
+    (void)o; (void)p; (void)c;
+    g_dpc_wake = CreateEventW(NULL, FALSE, FALSE, NULL);
+    return TRUE;
+}
+
+static HANDLE dpc_wake(void)
+{
+    InitOnceExecuteOnce(&g_dpc_wake_once, dpc_wake_init, NULL, NULL);
+    return g_dpc_wake;
+}
+
+void xbox_KeKickDpcs(void)
+{
+    HANDLE h = dpc_wake();
+    if (h)
+        SetEvent(h);
+}
+
+#ifdef XBOX_KERNEL_TEST_HOOKS
+int xbox_KeTestDpcWakePending(void)
+{
+    HANDLE h = dpc_wake();
+    return h && WaitForSingleObject(h, 0) == WAIT_OBJECT_0;
+}
+#endif
+
 static void bridge_KeInsertQueueDpc(void)
 {
     uint32_t dpc  = STACK_ARG(0);
@@ -2673,6 +2708,21 @@ static void bridge_KeInsertQueueDpc(void)
     BRIDGE_MEM8(dpc + 2) = 1;
     g_dpc_tail = next;
     LeaveCriticalSection(&g_dpc_lock);
+    /* On the single-processor console a DPC starts only once the IRQL has
+     * dropped below DISPATCH_LEVEL, so waking the timer thread at once would
+     * run it in parallel with the code that queued it:
+     *   - from an ISR (IRQL above DISPATCH) it is woken when the ISR returns,
+     *     which the device model does (xbox_KeKickDpcs);
+     *   - at DISPATCH_LEVEL (a guest section that has raised the IRQL) the
+     *     wake is deferred to the drop below DISPATCH (xbox_IrqlDeferDpcKick);
+     *   - below DISPATCH nothing holds it back. */
+    {
+        int irql = xbox_IrqlCurrent();
+        if (irql < DISPATCH_LEVEL)
+            xbox_KeKickDpcs();
+        else if (irql == DISPATCH_LEVEL)
+            xbox_IrqlDeferDpcKick();
+    }
     g_eax = 1;
 }
 
@@ -3087,7 +3137,7 @@ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
         long long now;
         int i;
 
-        Sleep(10);
+        WaitForSingleObject(dpc_wake(), 10);
         kernel_vblank_tick();  /* the GPU's frame clock */
         kernel_drain_dpcs();   /* deferred work, before due timers */
         now = (long long)GetTickCount64();
@@ -6878,6 +6928,9 @@ static void ke_shadow_insert(uint32_t guest_va, HANDLE host)
             if (g_ke_shadow[i].host_handle && g_ke_shadow[i].host_handle != host)
                 CloseHandle(g_ke_shadow[i].host_handle);
             g_ke_shadow[i].host_handle = host;
+            /* KeInitialize* owns the object again, even if the slot was a
+             * header-owned event from an earlier tenant of this address. */
+            g_ke_shadow[i].in_use = 1;
             LeaveCriticalSection(&g_ke_shadow_cs);
             return;
         }
@@ -6902,7 +6955,13 @@ static void ke_shadow_insert(uint32_t guest_va, HANDLE host)
     CloseHandle(host);
 }
 
-/* Look up the host HANDLE for a guest object VA. Returns NULL if not found. */
+/* Look up the host HANDLE for a guest object VA. Returns NULL if not found.
+ *
+ * Only KeInitialize* objects (in_use == 1). A stack address is reused by every
+ * frame that lands on it, so a VA where a header-owned event once lived (in_use
+ * == 2) and a timer or a freed thread slice lives now must not find the old
+ * handle. Those slots are reached only through ke_guest_event, after it has
+ * checked the header. */
 static HANDLE ke_shadow_lookup(uint32_t guest_va)
 {
     uint32_t i;
@@ -6915,7 +6974,7 @@ static HANDLE ke_shadow_lookup(uint32_t guest_va)
 
     EnterCriticalSection(&g_ke_shadow_cs);
     for (i = 0; i < KE_SHADOW_SIZE; i++) {
-        if (g_ke_shadow[i].in_use && g_ke_shadow[i].guest_va == guest_va) {
+        if (g_ke_shadow[i].in_use == 1 && g_ke_shadow[i].guest_va == guest_va) {
             h = g_ke_shadow[i].host_handle;
             break;
         }
@@ -6967,7 +7026,16 @@ static void ke_shadow_remove(uint32_t guest_va)
  * Opt-in because it changes what every such wait does: a wait that failed at
  * once now blocks until the event is set, and on a title whose setter the
  * runtime does not model yet (a GPU interrupt, say) that turns a spin into a
- * hang. Turn it on for a title that waits on events it built itself. */
+ * hang. Turn it on for a title that waits on events it built itself.
+ *
+ * A KEVENT on a guest stack qualifies without the switch. XInputGetCapabilities
+ * builds its URB and KEVENT on the caller's stack and waits 50 ms for the
+ * request to finish. An instant refusal of that wait left the URB in the
+ * controller's schedule, and its completion later wrote into whatever frame
+ * had replaced it (Fallout: BinkCopyToBuffer, and stray ICALLs). The setter of
+ * such an event is the completion of the request, which the runtime delivers.
+ * Events outside the stacks (D3D's vblank event at device+0x1DAC in Fallout)
+ * stay behind the switch: nothing here sets them. */
 static HANDLE ke_guest_event(uint32_t guest_va, int *type)
 {
     static int enabled = -1;
@@ -6980,7 +7048,9 @@ static HANDLE ke_guest_event(uint32_t guest_va, int *type)
     }
     /* The event D3D's fence wait sleeps on has a setter once the project
      * names it (xbox_Nv2aFenceWakeEvent), so it qualifies on its own. */
-    if (!enabled && (!guest_va || guest_va != xbox_Nv2aFenceWakeEventVa()))
+    if (!enabled && (!guest_va
+                     || (guest_va != xbox_Nv2aFenceWakeEventVa()
+                         && !xbox_IsGuestStackVa(guest_va))))
         return NULL;
     if (guest_va < 0x10000u || (guest_va & 3u))
         return NULL;
@@ -6995,9 +7065,23 @@ static HANDLE ke_guest_event(uint32_t guest_va, int *type)
     EnterCriticalSection(&g_ke_shadow_cs);
     for (i = 0; i < KE_SHADOW_SIZE; i++) {
         if (g_ke_shadow[i].in_use && g_ke_shadow[i].guest_va == guest_va) {
-            h = g_ke_shadow[i].in_use == 2 ? g_ke_shadow[i].host_handle : NULL;
+            if (g_ke_shadow[i].in_use == 1) {
+                /* Size 4 is written only by title code (KeInitializeEvent
+                 * writes 16), so the object at this address has been rebuilt
+                 * by hand since the shadow was made: the shadow is stale. */
+                h = CreateEventA(NULL, *type == 0, BRIDGE_MEM32(guest_va + 4) != 0, NULL);
+                if (h) {
+                    if (g_ke_shadow[i].host_handle)
+                        CloseHandle(g_ke_shadow[i].host_handle);
+                    g_ke_shadow[i].host_handle = h;
+                    g_ke_shadow[i].in_use      = 2;
+                }
+                LeaveCriticalSection(&g_ke_shadow_cs);
+                return h;
+            }
+            h = g_ke_shadow[i].host_handle;
             LeaveCriticalSection(&g_ke_shadow_cs);
-            return h;                              /* a KeInitializeEvent shadow: old path */
+            return h;
         }
     }
     for (i = 0; i < KE_SHADOW_SIZE; i++) {
@@ -7016,7 +7100,8 @@ static HANDLE ke_guest_event(uint32_t guest_va, int *type)
         static int shown;
         if (shown++ < 16)
             fprintf(stderr, "  [KERNEL] event 0x%08X built by the title: host event created "
-                            "(%s)\n", guest_va, *type ? "synchronization" : "notification");
+                            "(%s%s)\n", guest_va, *type ? "synchronization" : "notification",
+                    xbox_IsGuestStackVa(guest_va) ? ", on a guest stack" : "");
     }
     return h;
 }
@@ -8085,16 +8170,9 @@ static void bridge_KeSetEventBoostPriority(void)
 {
     uint32_t guest_va = STACK_ARG(0);
     uint32_t increment = STACK_ARG(1);
-    HANDLE h;
 
     (void)increment;
-
-    h = ke_shadow_lookup(guest_va);
-    if (!h)
-        h = XBOX_TO_NATIVE(guest_va);
-    if (h)
-        SetEvent(h);
-
+    (void)ke_set_event(guest_va);    /* the KeSetEvent path: title-built and stack events too */
     g_eax = 0;
 }
 

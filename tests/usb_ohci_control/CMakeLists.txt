@@ -1,0 +1,16 @@
+cmake_minimum_required(VERSION 3.20)
+project(usb_ohci_control_regression C)
+if(NOT WIN32)
+    message(FATAL_ERROR "usb_ohci_control: Windows only (the controller's wake events)")
+endif()
+set(CMAKE_C_STANDARD 11)
+add_subdirectory(../.. runtime)
+# The service pass and the wake event, without the controller thread.
+target_compile_definitions(xbox_usb PRIVATE OHCI_TEST_HOOKS)
+target_compile_definitions(xbox_kernel PRIVATE XBOX_KERNEL_TEST_HOOKS)
+add_executable(usb-ohci-control-test usb_ohci_control_test.c)
+target_include_directories(usb-ohci-control-test PRIVATE ../../src/usb ../../src/kernel ../../src)
+target_link_libraries(usb-ohci-control-test PRIVATE xboxrecomp)
+enable_testing()
+add_test(NAME usb-ohci-control COMMAND usb-ohci-control-test
+         ${CMAKE_CURRENT_SOURCE_DIR}/../../tools/conformance/test.xbe)

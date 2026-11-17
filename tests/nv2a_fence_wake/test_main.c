@@ -18,6 +18,9 @@
  *            xbox_KeSignalTitleEvent on another (the executor's NOP 5 / DMA_GET
  *            wake), and consumes the signal. Without that D3D's BlockOnFence
  *            loops on a failed wait or sleeps through a long frame for good.
+ *            The same from a spawned guest thread whose TIB (heap) lies above
+ *            the device: the event is found by mapping, not by the calling
+ *            thread's TIB (Fallout's loading-screen thread, end of Carbon).
  *   no-exec  it is not: a wait fails at once rather than sleep on an event
  *            nothing would set.
  *
@@ -136,6 +139,22 @@ static DWORD WINAPI waiter(void *p)
     uint32_t esp = 0;
     s_wst = ke_wait_on(STACK_WAIT, (uint32_t)(uintptr_t)p, LONG_VA, &esp);
     s_wesp = esp;
+    return 0;
+}
+
+/* A spawned guest thread, as bridge_spawn_thread makes one: its TIB comes from
+ * xbox_AllocThreadTib (the heap) and g_fs_base points at it. Fallout's device
+ * -- and so the fence event at device + 0x1DBC -- is in the image's .data,
+ * below every such TIB; its loading-screen thread waits on that event. */
+static volatile uint32_t s_gt_tib, s_gt_va, s_gt_st = 0xDEADBEEFu;
+static DWORD WINAPI guest_thread_waiter(void *p)
+{
+    /* The heap block xbox_AllocThreadTib would hand out (the test XBE has no
+     * TLS, so it returns 0 here): allocated after the device, so above it. */
+    s_gt_tib = xbox_HeapAlloc(0x40, 16);
+    g_fs_base = s_gt_tib;
+    s_gt_va = xbox_Nv2aFenceWakeEventVa();
+    s_gt_st = ke_wait_on(STACK_WAIT, (uint32_t)(uintptr_t)p, ZERO_VA, NULL);
     return 0;
 }
 
@@ -483,6 +502,29 @@ int main(int argc, char **argv)
         checkd(done && s_wst == 0 && G(va)[1] == 0 && s_wesp == STACK_WAIT + 24,
                "xbox_KeSignalTitleEvent from another thread releases it; the wait consumes the signal",
                "done %d status 0x%08X SignalState %u", done, s_wst, G(va)[1]);
+
+        /* 3b. The same event from a spawned guest thread whose TIB lies above
+         * the device. fence_readable bounded by the calling thread's g_fs_base,
+         * so there the event was "not the fence": the wait fell through to the
+         * guest address as a HANDLE and failed at once, and BlockOnFence's
+         * while (KeWaitForSingleObject(...)) spun for good (Fallout, end of the
+         * Carbon load). Zero timeout: unset it times out, set it returns 0;
+         * never STATUS_UNSUCCESSFUL. */
+        th = CreateThread(NULL, 0, guest_thread_waiter, (void *)(uintptr_t)va, 0, NULL);
+        if (th) {
+            WaitForSingleObject(th, 10000);
+            CloseHandle(th);
+        }
+        checkd(th && s_gt_tib > va,
+               "setup: the guest thread's TIB lies above the device",
+               "tib 0x%08X va 0x%08X", s_gt_tib, va);
+        checkd(s_gt_va == va,
+               "a guest thread with its own TIB sees the fence wake event",
+               "xbox_Nv2aFenceWakeEventVa 0x%08X, want 0x%08X (g_fs_base 0x%08X)",
+               s_gt_va, va, s_gt_tib);
+        checkd(s_gt_st == STATUS_TIMEOUT || s_gt_st == 0,
+               "its wait on the fence event is a real wait (times out or returns 0)",
+               "status 0x%08X", s_gt_st);
     } else if (!exec) {
         /* 4. Not a host event: a wait fails at once, never sleeps. Not
          * signalled here: a wait must fail on its own. */

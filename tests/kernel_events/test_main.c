@@ -8,9 +8,10 @@
  *
  * One process per mode, because the switch is read once:
  *
- *   default        No switch set. Pins what every title gets today: the guest
- *                  address goes to Win32 as a HANDLE, so a set is lost and a
- *                  wait fails instead of reporting the event's state.
+ *   default        No switch set. Pins what a title gets for an event off the
+ *                  guest stacks: the guest address goes to Win32 as a HANDLE,
+ *                  so a set is lost and a wait fails instead of reporting the
+ *                  event's state.
  *   title-kevents  RECOMP_TITLE_KEVENTS=1. Each check fails without it:
  *
  *   1. A synchronization event that is not set times out.
@@ -19,6 +20,32 @@
  *   3. SignalState written to 1 by the title counts: XDK code sets and clears
  *      events by writing the header, not only through the kernel.
  *   4. A notification event stays set across two waits; KeResetEvent clears it.
+ *
+ * A KEVENT on a guest stack is a real event in both modes, because
+ * XInputGetCapabilities builds its URB and KEVENT on the caller's stack and
+ * waits for the request to finish. When the wait failed at once the URB stayed
+ * in the USB controller's schedule and its completion later wrote into
+ * whatever frame had replaced it (Fallout: BinkCopyToBuffer's row counter).
+ * Each check below fails without the stack rule:
+ *
+ *   5. The main stack region: unset times out, KeSetEvent ends the wait, a
+ *      notification event rebuilt on the same address stays set until reset.
+ *   6. A worker slice of the main region, where ISR, DPC and timer routines run.
+ *   7. A live thread slice (taken from the heap, so only the registry of live
+ *      slices tells it from heap); once freed it is no stack, and the shadow
+ *      made while it was one must not answer for the address any more.
+ *   8. WaitAny over stack events resolves the index and consumes it.
+ *   9. A wait on one thread is released by KeSetEvent from another -- the
+ *      shape of an ISR or DPC completing a request.
+ *  10. A stack address is reused by whatever frame lands on it, so the shadow
+ *      table follows the object that is there now:
+ *      a. a hand-built event, then KeInitializeEvent at the same address: the
+ *         explicit object owns it again (the old header-owned slot would fail
+ *         every wait with 0xC0000001);
+ *      b. KeInitializeEvent, then a hand-built event at the same address: the
+ *         shadow is stale and a fresh host event replaces it (the old handle
+ *         would still be set);
+ *      c. KeSetEventBoostPriority sets a hand-built event as KeSetEvent does.
  */
 #include "kernel.h"
 #include "xbox_memory_layout.h"
@@ -37,13 +64,14 @@ recomp_func_t recomp_lookup_manual(uint32_t xbox_va) { (void)xbox_va; return NUL
 extern recomp_func_t recomp_lookup_kernel(uint32_t xbox_va);
 extern RECOMP_TLS uint32_t g_eax, g_esp;
 
-enum { S_SET, S_WAIT, S_RESET, S_MULTI, S_INIT, N_SLOTS };
+enum { S_SET, S_WAIT, S_RESET, S_MULTI, S_INIT, S_BOOST, N_SLOTS };
 static const uint32_t ORD[N_SLOTS] = {
     145,   /* KeSetEvent */
     159,   /* KeWaitForSingleObject */
     138,   /* KeResetEvent */
     158,   /* KeWaitForMultipleObjects */
     108,   /* KeInitializeEvent */
+    146,   /* KeSetEventBoostPriority */
 };
 
 #define STATUS_TIMEOUT 0x00000102u
@@ -60,6 +88,8 @@ static uint32_t scratch;                 /* guest VA of a 64 KB block */
 #define FRESH_A (scratch + 0x3500)
 #define FRESH_B (scratch + 0x3600)
 #define EXPLICIT_B (scratch + 0x3700)
+#define LONG_VA  (scratch + 0x3800)      /* a LARGE_INTEGER of -5 s, relative */
+#define STACK2_VA (scratch + 0x1800)     /* the call stack of the waiting thread */
 
 static uint32_t slot_va[N_SLOTS];
 static int failures;
@@ -128,10 +158,31 @@ static uint32_t ke_multi(uint32_t a, uint32_t b, int wait_all)
     return call(S_MULTI, 8, args);
 }
 
+static uint32_t ke_boost(uint32_t va)
+{
+    uint32_t args[2] = { va, 0 };
+    return call(S_BOOST, 2, args);
+}
+
 static void ke_init(uint32_t va)
 {
     uint32_t args[3] = {va, 0, 1}; /* notification, initially signalled */
     call(S_INIT, 3, args);
+}
+
+static volatile uint32_t s_wst = 0xDEADBEEFu;
+static DWORD WINAPI waiter(void *p)
+{
+    uint32_t *sp = G(STACK2_VA);
+    sp[0] = 0xBEEF0001u;
+    sp[1] = (uint32_t)(uintptr_t)p;
+    sp[2] = sp[3] = sp[4] = 0;
+    sp[5] = LONG_VA;
+    g_esp = STACK2_VA;
+    g_eax = 0xDEADBEEFu;
+    recomp_lookup_kernel(slot_va[S_WAIT])();
+    s_wst = g_eax;
+    return 0;
 }
 
 static unsigned char *load_file(const char *path, size_t *len)
@@ -195,6 +246,8 @@ int main(int argc, char **argv)
         }
     }
     G(ZERO_VA)[0] = G(ZERO_VA)[1] = 0;
+    G(LONG_VA)[0] = (uint32_t)-50000000;
+    G(LONG_VA)[1] = 0xFFFFFFFFu;
     printf("mode: %s\n", mode);
 
     ke_init(EXPLICIT_VA);
@@ -216,11 +269,12 @@ int main(int argc, char **argv)
     build_event(NOTIF_VA, 0, 0);
 
     if (!on) {
+        check(!xbox_IsGuestStackVa(SYNC_VA), "default: SYNC_VA is off the guest stacks (heap)", NULL);
         ke_set(SYNC_VA);
         st = ke_wait(SYNC_VA);
         snprintf(d, sizeof d, "status 0x%08X", st);
         check(st != 0 && st != STATUS_TIMEOUT,
-              "default: a title-built event is not a host event (the wait fails)", d);
+              "default: a title-built event off the guest stacks is not a host event (the wait fails)", d);
     } else {
         /* 1. Not set: times out. */
         st = ke_wait(SYNC_VA);
@@ -254,6 +308,145 @@ int main(int argc, char **argv)
         snprintf(d, sizeof d, "status 0x%08X, SignalState %u", st, G(NOTIF_VA)[1]);
         check(st == STATUS_TIMEOUT && G(NOTIF_VA)[1] == 0,
               "KeResetEvent clears it", d);
+    }
+
+    {   /* 5. The main stack region. */
+        const uint32_t STK = XBOX_STACK_BASE + XBOX_STACK_SIZE - 0x400;
+
+        check(xbox_IsGuestStackVa(STK), "STK is on a guest stack", NULL);
+        build_event(STK, 1, 0);
+        st = ke_wait(STK);
+        snprintf(d, sizeof d, "status 0x%08X", st);
+        check(st == STATUS_TIMEOUT, "guest-stack KEVENT: unset times out", d);
+        ke_set(STK);
+        st = ke_wait(STK);
+        snprintf(d, sizeof d, "status 0x%08X, SignalState %u", st, G(STK)[1]);
+        check(st == 0 && G(STK)[1] == 0, "guest-stack KEVENT: KeSetEvent ends the wait", d);
+
+        build_event(STK, 0, 0);
+        ke_set(STK);
+        st = ke_wait(STK);
+        i = ke_wait(STK) == 0;
+        snprintf(d, sizeof d, "status 0x%08X, second %s, SignalState %u", st, i ? "ok" : "failed", G(STK)[1]);
+        check(st == 0 && i && G(STK)[1] == 1,
+              "notification on a reused stack address stays set", d);
+        ke_reset(STK);
+        st = ke_wait(STK);
+        snprintf(d, sizeof d, "status 0x%08X", st);
+        check(st == STATUS_TIMEOUT, "KeResetEvent clears a notification event on a stack", d);
+    }
+
+    {   /* 6. A worker slice: where ISRs, DPCs and timers run. */
+        const uint32_t WK = XBOX_WORKER_STACK_TOP(15) - 0x100;
+
+        build_event(WK, 1, 1);
+        st = ke_wait(WK);
+        snprintf(d, sizeof d, "status 0x%08X", st);
+        check(st == 0, "a KEVENT on a worker stack slice is a real event", d);
+    }
+
+    {   /* 7. A thread slice, alive and then freed. */
+        uint32_t top = xbox_AllocThreadStack();
+        uint32_t TS = top - 0x400;
+
+        check(top != 0, "xbox_AllocThreadStack gives a slice", NULL);
+        check(TS >= XBOX_STACK_BASE + XBOX_STACK_SIZE,
+              "the thread slice is in the heap (the registry is what tells it)", NULL);
+        if (top) {
+            check(xbox_IsGuestStackVa(TS), "a live thread slice is a guest stack", NULL);
+            build_event(TS, 1, 0);
+            st = ke_wait(TS);
+            snprintf(d, sizeof d, "status 0x%08X", st);
+            check(st == STATUS_TIMEOUT, "a KEVENT on a thread slice: unset times out", d);
+            ke_set(TS);
+            st = ke_wait(TS);
+            snprintf(d, sizeof d, "status 0x%08X", st);
+            check(st == 0, "a KEVENT on a thread slice: KeSetEvent ends the wait", d);
+
+            xbox_FreeThreadStack(top);
+            check(!xbox_IsGuestStackVa(TS), "a freed thread slice is no guest stack", NULL);
+            build_event(TS, 1, 1);
+            st = ke_wait(TS);
+            snprintf(d, sizeof d, "status 0x%08X", st);
+            if (on)
+                check(st == 0, "title-kevents: the event on the freed slice is the title's again", d);
+            else
+                check(st != 0 && st != STATUS_TIMEOUT,
+                      "a freed thread slice is no stack: the old path again, no stale shadow", d);
+        }
+    }
+
+    {   /* 8. WaitAny over stack events. */
+        const uint32_t A = XBOX_STACK_BASE + XBOX_STACK_SIZE - 0x440;
+        const uint32_t B = XBOX_STACK_BASE + XBOX_STACK_SIZE - 0x480;
+
+        build_event(A, 1, 0);
+        build_event(B, 1, 1);
+        st = ke_multi(A, B, 0);
+        snprintf(d, sizeof d, "status 0x%08X, B SignalState %u", st, G(B)[1]);
+        check(st == 1 && G(B)[1] == 0, "WaitAny over stack events picks the set one and consumes it", d);
+    }
+
+    {   /* 9. A wait on one thread, KeSetEvent from another. */
+        const uint32_t STK2 = XBOX_STACK_BASE + XBOX_STACK_SIZE - 0x800;
+        HANDLE th;
+        int done;
+
+        build_event(STK2, 1, 0);
+        s_wst = 0xDEADBEEFu;
+        th = CreateThread(NULL, 0, waiter, (void *)(uintptr_t)STK2, 0, NULL);
+        check(th != NULL && WaitForSingleObject(th, 200) == WAIT_TIMEOUT,
+              "a wait on a stack event blocks until it is set", NULL);
+        ke_set(STK2);
+        done = th && WaitForSingleObject(th, 2000) == WAIT_OBJECT_0;
+        if (th && !done)
+            WaitForSingleObject(th, 10000);   /* never leave the thread on a guest stack */
+        if (th) CloseHandle(th);
+        snprintf(d, sizeof d, "done %d status 0x%08X", done, s_wst);
+        check(done && s_wst == 0, "KeSetEvent from another thread releases the wait", d);
+    }
+
+    {   /* 10. The shadow table follows the object at a reused stack address. */
+        const uint32_t RA = XBOX_STACK_BASE + XBOX_STACK_SIZE - 0xC00;
+        const uint32_t RB = XBOX_STACK_BASE + XBOX_STACK_SIZE - 0xC40;
+        const uint32_t RC = XBOX_STACK_BASE + XBOX_STACK_SIZE - 0xC80;
+
+        /* a. hand-built, then KeInitializeEvent. */
+        build_event(RA, 1, 0);
+        check(ke_wait(RA) == STATUS_TIMEOUT, "10a: the hand-built event is a host event", NULL);
+        ke_init(RA);                                  /* notification, signalled */
+        st = ke_wait(RA);
+        snprintf(d, sizeof d, "status 0x%08X", st);
+        check(st == 0, "10a: KeInitializeEvent on a reused stack address owns it again", d);
+        ke_reset(RA);
+        st = ke_wait(RA);
+        snprintf(d, sizeof d, "status 0x%08X", st);
+        check(st == STATUS_TIMEOUT, "10a: KeResetEvent reaches the explicit event", d);
+        ke_set(RA);
+        st = ke_wait(RA);
+        snprintf(d, sizeof d, "status 0x%08X", st);
+        check(st == 0, "10a: KeSetEvent reaches the explicit event", d);
+
+        /* b. KeInitializeEvent, then hand-built. */
+        ke_init(RB);                                  /* host event is set */
+        build_event(RB, 1, 0);
+        st = ke_wait(RB);
+        snprintf(d, sizeof d, "status 0x%08X", st);
+        check(st == STATUS_TIMEOUT, "10b: a hand-built event replaces the stale KeInitializeEvent shadow", d);
+        ke_set(RB);
+        st = ke_wait(RB);
+        snprintf(d, sizeof d, "status 0x%08X", st);
+        check(st == 0, "10b: KeSetEvent ends the wait on the replacement", d);
+
+        /* c. KeSetEventBoostPriority. */
+        build_event(RC, 1, 0);
+        check(ke_wait(RC) == STATUS_TIMEOUT, "10c: the hand-built event is unset", NULL);
+        ke_boost(RC);
+        snprintf(d, sizeof d, "SignalState %u", G(RC)[1]);
+        check(G(RC)[1] == 1, "10c: KeSetEventBoostPriority sets SignalState", d);
+        st = ke_wait(RC);
+        snprintf(d, sizeof d, "status 0x%08X", st);
+        check(st == 0, "10c: and ends the wait", d);
     }
 
     if (on) {

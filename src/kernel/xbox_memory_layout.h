@@ -587,6 +587,12 @@ uint32_t xbox_AllocThreadTib(void);
  */
 void xbox_FreeThreadStack(uint32_t stack_top);
 
+/* 1 if va lies on a guest stack: the main stack region (the worker slices for
+ * ISRs, DPCs and timers are inside it) or a live xbox_AllocThreadStack slice.
+ * The XDK builds the KEVENT of a synchronous request on the caller's stack, so
+ * the kernel bridge needs to tell such an address from a heap or image one. */
+int xbox_IsGuestStackVa(uint32_t va);
+
 /* Worker stack slices for host-tick-driven titles (see XBOX_WORKER_STACK_* and
  * docs/technical/burnout3-reunification.md). Additive; unused by default-model
  * titles. */
