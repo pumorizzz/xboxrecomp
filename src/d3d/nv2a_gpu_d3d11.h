@@ -5,7 +5,7 @@
  * the executor still decodes the pushbuffer, runs vertex programs and clips
  * on the CPU, and hands this back end triangles in surface pixels; this
  * rasterises them on the GPU -- depth and stencil, blending, the register
- * combiners in one ubershader -- and writes the colour surfaces back into
+ * combiners in a pixel shader -- and writes the colour surfaces back into
  * guest RAM when they are read there (the flip's present, the frame dumps,
  * a texture decoded from guest RAM); a texture that is a live render
  * target is sampled from the target on the GPU.
@@ -27,6 +27,11 @@
  *   guest RAM instead of a swap chain on it;
  *   RECOMP_GPU_RASTER_PRESENT_DUMP=<prefix> -- every
  *   RECOMP_GPU_RASTER_PRESENT_DUMP_EVERY-th (default 30) shown frame as BMP.
+ * RECOMP_GPU_PROF=<secs>[,stats][,flatps] -- a timestamp profile of the GPU
+ *   work per frame, by pass and target (nv2a_gpu_prof.c).
+ * RECOMP_GPU_RASTER_PSCHECK=<ref.hlsl>[,<every>] -- every <every>-th
+ *   (default 30) frame each draw's pixel shader against ps_main of a
+ *   reference shader, float and 8-bit differences counted.
  * A lost device (driver reset) hands the frame back to the software
  * rasteriser at the next flip; RECOMP_GPU_RASTER_LOSE_AT=<flip> acts it out.
  * Needs RECOMP_PB_EXEC=1 to have any effect.

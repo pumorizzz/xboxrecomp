@@ -493,7 +493,11 @@ ones under Proton as ctest's emulator; its header has the commands.
 
 The runtime libraries (C) use:
 - MSVC (Visual Studio 2022) or MinGW-w64 on Windows; Clang or GCC on Linux/macOS
-- Windows SDK (D3D11, DXGI, XInput, XAudio2, waveOut, Media Foundation)
+- Windows SDK (D3D11, DXGI, XInput, XAudio2, waveOut, Media Foundation); the
+  D3D11 back end's shaders are compiled during the build by a host tool on
+  D3DCompile (`src/d3d/nv2a_gpu_shaders.cmake`); a MinGW cross build from
+  Linux needs `CMAKE_CROSSCOMPILING_EMULATOR` (e.g. `tests/proton_run.sh`) to
+  run it, and stops at configure without one
 - Linux/macOS: SDL2, libepoxy, pkg-config
 - CMake 3.20+
 - No other external dependencies — all hardware emulation code is self-contained

@@ -12,8 +12,12 @@ if(WIN32)
         d3d8_combiners.c
         d3d8_vsh.c
         nv2a_gpu_d3d11.c        # RECOMP_GPU_RASTER: NV2A rasterisation on D3D11
+        nv2a_gpu_prof.c         # RECOMP_GPU_PROF: timestamp profile of the D3D11 back end
     )
     target_link_libraries(xbox_d3d8 PUBLIC platform d3d11 dxgi dxguid d3dcompiler)
+    # nv2a_gpu_d3d11.c's shaders, compiled at build time (nv2a_gpu_shaders.h).
+    include(${CMAKE_CURRENT_LIST_DIR}/nv2a_gpu_shaders.cmake)
+    nv2a_gpu_shaders(xbox_d3d8)
     # nv2a_gpu_d3d11.c presents into the framebuffer window (src/video/fb_present.c).
     # xbox_video links xbox_d3d8 too; CMake allows the cycle between static libraries.
     target_link_libraries(xbox_d3d8 PUBLIC xbox_video)

@@ -56,6 +56,10 @@
  * surface pixel is 36 samples (3x3 with 4x MSAA, or 2x with 3x3 SSAA), where
  * dividing per draw gave 30.
  *
+ * The GPU profile (RECOMP_GPU_PROF, nv2a_gpu_prof.c) stays off when the
+ * variable is unset: not one query made all run long (tests/nv2a_gpu_backend's
+ * nv2a-gpu-prof* test the profile itself).
+ *
  * Harness as tests/nv2a_points; Windows only. */
 #include <math.h>
 #include <stddef.h>
@@ -66,6 +70,7 @@
 #include "nv2a_backend.h"
 #include "d3d/nv2a_gpu_d3d11.h"
 #include "d3d/d3d8_swizzle.h"
+#include "d3d/nv2a_gpu_prof.h"
 
 #define W 64
 #define H 64
@@ -514,6 +519,7 @@ int main(void)
     clear_surface_at(SURF(18));
     CHECK(surface_is(SURF(18), CLEAR_ARGB)); /* the software path drew it */
 
+    CHECK(nv2a_gpu_test_prof_queries() == 0);   /* RECOMP_GPU_PROF unset: off */
     nv2a_backend_register(NULL);
     printf(s_fail ? "FAIL\n" : "PASS\n");
     return s_fail;

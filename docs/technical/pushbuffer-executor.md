@@ -318,8 +318,14 @@ in `src/d3d/nv2a_gpu_d3d11.c`, written for *Fallout: Brotherhood of Steel*
   projected screen positions and draw with the rasteriser's culling off.
 
 The toolkit's own back end is `src/d3d/nv2a_gpu_d3d11.c` (`RECOMP_GPU_RASTER`):
-it rasterises on the GPU, runs the combiners in one ubershader and keeps depth
-and stencil on the GPU. A game project registers it by calling
+it rasterises on the GPU, runs the combiners in a pixel shader and keeps depth
+and stencil on the GPU. Its pixel shaders come from one source
+(`src/d3d/nv2a_gpu_shaders.hlsl`), one per path, picked on the CPU per draw:
+`ps_screen` for screen-space batches, `ps_ffp` for the fixed-function
+stand-in, and `ps_rc` for the register combiners in three variants by what the
+stages sample (`RC_TEX`: anything; no render target read linearly; only such
+targets). They are compiled when the toolkit is built (see "Pixel shader
+cost" below). A game project registers it by calling
 `nv2a_gpu_d3d11_install()` before the title starts.
 
 Its colour surfaces go back to guest RAM only when something reads them there:
@@ -370,7 +376,7 @@ Two more steps took the readback out of the frame altogether:
   1280 x `s_gh`, where `s_gh` starts at 512 and grows -- everything written
   back and made again -- when a surface reaches lower. Occlusion counts are
   divided back to pixels. Scale 1 without MSAA is the old path exactly.
-  Cost is GPU time per pixel (the combiner ubershader): Fallout's menu,
+  Cost is GPU time per pixel (the combiner shader; see "Pixel shader cost"): Fallout's menu,
   uncapped on an RTX 3080 Ti, 1x ~1,800 fps, 3x3 + 4x MSAA ~122, 4x3 + 4x ~85.
   `RECOMP_GPU_RASTER_SSAA=<n>` (1-4) draws the targets at scale x n (at most 8
   a side, otherwise n is lowered with a log line); the presenter first averages
@@ -379,6 +385,87 @@ Two more steps took the readback out of the frame altogether:
   averages the whole block, and MSAA is resolved first.
   `tests/nv2a_gpu_backend` runs a second time at 3x3 + 4x MSAA and a third at 2x
   with 3x3 SSAA; each also reads a linear target and a swizzled one as swizzled textures.
+- **GPU profile.** `RECOMP_GPU_PROF=<secs>[,stats][,flatps]` (`nv2a_gpu_prof.c`,
+  off by default: then each hook is one test of a flag and no query is made)
+  prints every `<secs>` where the GPU's time per frame goes. The back end marks
+  each piece of GPU work with its kind (`clear.color clear.zs z.init draw.screen
+  draw.ffp draw.rc resolve upload writeback tex.upload ssaa present swap`) and
+  target; a timestamp is written only where (kind, target) changes, so a
+  segment is a run of one key and the segments add up to the frame's span. A
+  frame is bracketed in a `TIMESTAMP_DISJOINT` query and read back from a ring
+  of 8 with `DONOTFLUSH` a few flips later -- never waited for; with all 8 out
+  a frame is dropped, a disjoint one thrown away; a frame whose `GetData`
+  fails (a query never ended) is thrown away too but counted apart, as `read
+  errors`, so it cannot pass for the driver's disjoint. The profile submits each
+  frame's closing queries itself (a `Flush` at the flip: they come after
+  `Present`, which submitted only what came before): left in the command buffer until the next frame's work, the
+  end timestamp ran late, and at a frame limit the GPU's idle time went into
+  the last segment (span = the flip period). The report (one block, one
+  `fwrite`) gives per kind ms/frame, % of the span, segments, draws, triangles,
+  clears, resolves and MB; per target (12 heaviest) ms by kind; the share of
+  triangles drawn with zfar / zclip / alpha test / clip planes / blend / depth
+  write / cull_enable; host flip period, `Present()`, readback stalls and
+  visibility-report waits. Pixels (`est Mpx`) are each draw's bounding box
+  inside the scissor at the internal scale, not what was shaded. Segment
+  boundaries are as exact as the GPU orders timestamps against neighbouring
+  work. `stats` adds a pipeline-statistics query per segment (pixel shader
+  invocations, ns per 1000 of them) and may serialise the GPU: times without it
+  are the honest ones. `flatps` swaps a flat pixel shader in for transformed
+  draws, to see what the ubershader costs; the picture is wrong then.
+  `tests/nv2a_gpu_backend`: `nv2a-gpu-prof` (stats), `-ts`, `-scaled`, and
+  `-lost` (the device lost at the second flip with the profile on).
+- **Pixel shader cost.** The profile showed where Fallout's frame went by
+  Ruby's bar in Carbon at 6x5 + MSAA 2 on an RTX 3080 Ti: a GPU span of
+  24.6 ms, 22.8 of it combiner draws, ~518 ns per 1000 pixel shader
+  invocations; a flat pixel shader (`flatps`) drew the same transformed
+  draws in 5.4 ms against 19.1. The ubershader kept the combiners' sixteen
+  registers in an array indexed by the combiner words (`float4 R[16]`); an array indexed at run
+  time is an indexable temp, which NVIDIA keeps in local memory, so every
+  register read and write of every stage went out to memory. Three exact
+  changes, each measured on its own:
+  - the registers are fifteen `float4`s (r0 always reads zero) behind
+    `[forcecase] switch`es on the register number -- uniform, as it comes
+    from the combiner words -- span 24.6 -> 9.6 ms, 518 -> 188 ns per 1000
+    invocations (a chain of `?:` instead compiled faster but drew at 304
+    ns per 1000);
+  - one shader per path instead of one with every path's branches
+    (`ps_screen`, `ps_ffp`, `ps_rc`), the CPU picks: 9.6 -> 7.2 ms, 135 ns
+    per 1000;
+  - `wrapc` divides only when it must (a coordinate already inside needs no
+    wrap, a power-of-two size wraps with `&`; a signed division is a long
+    sequence and it ran four times per bilinear tap), and `ps_rc` has
+    variants by what the stages sample (`RC_TEX`), so Fallout's filter pass
+    (the 1280x480 scene read as a texture into the presented 640x480) runs
+    without the texture paths it never takes: 0.8 -> 0.6-0.7 ms for that
+    pass, the span 7.2 -> 6.9 ms.
+  By the bar the span went 24.6 -> 6.9 ms, the combiner draws 22.8 -> 5.5 ms,
+  518 -> 134 ns per 1000 invocations (spans without `stats`). The combiner
+  shader takes D3DCompile ~14 s (ps_rc, 295 KB of DXBC; ~11.6 s before the
+  `RC_TEX` variants; two to three times the ubershader's 5.2: the switches are long); the
+  title enables the combiners when it creates its device, so the first frame
+  needs it, and compiled in the background the first frame still waited
+  ~14 s. So the shaders are compiled when the toolkit is built:
+  `src/d3d/nv2a_gpu_shaderc.c`, a host tool on D3DCompile with the flags the
+  back end used at run time, writes `nv2a_gpu_shaders.h` (the code of each
+  shader and the source) from `nv2a_gpu_shaders.hlsl`;
+  `src/d3d/nv2a_gpu_shaders.cmake` adds it to a target. The back end only
+  creates them (`pipeline made in 0.01 s`); Fallout reaches control 16.0 s
+  after start instead of 20.3. Only the blit, present and diagnostic shaders
+  are still compiled at run time.
+  The picture is the same bit for bit. `tests/nv2a_gpu_backend/ps_reference.hlsl`
+  is a frozen copy of the ubershader (never edited); `nv2a-gpu-ps`, `-scaled`
+  and `-ssaa` draw random combiner programs, FFP and screen batches (wrap and
+  clamp, swizzled and render-target stages, alpha test, z outside the clip
+  range) once through the reference and once through the back end's own and
+  compare guest memory byte for byte, check the combiners against
+  `nv2a_rc_eval` within 1 per channel, check that no variant has an
+  indexable temp, and that the embedded code is what the source compiles to.
+  On the GPU `RECOMP_GPU_RASTER_PSCHECK=<ref.hlsl>[,<every>]` draws each draw
+  of every `<every>`-th frame (default 30) a second time through the picked
+  shader and through `ps_main` of the reference file into a float target and
+  prints every 10 s how many pixels differ (`[PSCHECK] ... float differ k,
+  8-bit differ j`); by the bar both were 0. Diagnostics only: it reads back
+  per draw.
 - **Texture decodes off the frame.** A texture new to the back end's cache is
   decoded on the executor's thread mid-frame. Texel by texel through the
   executor's sampler that ran at ~19 Mtexel/s: Fallout's first street in
@@ -466,7 +553,9 @@ frames Carbon compares at 0.00–0.02%.
 | `RECOMP_GPU_RASTER_PRESENT=0` | the D3D11 back end leaves the framebuffer window to GDI and guest RAM (the presented surface is written back at every flip) |
 | `RECOMP_GPU_RASTER_PRESENT_DUMP=<prefix>` | every `RECOMP_GPU_RASTER_PRESENT_DUMP_EVERY`-th (default 30) presented frame as `<prefix>NNNNNN.bmp`, 640x480 as the window shows it, HUD and menus included |
 | `RECOMP_GPU_RASTER_RTTEX=0` | the D3D11 back end reads every texture through guest RAM, render targets included |
+| `RECOMP_GPU_RASTER_PSCHECK=<ref.hlsl>[,<every>]` | every `<every>`-th (default 30) frame the D3D11 back end draws each draw again through its pixel shader and through `ps_main` of the reference file (`tests/nv2a_gpu_backend/ps_reference.hlsl`) and prints every 10 s a `[PSCHECK]` line: draws, pixels, float and 8-bit differences, the first that differs; diagnostics only (reads back per draw); see "Pixel shader cost" above. Unset: off |
 | `RECOMP_GPU_RASTER_LOSE_AT=<flip>` | act out a lost D3D11 device at that flip: the software rasteriser takes over from the next frame, as after a driver reset |
+| `RECOMP_GPU_PROF=<secs>[,stats][,flatps]` | every `<secs>` (at least 0.5) a `[GPUPROF]` block: the D3D11 back end's GPU time per frame by pass and render target, from timestamp queries; `stats` adds pixel shader invocations, `flatps` a flat pixel shader for transformed draws (wrong picture, diagnostics only); see "GPU profile" above. Unset or `0`: off |
 | `RECOMP_FPS_LIMIT=<hz>` | the flip stall completes on a tick of the 60 Hz vblank grid (the host's performance counter from the first flip or vblank), at least ceil(60/hz) ticks after the previous flip; a frame that misses its tick waits for the next one, as on a vsynced console, so frame times are whole 1/60 s (39 fps shows as 30, never 4 + 28 ms pairs). Default 60; a limit above 60 counts as 60; `0` off — the flip completes at once and a title pacing itself on the flip runs its menus at hundreds of fps. With `RECOMP_VBLANK` the guest's vblank count follows the same grid |
 | `RECOMP_FFP_FLIP_NORMALS` | light the side of a fixed-function mesh that faces the viewer, even when the title left two-sided lighting off. Not hardware behaviour: a compatibility option for a game project to turn on, off by default |
 

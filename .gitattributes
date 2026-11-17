@@ -1,3 +1,7 @@
 # Shell scripts must stay LF: a CRLF checkout breaks the shebang on Linux
 # ("bad interpreter: /usr/bin/env bash^M").
 *.sh text eol=lf
+# HLSL stays LF too: tests/nv2a_gpu_backend checks ps_reference.hlsl by a hash
+# of its bytes, and nv2a_gpu_shaders.hlsl is compiled into the build and
+# embedded as text; with core.autocrlf a checkout would differ by line ends.
+*.hlsl text eol=lf
