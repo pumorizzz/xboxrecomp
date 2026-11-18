@@ -18,7 +18,12 @@ set(NV2A_GPU_SHADERS_SPECS
     ps_ffp:ps_4_0:k_ps_ffp
     ps_rc:ps_4_0:k_ps_rc
     ps_rc:ps_4_0:k_ps_rc_tex:RC_TEX=1
-    ps_rc:ps_4_0:k_ps_rc_rt:RC_TEX=2)
+    ps_rc:ps_4_0:k_ps_rc_rt:RC_TEX=2
+    pvs:vs_4_0:k_pvs
+    pps:ps_4_0:k_pps
+    bvs:vs_4_0:k_bvs
+    bps_up:ps_4_0:k_bps_up
+    bps_down:ps_4_0:k_bps_down)
 
 function(nv2a_gpu_shaders target)
     set(dir ${CMAKE_BINARY_DIR}/nv2a_gpu_shaders)

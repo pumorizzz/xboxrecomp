@@ -557,7 +557,81 @@ frames Carbon compares at 0.00–0.02%.
 | `RECOMP_GPU_RASTER_LOSE_AT=<flip>` | act out a lost D3D11 device at that flip: the software rasteriser takes over from the next frame, as after a driver reset |
 | `RECOMP_GPU_PROF=<secs>[,stats][,flatps]` | every `<secs>` (at least 0.5) a `[GPUPROF]` block: the D3D11 back end's GPU time per frame by pass and render target, from timestamp queries; `stats` adds pixel shader invocations, `flatps` a flat pixel shader for transformed draws (wrong picture, diagnostics only); see "GPU profile" above. Unset or `0`: off |
 | `RECOMP_FPS_LIMIT=<hz>` | the flip stall completes on a tick of the 60 Hz vblank grid (the host's performance counter from the first flip or vblank), at least ceil(60/hz) ticks after the previous flip; a frame that misses its tick waits for the next one, as on a vsynced console, so frame times are whole 1/60 s (39 fps shows as 30, never 4 + 28 ms pairs). Default 60; a limit above 60 counts as 60; `0` off — the flip completes at once and a title pacing itself on the flip runs its menus at hundreds of fps. With `RECOMP_VBLANK` the guest's vblank count follows the same grid |
+| `RECOMP_FRAME_SKIP=0\|1\|auto` | frame skip (see [Frame Skip](#frame-skip)): the flip waits for every tick of the grid whatever the limit, and only some flips are shown. `1`: L shows a second on the grid (`RECOMP_FPS_LIMIT` = L, active below 60), Present as before; `auto`: the same cadence, and a frame is shown only when the back end can present it without waiting (an outside limiter), on a flip-model swap chain. Needs a back end with `pace` (the D3D11 one, not with `compare` or `SYNC=all`); otherwise one `[GPU] RECOMP_FRAME_SKIP=… is not active: …` line. Unset or `0`: off, the flip waits ceil(60/L) ticks |
+| `RECOMP_GPU_RASTER_PRESENT_HZ=<n>` | diagnostics for `RECOMP_FRAME_SKIP=auto`: the D3D11 back end acts out a limiter at n Hz in front of its swap chain (the host clock cut into 1/n s slots, one show a slot), to see frame skip at work without one |
+| `RECOMP_GPU_RASTER_FRAME_LATENCY=<1-3>` | `RECOMP_FRAME_SKIP=auto`: frames the flip-model chain may hold (`SetMaximumFrameLatency`, default 2). At 1, a frame whose GPU work and the compositor's next vblank outlast a flip period keeps the waitable unsignalled at the next flip, and auto skipped frames with no limiter at all (6x5 + MSAA 2 in a 143 Hz window: 465-582 of 600 shown; at 2: 593-600). 2 costs a frame of queue only while the GPU is slower than a flip period; an outside limiter still fills it |
+| `RECOMP_FRAME_SKIP_TRACE=1` | why a skipped window is drawn after all, where a stale read or texture came from (`[FSKIP]` lines, the first 60 and every 500th) |
 | `RECOMP_FFP_FLIP_NORMALS` | light the side of a fixed-function mesh that faces the viewer, even when the title left two-sided lighting off. Not hardware behaviour: a compatibility option for a game project to turn on, off by default |
+
+## Frame Skip
+
+A title whose logic counts frames needs them 1/60 s apart. Fallout: BoS's
+Tutorial charge does not count at a native 22.2 ms (45 fps) or 33 ms (30 fps),
+so a lower `RECOMP_FPS_LIMIT` -- or an outside limiter: a Steam Deck's frame
+limit, NVIDIA's Max Frame Rate, RTSS -- broke it. With `RECOMP_FRAME_SKIP` the
+flip stall still completes on every tick (`vblank_grid_pace_hz`), so the
+semaphore, `NO_OPERATION 5`, the frame counter and `flip()` see 60 a second,
+and the back end's `pace(va, tick, cadence_show, cadence_next)` decides at each
+`FLIP_STALL` whether that flip is shown. The cadence is
+`vblank_grid_shown`: tick k belongs to slot floor(k·L/60) and a flip is shown
+when its slot is past the last shown one -- divisors of 60 are even (30: every
+other tick), the rest alternate (45: 1-1-2, 40: 1-2, 50: 1-1-1-1-2). A flip that
+is not shown is not presented, written back, copied to the window or dumped
+(`RECOMP_FB_DUMP_FLIPS`). The `[GPU] … fps (N flips, shown M)` line counts both;
+the window title says `FPS: 45.0 (game 60.0)`.
+
+The D3D11 back end does not draw what is not shown. A *window* runs from one
+boundary to the next -- the first full overwrite after a flip of the surface
+that flip showed (or the one before, when the two alternate): a colour clear
+of all four channels over the whole target, or a draw
+that passes the coverage test (one triangle, or two forming a convex quad,
+holding the four corner pixel centres; opaque: no blend, all channels, no
+alpha/depth/stencil test, no clip-plane stage, z inside `SET_CLIP_MIN/MAX`). In
+a skipped window clears and draws go into a journal (surface, state, combiners
+and a copy of every vertex -- the executor reuses its buffers) and the GPU sees
+none of it. At the next boundary the journal is dropped, unless a target it
+wrote is not *self-contained*: the last shown window read it (a texture, a
+blend, a show, a writeback, a depth/stencil test) before overwriting it whole,
+or did not touch it; a write nothing reads does not count (Fallout's filter
+writes depth into the zeta-0 buffer with the test off every frame). It is
+drawn (replayed) instead then -- at that boundary, even when the next window
+is skipped too -- and also when
+the frame turns out to be shown after all, when something observes the GPU's
+work in a skipped window (a writeback, a visibility count from a logged draw)
+and when the 256 MB arena is full. A dropped target read before it was
+overwritten is a *stale read*: said once; the target is then drawn in skipped
+windows until a shown window overwrites it first again (in boot_check one
+each at the chapter intro and Carbon's loading screen, where the shown
+surface changes; `RECOMP_FRAME_SKIP_TRACE=1` says why a window is drawn and
+where a stale read or texture came from). The 10 s `[GPURAST] frame skip:` line counts shown,
+skipped, not ready (presenter / GPU), logged ops, windows dropped, replayed
+(ready / observed / not self-contained / arena full), mispredicted and stale
+reads, stale textures (a logged draw keeps a hash of each texture it samples
+from guest RAM; changed by the time it is drawn, it is counted and said once).
+The arena figure is its size; the MB before it is what was logged over the
+period. In Fallout every window begins with `clear F3` over its 640x480 target
+and nothing reads across windows, except the loading screen, whose filter
+reads the previous frame: its one clear is replayed (stage3 traces of the
+port's task, 210 windows).
+
+With `auto` the swap chain is a flip-model one (`FLIP_DISCARD`, two buffers,
+`SetMaximumFrameLatency(2)` -- `RECOMP_GPU_RASTER_FRAME_LATENCY` -- and its
+waitable object), and a frame is shown when
+the waitable is signalled and the GPU has finished the last shown frame (a
+`D3D11_QUERY_EVENT`). No thread of its own: DXGI must not run beside the
+immediate context, and DXVK holds the context lock through part of Present.
+The mode of the next window is a forecast -- the cadence, and with `auto` the
+presenter as a rate (shows a tick, 0.75 under a limit of 45) and a credit in its
+phase: a tick accrues the rate, a show spends one, a flip held back says the
+credit is just short of one; the next window is expected shown when the credit
+reaches one by its flip. (An average of the interval between shows swung with
+45's 1-1-2 and had shown windows logged and drawn late.) A frame that is only in
+guest RAM (a movie the CPU drew) goes up into a texture and through the same
+shader, as GDI cannot draw into a flip-model window. Without the flip model
+or the waitable `auto` falls back to the cadence on the old chain. Frame skip
+is the GPU path's only: the software rasteriser shows every flip. Tests:
+`tests/nv2a_vblank_grid` (the cadence) and `tests/nv2a_gpu_backend`
+`nv2a-gpu-skip-*` (the executor and the back end on WARP).
 
 ## The DMA Walk Is Opt-In
 

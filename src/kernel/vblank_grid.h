@@ -66,4 +66,44 @@ static inline int64_t vblank_grid_flip_at(int64_t now, int64_t base, int64_t fre
     return vblank_grid_time(k, base, freq);
 }
 
+/*
+ * Frame skip (RECOMP_FRAME_SKIP): the game keeps flipping on every tick of the
+ * 60 Hz grid -- its dt stays 16.7 ms, which the Tutorial charge needs (at a
+ * native 22.2 ms or 33 ms dt it does not count) -- while only some of those
+ * flips are shown, L per second. Tick k belongs to cadence slot
+ * floor(k*L/60); a flip is shown when its slot is past the slot of the last
+ * shown flip. Divisors of 60 give an even cadence (30 -> every 2nd tick, 20 ->
+ * every 3rd); others alternate (45 -> 1-1-2, 40 -> 1-2, 50 -> 1-1-1-1-2) and
+ * average L. Shown at once on readiness (Steam Deck), the intervals are even
+ * but the content still steps 1-1-2 ticks of game time: unavoidable while the
+ * game's tick differs from the display's.
+ */
+
+/* The cadence slot of tick k at L shows per second: floor(k*L/60), split so it
+ * cannot overflow. L <= 0 or >= 60: every tick is its own slot. */
+static inline uint64_t vblank_grid_slot(uint64_t k, int L)
+{
+    if (L <= 0 || L >= VBLANK_GRID_HZ)
+        return k;
+    return k / VBLANK_GRID_HZ * (uint64_t)L + k % VBLANK_GRID_HZ * (uint64_t)L / VBLANK_GRID_HZ;
+}
+
+/* 1: the flip on tick k is shown, given the tick of the last shown flip
+ * (last_shown; 0 = none yet shows tick 0's slot as taken, so the first flip
+ * past it is shown). Every flip at L <= 0 or L >= 60. A late flip that skipped
+ * past several slots is shown once, never twice in one slot. */
+static inline int vblank_grid_shown(uint64_t k, uint64_t last_shown, int L)
+{
+    if (L <= 0 || L >= VBLANK_GRID_HZ)
+        return 1;
+    return vblank_grid_slot(k, L) > vblank_grid_slot(last_shown, L);
+}
+
+/* The rate the flip pacer waits for: 60 while frame skip is active (the game
+ * flips on every tick, the cadence picks which are shown), the limit otherwise. */
+static inline int vblank_grid_pace_hz(int limit, int skip)
+{
+    return skip ? VBLANK_GRID_HZ : limit;
+}
+
 #endif

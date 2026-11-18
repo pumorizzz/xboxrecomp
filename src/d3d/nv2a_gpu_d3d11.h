@@ -32,6 +32,13 @@
  * RECOMP_GPU_RASTER_PSCHECK=<ref.hlsl>[,<every>] -- every <every>-th
  *   (default 30) frame each draw's pixel shader against ps_main of a
  *   reference shader, float and 8-bit differences counted.
+ * RECOMP_FRAME_SKIP=1|auto (the executor's frame skip): a frame the cadence
+ *   or, with auto, the swap chain (a flip-model one with a waitable) cannot
+ *   show is not drawn -- its work is logged and dropped, or drawn when
+ *   something reads it; RECOMP_GPU_RASTER_PRESENT_HZ=<n> acts out a limiter
+ *   at n Hz in front of the chain; RECOMP_GPU_RASTER_FRAME_LATENCY=<1-3>
+ *   (default 2) the frames the chain may hold (docs: pushbuffer-executor.md
+ *   "Frame Skip").
  * A lost device (driver reset) hands the frame back to the software
  * rasteriser at the next flip; RECOMP_GPU_RASTER_LOSE_AT=<flip> acts it out.
  * Needs RECOMP_PB_EXEC=1 to have any effect.

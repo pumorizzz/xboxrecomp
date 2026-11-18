@@ -107,4 +107,5 @@ Where to look when a title does something and says nothing about why.
 | slows to 1 FPS some minutes into a level | [Counters Outlive 32 Bits](technical/kernel-replacement.md#counters-outlive-32-bits) |
 | reports ABI violations in CRT helpers | [Reports RECOMP_ABI_CHECK Always Gives](pipeline/06-debugging.md#reports-recomp_abi_check-always-gives) |
 | has flips on the vblank grid but frame times in pairs (4 + 29 ms) | [Answering the Title While It Runs](technical/pushbuffer-executor.md#answering-the-title-while-it-runs) |
+| runs slow or loses timed input at a frame limit below 60 (or under an outside limiter) | [Frame Skip](technical/pushbuffer-executor.md#frame-skip) |
 | stalls 80 ms (console) to 400 ms (output redirected) exactly every 10 s | [The Report Is One Write](technical/pushbuffer-executor.md#the-report-is-one-write) |

@@ -89,8 +89,37 @@ add_test(NAME nv2a-gpu-ps-ssaa COMMAND nv2a-gpu-ps-test)
 set_tests_properties(nv2a-gpu-ps-ssaa PROPERTIES
     ENVIRONMENT "RECOMP_GPU_RASTER_SCALE=2;RECOMP_GPU_RASTER_SSAA=3")
 
+# Frame skip (RECOMP_FRAME_SKIP): the executor's cadence and the back end's
+# journal, drop and replay, and auto's readiness on a flip-model chain (a
+# hidden window). One scenario a run (the limit and the mode are read once);
+# see the head of nv2a_gpu_skip_test.c. At 1x, and the ones that check
+# pixels again at 3x3 with 4x MSAA.
+add_executable(nv2a-gpu-skip-test nv2a_gpu_skip_test.c
+    ../../src/kernel/nv2a_pb_exec.c
+    ../../src/kernel/nv2a_vsh_interp.c
+    ../../src/kernel/nv2a_combiner.c
+    ../../src/d3d/nv2a_gpu_d3d11.c
+    ../../src/d3d/nv2a_gpu_prof.c)
+target_include_directories(nv2a-gpu-skip-test PRIVATE ../../src/kernel ../../src)
+target_link_libraries(nv2a-gpu-skip-test PRIVATE d3d11 dxgi dxguid d3dcompiler user32)
+target_compile_definitions(nv2a-gpu-skip-test PRIVATE NV2A_GPU_TEST_HOOKS)
+if(MSVC)
+    target_compile_definitions(nv2a-gpu-skip-test PRIVATE _CRT_SECURE_NO_WARNINGS)
+endif()
+foreach(s s1 s1b s2 s3 s4 s5 s6 s7 s7b s8 s8b s9 s10 s10b s11 s12 s13 s14 s15 s16 s17 s18 s19 s19b s20 s21 s22 s22b s23 s24 s25 s25b s26 s26b s26c s27)
+    add_test(NAME nv2a-gpu-skip-${s} COMMAND nv2a-gpu-skip-test ${s})
+    # s11: the executor must not wait for a presenter that never gets ready.
+    set_tests_properties(nv2a-gpu-skip-${s} PROPERTIES TIMEOUT 120)
+endforeach()
+foreach(s s1 s1b s2 s4 s5 s13 s14 s22 s22b s23)
+    add_test(NAME nv2a-gpu-skip-${s}-scaled COMMAND nv2a-gpu-skip-test ${s})
+    set_tests_properties(nv2a-gpu-skip-${s}-scaled PROPERTIES TIMEOUT 120
+        ENVIRONMENT "RECOMP_GPU_RASTER_SCALE=3;RECOMP_GPU_RASTER_MSAA=4")
+endforeach()
+
 # nv2a_gpu_d3d11.c's shaders, compiled at build time (src/d3d/nv2a_gpu_shaders.cmake).
 include(${CMAKE_CURRENT_SOURCE_DIR}/../../src/d3d/nv2a_gpu_shaders.cmake)
 nv2a_gpu_shaders(nv2a-gpu-backend-test)
 nv2a_gpu_shaders(nv2a-gpu-prof-test)
 nv2a_gpu_shaders(nv2a-gpu-ps-test)
+nv2a_gpu_shaders(nv2a-gpu-skip-test)

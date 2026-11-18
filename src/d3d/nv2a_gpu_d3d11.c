@@ -68,6 +68,7 @@
 #include <windows.h>
 #include <d3d11.h>
 #include <dxgi.h>
+#include <dxgi1_3.h>               /* IDXGISwapChain2: the frame latency waitable */
 #include <d3dcompiler.h>
 #include <float.h>
 #include <math.h>
@@ -85,6 +86,8 @@
 #include "../video/video_player.h"   /* the framebuffer window it presents into */
 
 extern ptrdiff_t xbox_GetMemoryOffset(void);
+/* fb_present.c: the window's own copy of a guest RAM frame (its dumps). */
+extern void xbox_FramebufferWindowPresent(uint32_t fb_va, uint32_t pitch);
 
 #define RT_W 1280                       /* = NV_ZBUF_W in nv2a_pb_exec.c */
 #define RT_H 1024                       /* = NV_ZBUF_H */
@@ -196,7 +199,7 @@ static ID3D11PixelShader *s_ps_bound;   /* what PSSetShader last set for the ras
 static ID3D11PixelShader *s_ps_override, *s_ps_ovr_cache;
 static const void *s_ovr_code;
 static size_t s_ovr_len;
-#define MAX_PS_BLOBS 8
+#define MAX_PS_BLOBS 12
 static const void *s_ps_code[MAX_PS_BLOBS]; /* the back end's own (nv2a_gpu_shaders.h) */
 static size_t s_ps_len[MAX_PS_BLOBS];
 static const char *s_ps_names[MAX_PS_BLOBS];
@@ -377,26 +380,8 @@ static uint32_t rt_dirty_hi(const GpuRt *r)
 
 /* bps_up: a native texel drawn over its s_sx x s_sy block of the target.
  * bps_down: the block averaged back to one texel -- the anti-aliased colour
- * guest RAM gets; also the SSAA reduction for the presenter. */
-static const char s_blit_hlsl[] =
-"Texture2DArray<float4> bsrc : register(t0);\n"
-"cbuffer B : register(b3) { float4 bk; };\n"   /* the block: s_sx, s_sy, or s_ssaa twice */
-"float4 bvs(uint i : SV_VertexID) : SV_Position {\n"
-"    float2 q = float2((i << 1) & 2, i & 2);\n"
-"    return float4(q * float2(2, -2) + float2(-1, 1), 0, 1);\n"
-"}\n"
-"float4 bps_up(float4 p : SV_Position) : SV_Target {\n"
-"    return bsrc.Load(int4(int2(p.xy) / int2(bk.xy), 0, 0));\n"
-"}\n"
-"float4 bps_down(float4 p : SV_Position) : SV_Target {\n"
-"    int2 s = int2(bk.xy), b = int2(p.xy) * s;\n"
-"    float4 a = float4(0.0, 0.0, 0.0, 0.0);\n"
-"    int x, y;\n"
-"    [loop] for (y = 0; y < s.y; y++)\n"
-"        [loop] for (x = 0; x < s.x; x++)\n"
-"            a += bsrc.Load(int4(b + int2(x, y), 0, 0));\n"
-"    return a / (float)(s.x * s.y);\n"
-"}\n";
+ * guest RAM gets; also the SSAA reduction for the presenter. In
+ * nv2a_gpu_shaders.hlsl, compiled at build time (k_bvs, k_bps_up, k_bps_down). */
 
 static ID3D11BlendState *blend_state(int enable, uint32_t src, uint32_t dst,
                                      uint32_t eq, UINT8 mask);
@@ -1702,7 +1687,7 @@ static float zmax_of(const Nv2aRenderState *rs)
     return rs->zeta_format == 1 ? 65535.0f : 16777215.0f;
 }
 
-static void gpu_clear(const Nv2aSurface *s, const Nv2aRenderState *rs,
+static void exec_clear(const Nv2aSurface *s, const Nv2aRenderState *rs,
                       uint32_t flags, uint32_t argb, uint32_t zs)
 {
     if (flags & 0xF0) {
@@ -1854,7 +1839,7 @@ static uint32_t stages_needed(const Nv2aBatch *b)
     return need & b->stage_valid;
 }
 
-static void gpu_draw(const Nv2aSurface *s, const Nv2aBatch *b)
+static void exec_draw(const Nv2aSurface *s, const Nv2aBatch *b)
 {
     const Nv2aRenderState *rs = b->state;
     ID3D11ShaderResourceView *srv[4];
@@ -2072,6 +2057,774 @@ static void gpu_draw(const Nv2aSurface *s, const Nv2aBatch *b)
         }
 }
 
+/* ---- frame skip (RECOMP_FRAME_SKIP) --------------------------------------
+ *
+ * The game flips on every tick of the 60 Hz grid; the executor asks pace()
+ * at each flip whether it is shown (the cadence of RECOMP_FPS_LIMIT and, with
+ * auto, whether the swap chain can take a frame without waiting). A frame
+ * that is not shown need not be drawn at all -- that is the point: at 30
+ * shows a second the GPU draws half the frames.
+ *
+ * Windows. A window runs from one boundary to the next: the first full
+ * overwrite after a flip of P, the surface the last flip showed (and the one
+ * before it, when the two alternate: double buffering) -- a colour clear of
+ * all four channels over the whole target, or a draw that passes the coverage
+ * test (fs_covers). Only the first after a flip: a second full overwrite of P
+ * in the same frame would split it in two, and the window committed last would
+ * know only its half. In Fallout every frame starts with `clear F3` over
+ * 0x00778000 and its depth buffer (stage3 traces: 210 of 210 windows). Each
+ * window is SHOW (drawn as it comes) or SKIP; the mode of the next one is the
+ * forecast pace() makes (cadence_next, and with auto the presenter's rate and
+ * phase, see gpu_pace).
+ *
+ * SKIP: clears and draws go into a journal (the arena: surface, state,
+ * combiners, every vertex copied -- the executor reuses its buffers) and the
+ * GPU sees nothing: no target acquired, no texture decoded, no guest RAM
+ * compared. At the next boundary the journal is dropped and the targets it
+ * wrote are marked dropped -- unless one of them is not self-contained, when
+ * it is drawn after all (replayed): a window that reads what an earlier one
+ * left needs it. It is replayed too, exactly as logged, when pace() shows the
+ * frame after all (the forecast was wrong), when something observes the GPU's
+ * work in a SKIP window (a writeback, the presented surface, a visibility
+ * count from a logged draw), and when the arena is full.
+ *
+ * Self-contained: each target (colour by address, depth by address) is, when
+ * the last SHOW window read nothing of it before overwriting it whole -- a
+ * read being a texture, a blend, a show, a writeback, a depth or stencil test.
+ * A partial write read later in the window is not (the read sees the old
+ * pixels around it); a partial write nothing reads is (Fallout's filter writes
+ * depth into the zeta-0 buffer with the test off, every frame, and no draw
+ * ever tests it: counted as a read before, every skipped window was drawn).
+ * An untouched target is not. Reading a dropped target before it was
+ * overwritten (the guess was wrong) is a stale read: said once per address;
+ * the window it happened in reads the target first, so the target is not
+ * self-contained until a shown window overwrites it first again. It used to
+ * stay so for good: one miss at Carbon's loading screen (the shown surface
+ * changes there, the guess cannot know) and every skipped window after it
+ * was drawn. RECOMP_FRAME_SKIP_TRACE=1 says why a window is drawn and
+ * where a stale read or texture came from.
+ *
+ * A logged draw keeps a hash of each texture it samples from guest RAM (and
+ * its palette); drawn later, a texture whose bytes changed meanwhile (the
+ * title's CPU went on: a movie, a dynamic texture) is counted and said once
+ * per address -- the frame is drawn from what is there now.
+ *
+ * Off (pace not registered) with RECOMP_GPU_RASTER=compare and SYNC=all. */
+#define FS_MAX_T 32
+#define FS_RATE_N 64                    /* flips the presenter's rate is taken over */
+#define FS_ARENA_MAX ((size_t)256 << 20)
+#define FS_RT 0
+#define FS_Z 1
+#define FS_FULL 1                       /* overwritten whole before anything read it */
+#define FS_OTHER 2                      /* read before it was overwritten whole */
+#define FS_WROTE 3                      /* written in part, nothing read yet */
+#define FS_READ 4                       /* fs_mark: an access that reads */
+#define FS_SHOW 0
+#define FS_SKIP 1
+#define FSR_READY 0                     /* replayed: shown after all */
+#define FSR_OBSERVED 1                  /* something read the GPU's work */
+#define FSR_NOTSELF 2                   /* a written target is not self-contained */
+#define FSR_OVERFLOW 3                  /* the arena is full */
+#define FS_OP_CLEAR 1
+#define FS_OP_DRAW 2
+
+typedef struct { uint32_t kind, va, end, cls; } FsT;
+
+typedef struct {
+    uint32_t type, bytes, pad[2];
+} FsOp;
+
+typedef struct {
+    FsOp op;
+    Nv2aSurface s;
+    Nv2aRenderState rs;
+    uint32_t flags, argb, zs;
+} FsClear;
+
+typedef struct {
+    FsOp op;
+    Nv2aSurface s;
+    Nv2aBatch b;
+    Nv2aRenderState rs;
+    Nv2aCombiner rc;
+    uint32_t has_rc;
+    uint32_t hashed;                    /* bit i: stage i read from guest RAM, thash[i] */
+    uint32_t window_no, flip_no;        /* where it was logged (RECOMP_FRAME_SKIP_TRACE) */
+    uint64_t thash[4];
+} FsDraw;
+
+/* Counters, cumulative (the 10 s report prints the difference). logged_bytes
+ * is what went into the arena over the period, not what it holds: the
+ * journal starts empty at every window. */
+typedef struct {
+    uint32_t shown, skipped, nr_presenter, nr_gpu, logged, dropped_windows;
+    uint32_t replayed[4], mispredicted_skip, mispredicted_show, stale, tex_changed;
+    uint64_t logged_bytes;
+} FsStats;
+
+/* Texture hashes, once per (address, size, palette) while logging a window
+ * or drawing a journal: a window samples the same few textures many times. */
+#define FS_HCACHE 64
+typedef struct { uint32_t off, bytes, palette, color; uint64_t h; } FsHash;
+
+static struct {
+    int on;                             /* pace() was called: this section runs */
+    int mode, next_mode, replaying, first_pace;
+    uint8_t *arena;
+    size_t used, cap;
+    uint32_t ops;
+    int zpass;                          /* the journal holds a visibility-counted draw */
+    FsT jt[FS_MAX_T];                   /* targets the journal writes */
+    int njt, jt_lost;
+    FsT win[FS_MAX_T];                  /* this window's first accesses */
+    int nwin;
+    FsT selfc[FS_MAX_T];                /* self-contained in the last SHOW window */
+    int nselfc;
+    FsT dropped[FS_MAX_T];              /* written by a dropped journal, not since */
+    int ndropped;
+    uint32_t stale_said[64];
+    int nstale_said;
+    uint32_t tex_said[64];              /* textures said changed */
+    int ntex_said;
+    FsHash hc[FS_HCACHE];
+    int nhc;
+    uint32_t pva[2];                    /* the surfaces the last two flips showed */
+    int armed;                          /* no boundary since the last flip */
+    FsT seen[FS_MAX_T];                 /* every target the last SHOW window touched */
+    int nseen;
+    uint32_t window_no;                 /* boundaries so far (RECOMP_FRAME_SKIP_TRACE) */
+    double R;                           /* auto: the presenter's rate, shows per tick */
+    uint8_t r_shown[FS_RATE_N], r_gap[FS_RATE_N];   /* ... over the last FS_RATE_N flips */
+    int r_at, r_n;
+    double credit;                      /* auto: shows owed by it, in its phase */
+    uint64_t k_shown;
+    uint64_t k_prev;                    /* the previous flip's tick */
+} s_fs;
+static FsStats s_fst, s_fst_said;
+
+/* RECOMP_FRAME_SKIP_TRACE=1: why a window is drawn after all and where a
+ * stale texture came from, the first 60 times and every 500th after. */
+static int s_fs_trace = -1;
+static uint32_t s_fs_trace_n;
+static int fs_trace_on(void)
+{
+    if (s_fs_trace < 0) {
+        const char *e = getenv("RECOMP_FRAME_SKIP_TRACE");
+        s_fs_trace = e && *e && strcmp(e, "0") != 0;
+    }
+    return s_fs_trace && (s_fs_trace_n++ < 60 || s_fs_trace_n % 500 == 0);
+}
+#define FS_TRACE(...) do { if (fs_trace_on()) fprintf(stderr, __VA_ARGS__); } while (0)
+
+static int fs_find(const FsT *a, int n, uint32_t kind, uint32_t va)
+{
+    int i;
+    for (i = 0; i < n; i++)
+        if (a[i].kind == kind && a[i].va == va)
+            return i;
+    return -1;
+}
+
+static void fs_del(FsT *a, int *n, int i)
+{
+    memmove(&a[i], &a[i + 1], (size_t)(*n - i - 1) * sizeof *a);
+    (*n)--;
+}
+
+/* Into a list once; a full list forgets its oldest entry. 0: it was full. */
+static int fs_add(FsT *a, int *n, uint32_t kind, uint32_t va, uint32_t end, uint32_t cls)
+{
+    int full = 0;
+    if (fs_find(a, *n, kind, va) >= 0)
+        return 1;
+    if (*n == FS_MAX_T) {
+        fs_del(a, n, 0);
+        full = 1;
+    }
+    a[*n].kind = kind; a[*n].va = va; a[*n].end = end; a[*n].cls = cls;
+    (*n)++;
+    return !full;
+}
+
+static void fs_stale(uint32_t va)
+{
+    int i;
+    s_fst.stale++;
+    for (i = 0; i < s_fs.nselfc; )
+        if (s_fs.selfc[i].va == va)
+            fs_del(s_fs.selfc, &s_fs.nselfc, i);
+        else
+            i++;
+    for (i = 0; i < s_fs.nstale_said; i++)
+        if (s_fs.stale_said[i] == va)
+            return;
+    if (s_fs.nstale_said < 64)
+        s_fs.stale_said[s_fs.nstale_said++] = va;
+    fprintf(stderr, "[GPURAST] frame skip: 0x%08X read before it was drawn again after a"
+                    " dropped window (a stale read)\n", va);
+}
+
+/* An access to a target in this window: FS_FULL (overwritten whole),
+ * FS_WROTE (in part) or FS_READ. Its state goes FS_WROTE -> FS_FULL or
+ * FS_OTHER and stays there; a full overwrite makes a dropped target whole. */
+static void fs_mark(uint32_t kind, uint32_t va, uint32_t end, uint32_t cls)
+{
+    int i = fs_find(s_fs.win, s_fs.nwin, kind, va);
+    uint32_t to = cls == FS_READ ? FS_OTHER : cls;
+    if (i < 0)
+        fs_add(s_fs.win, &s_fs.nwin, kind, va, end, to);
+    else if (s_fs.win[i].cls == FS_WROTE && to != FS_WROTE)
+        s_fs.win[i].cls = to;
+    if (cls == FS_FULL && (i = fs_find(s_fs.dropped, s_fs.ndropped, kind, va)) >= 0)
+        fs_del(s_fs.dropped, &s_fs.ndropped, i);
+}
+
+/* Something reads the target `va` (depth) or the guest bytes [lo, hi)
+ * (colour: a texture, a blend, a show, a writeback). */
+static void fs_read(uint32_t kind, uint32_t lo, uint32_t hi)
+{
+    int i;
+    for (i = 0; i < s_fs.ndropped; ) {
+        FsT *d = &s_fs.dropped[i];
+        if (d->kind == kind && (kind == FS_Z ? d->va == lo : ranges_overlap(d->va, d->end, lo, hi))) {
+            FS_TRACE("[FSKIP] stale read of %s 0x%08X (read 0x%08X-0x%08X) in window %u at"
+                     " flip %u, P 0x%08X/0x%08X%s\n", kind == FS_Z ? "depth" : "colour", d->va,
+                     lo, hi, s_fs.window_no, s_flip_no, s_fs.pva[0], s_fs.pva[1],
+                     s_fs.replaying ? ", drawing a journal" : "");
+            fs_stale(d->va);
+            fs_del(s_fs.dropped, &s_fs.ndropped, i);
+            continue;
+        }
+        i++;
+    }
+    if (kind == FS_Z) {
+        fs_mark(FS_Z, lo, lo, FS_READ);
+        return;
+    }
+    for (i = 0; i < MAX_RTS; i++)
+        if (s_rt[i].used && ranges_overlap(s_rt[i].va, rt_end(&s_rt[i]), lo, hi))
+            fs_mark(FS_RT, s_rt[i].va, rt_end(&s_rt[i]), FS_READ);
+    /* and a target only this window's work made: not acquired yet in a
+     * replay, or written in part */
+    for (i = 0; i < s_fs.nwin; i++)
+        if (s_fs.win[i].kind == FS_RT && ranges_overlap(s_fs.win[i].va, s_fs.win[i].end, lo, hi))
+            fs_mark(FS_RT, s_fs.win[i].va, s_fs.win[i].end, FS_READ);
+}
+
+static uint32_t fs_surf_end(const Nv2aSurface *s)
+{
+    return s->color_va + (s->clip_y + s->height) * s->pitch;
+}
+
+/* The clip rectangle is the whole target: (0,0), as wide as the pitch, as
+ * tall as the target has ever been. */
+static int fs_target_rect(const Nv2aSurface *s, uint32_t *w, uint32_t *h)
+{
+    uint32_t bpp = s->bytes_per_pixel, W, H, i;
+    if ((bpp != 2 && bpp != 4) || !s->pitch || s->clip_x || s->clip_y)
+        return 0;
+    W = s->pitch / bpp;
+    H = s->height;
+    if (W > RT_W) W = RT_W;
+    if (H > RT_H) H = RT_H;
+    for (i = 0; i < MAX_RTS; i++)
+        if (s_rt[i].used && s_rt[i].va == s->color_va && s_rt[i].pitch == s->pitch
+            && s_rt[i].H > H)
+            H = s_rt[i].H;
+    *w = W;
+    *h = H;
+    return s->width >= W && s->height >= H && H;
+}
+
+static int fs_full_rect(const Nv2aSurface *s)
+{
+    uint32_t w, h;
+    return fs_target_rect(s, &w, &h);
+}
+
+/* Nothing of what was there shows through: no blend, all four channels, no
+ * alpha, depth or stencil test, no clip-plane stage. */
+/* Blending reads the target: on, unless ONE/ZERO through an equation that
+ * then ignores the destination (ADD, SUBTRACT, REVERSE_SUBTRACT; MIN and MAX
+ * compare with it). */
+static int fs_blend_reads(const Nv2aRenderState *rs)
+{
+    if (!rs->blend_enable)
+        return 0;
+    if (rs->blend_src == 1 && rs->blend_dst == 0
+        && (rs->blend_eq == 0x8006 || rs->blend_eq == 0x800A || rs->blend_eq == 0x800B))
+        return 0;
+    return 1;
+}
+
+static int fs_opaque(const Nv2aBatch *b)
+{
+    const Nv2aRenderState *rs = b->state;
+    uint32_t st;
+    if (fs_blend_reads(rs))
+        return 0;
+    if ((rs->color_mask & 0x01010101u) != 0x01010101u)
+        return 0;
+    if (b->kind != NV2A_BATCH_XF)
+        return 1;
+    if (rs->alpha_test_enable || rs->stencil_enable)
+        return 0;
+    if (rs->depth_test_enable && rs->depth_func != 0x207)
+        return 0;
+    if (b->rc)
+        for (st = 0; st < 4; st++)
+            if (((b->rc->stage_program >> (st * 5)) & 0x1F) == 5)
+                return 0;
+    return 1;
+}
+
+static float fs_edge(const Nv2aVertexEx *a, const Nv2aVertexEx *b, float px, float py)
+{
+    return (b->x - a->x) * (py - a->y) - (b->y - a->y) * (px - a->x);
+}
+
+/* The four corner pixel centres all inside the convex polygon v[0..n-1]
+ * (n 3 or 4, in order); NaN fails every test. */
+static int fs_poly_has(const Nv2aVertexEx *const *v, int n, const float *cx, const float *cy)
+{
+    int c, i, pos = 0, neg = 0;
+    for (i = 0; i < n; i++) {           /* convex and not degenerate */
+        const Nv2aVertexEx *a = v[i], *b = v[(i + 1) % n], *d = v[(i + 2) % n];
+        float z = fs_edge(a, b, d->x, d->y);
+        if (z > 0.0f) pos = 1;
+        else if (z < 0.0f) neg = 1;
+        else return 0;
+    }
+    if (pos == neg)
+        return 0;
+    for (c = 0; c < 4; c++)
+        for (i = 0; i < n; i++) {
+            float e = fs_edge(v[i], v[(i + 1) % n], cx[c], cy[c]);
+            if (!(pos ? e >= 0.0f : e <= 0.0f))
+                return 0;
+        }
+    return 1;
+}
+
+static int fs_same(const Nv2aVertexEx *a, const Nv2aVertexEx *b)
+{
+    return a->x == b->x && a->y == b->y;
+}
+
+/* The draw overwrites the whole target: opaque (fs_opaque), its clip the
+ * whole target, and one triangle -- or two that share an edge into a convex
+ * quad -- holding the four corner pixel centres; with SET_CLIP_MIN/MAX in
+ * force their z inside it. */
+static int fs_covers(const Nv2aSurface *s, const Nv2aBatch *b)
+{
+    const Nv2aRenderState *rs = b->state;
+    uint32_t n = b->count - b->count % 3, t, W, H;
+    float cx[4], cy[4];
+    int zclip = b->kind == NV2A_BATCH_XF && rs->depth_max > rs->depth_min;
+
+    if (!b->vertices_ex || n < 3 || !fs_opaque(b) || !fs_target_rect(s, &W, &H))
+        return 0;
+    cx[0] = 0.5f; cy[0] = 0.5f; cx[1] = (float)W - 0.5f; cy[1] = 0.5f;
+    cx[2] = 0.5f; cy[2] = (float)H - 0.5f; cx[3] = (float)W - 0.5f; cy[3] = (float)H - 0.5f;
+    for (t = 0; t < n && t < 48; t += 3) {
+        const Nv2aVertexEx *v = &b->vertices_ex[t];
+        const Nv2aVertexEx *p[4];
+        int i;
+        if (zclip) {
+            int ok = 1;
+            for (i = 0; i < 3 && ok; i++)
+                ok = v[i].z >= rs->depth_min && v[i].z <= rs->depth_max;
+            if (!ok)
+                continue;
+        }
+        p[0] = &v[0]; p[1] = &v[1]; p[2] = &v[2];
+        if (fs_poly_has(p, 3, cx, cy))
+            return 1;
+        if (t + 6 <= n) {               /* the next triangle completing a quad */
+            const Nv2aVertexEx *w = &v[3];
+            int sh[3], ns = 0, u = -1, j, a, k;
+            for (i = 0; i < 3; i++) {
+                sh[i] = -1;
+                for (j = 0; j < 3; j++)
+                    if (fs_same(&w[i], &v[j]))
+                        sh[i] = j;
+                if (sh[i] >= 0) ns++; else u = i;
+            }
+            if (ns != 2 || u < 0)
+                continue;
+            if (zclip && !(w[u].z >= rs->depth_min && w[u].z <= rs->depth_max))
+                continue;
+            /* v's vertex not shared, then around: a, s1, w[u], s2 */
+            for (a = 0; a < 3; a++) {
+                for (k = 0; k < 3; k++)
+                    if (sh[k] == a)
+                        break;
+                if (k == 3)
+                    break;
+            }
+            p[0] = &v[a]; p[1] = &v[(a + 1) % 3]; p[2] = &w[u]; p[3] = &v[(a + 2) % 3];
+            if (fs_poly_has(p, 4, cx, cy))
+                return 1;
+        }
+    }
+    return 0;
+}
+
+static int fs_is_p(uint32_t va)
+{
+    return va && (va == s_fs.pva[0] || va == s_fs.pva[1]);
+}
+
+static int fs_z_full(const Nv2aRenderState *rs, uint32_t flags)
+{
+    return (flags & 1) && (rs->zeta_format == 1 || (flags & 2));
+}
+
+/* A clear writes the whole target only over the whole clip rectangle (the
+ * hardware clears that rectangle, depth included, whatever the back end's
+ * own D3D11 clear covers). */
+static void fs_track_clear(const Nv2aSurface *s, const Nv2aRenderState *rs, uint32_t flags)
+{
+    int full = fs_full_rect(s);
+    if (flags & 0xF0)
+        fs_mark(FS_RT, s->color_va, fs_surf_end(s),
+                (flags & 0xF0) == 0xF0 && full ? FS_FULL : FS_WROTE);
+    if (flags & 0x03)
+        fs_mark(FS_Z, rs->zeta_va, rs->zeta_va,
+                fs_z_full(rs, flags) && full ? FS_FULL : FS_WROTE);
+}
+
+static uint32_t stages_needed(const Nv2aBatch *b);
+
+static void fs_track_draw(const Nv2aSurface *s, const Nv2aBatch *b)
+{
+    const Nv2aRenderState *rs = b->state;
+    uint32_t need = stages_needed(b), st;
+
+    for (st = 0; st < 4; st++)
+        if (need & (1u << st))
+            fs_read(FS_RT, b->stages[st].offset,
+                    b->stages[st].offset + nv2a_backend_texture_bytes(&b->stages[st]));
+    if (fs_blend_reads(rs))
+        fs_read(FS_RT, s->color_va, fs_surf_end(s));
+    fs_mark(FS_RT, s->color_va, fs_surf_end(s), fs_covers(s, b) ? FS_FULL : FS_WROTE);
+    if (b->kind == NV2A_BATCH_XF) {
+        if ((rs->depth_test_enable && rs->depth_func != 0x207) || rs->stencil_enable)
+            fs_read(FS_Z, rs->zeta_va, rs->zeta_va);
+        else if (rs->depth_write)
+            fs_mark(FS_Z, rs->zeta_va, rs->zeta_va, FS_WROTE);
+    }
+}
+
+static void fs_journal_reset(void)
+{
+    s_fs.used = 0;
+    s_fs.ops = 0;
+    s_fs.zpass = 0;
+    s_fs.njt = 0;
+    s_fs.jt_lost = 0;
+    s_fs.nhc = 0;
+}
+
+/* The hash of a stage's texture (palette included) from guest RAM, through
+ * the cache; 0 in *ok when it is not in guest memory a surface may read. */
+static uint64_t fs_tex_hash(const Nv2aTexture *t, int *ok)
+{
+    uint32_t bytes = nv2a_backend_texture_bytes(t);
+    uint64_t h;
+    int i;
+    *ok = 0;
+    if (!bytes || !nv2a_backend_surface_ok(t->offset, bytes))
+        return 0;
+    *ok = 1;
+    for (i = 0; i < s_fs.nhc; i++)
+        if (s_fs.hc[i].off == t->offset && s_fs.hc[i].bytes == bytes
+            && s_fs.hc[i].palette == t->palette && s_fs.hc[i].color == t->color)
+            return s_fs.hc[i].h;
+    h = tex_hash(t, bytes);
+    if (s_fs.nhc < FS_HCACHE) {
+        FsHash *e = &s_fs.hc[s_fs.nhc++];
+        e->off = t->offset; e->bytes = bytes; e->palette = t->palette; e->color = t->color;
+        e->h = h;
+    }
+    return h;
+}
+
+/* A stage drawn from a target (this window's work or an earlier one's), not
+ * from guest RAM: nothing to hash. */
+static int fs_tex_on_gpu(const Nv2aTexture *t)
+{
+    uint32_t lo = t->offset, hi = lo + nv2a_backend_texture_bytes(t);
+    int i;
+    for (i = 0; i < MAX_RTS; i++)
+        if (s_rt[i].used && ranges_overlap(s_rt[i].va, rt_end(&s_rt[i]), lo, hi))
+            return 1;
+    for (i = 0; i < s_fs.njt; i++)
+        if (s_fs.jt[i].kind == FS_RT && ranges_overlap(s_fs.jt[i].va, s_fs.jt[i].end, lo, hi))
+            return 1;
+    return 0;
+}
+
+static void fs_tex_changed(uint32_t va)
+{
+    int i;
+    s_fst.tex_changed++;
+    for (i = 0; i < s_fs.ntex_said; i++)
+        if (s_fs.tex_said[i] == va)
+            return;
+    if (s_fs.ntex_said < 64)
+        s_fs.tex_said[s_fs.ntex_said++] = va;
+    fprintf(stderr, "[GPURAST] frame skip: texture 0x%08X changed between a skipped frame and"
+                    " its drawing (a stale texture); drawn from what is there now\n", va);
+}
+
+/* Room for `bytes` (16-aligned) in the arena; NULL when it is full. */
+static uint8_t *fs_alloc(size_t bytes)
+{
+    bytes = (bytes + 15) & ~(size_t)15;
+    if (s_fs.used + bytes > FS_ARENA_MAX)
+        return NULL;
+    if (s_fs.used + bytes > s_fs.cap) {
+        size_t cap = s_fs.cap ? s_fs.cap : ((size_t)8 << 20);
+        uint8_t *p;
+        while (cap < s_fs.used + bytes)
+            cap *= 2;
+        if (cap > FS_ARENA_MAX)
+            cap = FS_ARENA_MAX;
+        p = (uint8_t *)realloc(s_fs.arena, cap);
+        if (!p)
+            return NULL;
+        s_fs.arena = p;
+        s_fs.cap = cap;
+    }
+    s_fs.used += bytes;
+    s_fst.logged++;
+    s_fst.logged_bytes += bytes;
+    s_fs.ops++;
+    return s_fs.arena + s_fs.used - bytes;
+}
+
+static void fs_jt(uint32_t kind, uint32_t va, uint32_t end)
+{
+    if (!fs_add(s_fs.jt, &s_fs.njt, kind, va, end, 0))
+        s_fs.jt_lost = 1;
+}
+
+static int fs_log_clear(const Nv2aSurface *s, const Nv2aRenderState *rs, uint32_t flags,
+                        uint32_t argb, uint32_t zs)
+{
+    FsClear *c = (FsClear *)fs_alloc(sizeof(FsClear));
+    if (!c)
+        return 0;
+    c->op.type = FS_OP_CLEAR;
+    c->op.bytes = (uint32_t)((sizeof(FsClear) + 15) & ~(size_t)15);
+    c->s = *s; c->rs = *rs; c->flags = flags; c->argb = argb; c->zs = zs;
+    if (flags & 0xF0)
+        fs_jt(FS_RT, s->color_va, fs_surf_end(s));
+    if (flags & 0x03)
+        fs_jt(FS_Z, rs->zeta_va, rs->zeta_va);
+    return 1;
+}
+
+#define FS_DRAW_HEAD (((sizeof(FsDraw) + 15) / 16) * 16)
+
+static int fs_log_draw(const Nv2aSurface *s, const Nv2aBatch *b)
+{
+    size_t vbytes = b->vertices_ex ? (size_t)b->count * VTX_BYTES : 0;
+    FsDraw *d = (FsDraw *)fs_alloc(FS_DRAW_HEAD + vbytes);
+    const Nv2aRenderState *rs = b->state;
+    if (!d)
+        return 0;
+    d->op.type = FS_OP_DRAW;
+    d->op.bytes = (uint32_t)((FS_DRAW_HEAD + vbytes + 15) & ~(size_t)15);
+    d->s = *s;
+    d->b = *b;
+    d->rs = *rs;
+    d->has_rc = b->rc != NULL;
+    if (b->rc)
+        d->rc = *b->rc;
+    if (vbytes)
+        memcpy((uint8_t *)d + FS_DRAW_HEAD, b->vertices_ex, vbytes);
+    d->hashed = 0;
+    d->window_no = s_fs.window_no;
+    d->flip_no = s_flip_no;
+    {
+        uint32_t need = stages_needed(b), st;
+        for (st = 0; st < 4; st++) {
+            int ok;
+            if (!(need & (1u << st)) || fs_tex_on_gpu(&b->stages[st]))
+                continue;
+            d->thash[st] = fs_tex_hash(&b->stages[st], &ok);
+            if (ok)
+                d->hashed |= 1u << st;
+        }
+    }
+    fs_jt(FS_RT, s->color_va, fs_surf_end(s));
+    if (b->kind == NV2A_BATCH_XF && (rs->depth_write || rs->stencil_enable))
+        fs_jt(FS_Z, rs->zeta_va, rs->zeta_va);
+    if (b->kind == NV2A_BATCH_XF && rs->zpass_enable)
+        s_fs.zpass = 1;
+    return 1;
+}
+
+/* The journal drawn, in order, as it was logged; the window goes on as SHOW. */
+static void fs_replay(int why)
+{
+    size_t off = 0;
+    uint32_t ops = s_fs.ops;
+
+    s_fs.replaying = 1;
+    s_fs.nhc = 0;                       /* hashes of what is in guest RAM now */
+    while (off < s_fs.used) {
+        FsOp *op = (FsOp *)(s_fs.arena + off);
+        if (op->type == FS_OP_CLEAR) {
+            FsClear *c = (FsClear *)op;
+            fs_track_clear(&c->s, &c->rs, c->flags);
+            exec_clear(&c->s, &c->rs, c->flags, c->argb, c->zs);
+        } else {
+            FsDraw *d = (FsDraw *)op;
+            Nv2aBatch b = d->b;
+            b.state = &d->rs;
+            b.rc = d->has_rc ? &d->rc : NULL;
+            b.vertices_ex = b.vertices_ex ? (const Nv2aVertexEx *)((uint8_t *)d + FS_DRAW_HEAD)
+                                          : NULL;
+            b.vertices = NULL;
+            b.texture = NULL;
+            if (d->hashed) {
+                uint32_t st;
+                for (st = 0; st < 4; st++) {
+                    int ok;
+                    if ((d->hashed & (1u << st))
+                        && fs_tex_hash(&b.stages[st], &ok) != d->thash[st]) {
+                        FS_TRACE("[FSKIP] stale texture 0x%08X (stage %u, fmt 0x%02X %ux%u) into"
+                                 " 0x%08X: logged in window %u at flip %u, drawn in window %u at"
+                                 " flip %u (%s)\n", b.stages[st].offset, st, b.stages[st].color,
+                                 b.stages[st].width, b.stages[st].height, d->s.color_va,
+                                 d->window_no, d->flip_no, s_fs.window_no, s_flip_no,
+                                 why == FSR_READY ? "shown after all" : why == FSR_OBSERVED
+                                 ? "observed" : why == FSR_NOTSELF ? "not self-contained"
+                                 : "arena full");
+                        fs_tex_changed(b.stages[st].offset);
+                    }
+                }
+            }
+            fs_track_draw(&d->s, &b);
+            exec_draw(&d->s, &b);
+        }
+        off += op->bytes;
+    }
+    s_fs.replaying = 0;
+    if (ops)
+        s_fst.replayed[why]++;
+    fs_journal_reset();
+    s_fs.mode = FS_SHOW;
+}
+
+/* The journal away; what it wrote is dropped until overwritten. */
+static void fs_drop(void)
+{
+    int i;
+    for (i = 0; i < s_fs.njt; i++)
+        fs_add(s_fs.dropped, &s_fs.ndropped, s_fs.jt[i].kind, s_fs.jt[i].va,
+               s_fs.jt[i].end, 0);
+    if (s_fs.ops)
+        s_fst.dropped_windows++;
+    fs_journal_reset();
+}
+
+/* Every target the journal writes was self-contained in the last SHOW window. */
+static int fs_journal_self_contained(void)
+{
+    int i;
+    if (s_fs.jt_lost) {
+        FS_TRACE("[FSKIP] window %u drawn: more than %d targets written\n", s_fs.window_no,
+                 FS_MAX_T);
+        return 0;
+    }
+    for (i = 0; i < s_fs.njt; i++)
+        if (fs_find(s_fs.selfc, s_fs.nselfc, s_fs.jt[i].kind, s_fs.jt[i].va) < 0) {
+            FS_TRACE("[FSKIP] window %u drawn: %s 0x%08X not self-contained in the last shown"
+                     " window (%s)\n", s_fs.window_no, s_fs.jt[i].kind == FS_Z ? "depth" : "colour",
+                     s_fs.jt[i].va, fs_find(s_fs.seen, s_fs.nseen, s_fs.jt[i].kind,
+                                            s_fs.jt[i].va) >= 0 ? "read before overwritten"
+                                                                 : "untouched there");
+            return 0;
+        }
+    return 1;
+}
+
+/* A boundary: the window that ends is committed (SHOW) or its journal is
+ * dropped or drawn; the next one starts in next_mode. A journal that cannot
+ * be dropped is drawn here even when the next window is skipped too: carried
+ * on, it would sample guest RAM textures windows later (the title's CPU goes
+ * on writing them). */
+static void fs_boundary(void)
+{
+    int i;
+    s_fs.armed = 0;
+    s_fs.window_no++;
+    if (s_fs.mode == FS_SHOW) {
+        memcpy(s_fs.seen, s_fs.win, sizeof s_fs.win);
+        s_fs.nseen = s_fs.nwin;
+        s_fs.nselfc = 0;
+        for (i = 0; i < s_fs.nwin; i++)
+            if (s_fs.win[i].cls == FS_FULL || s_fs.win[i].cls == FS_WROTE)
+                fs_add(s_fs.selfc, &s_fs.nselfc, s_fs.win[i].kind, s_fs.win[i].va,
+                       s_fs.win[i].end, s_fs.win[i].cls);
+    } else if (s_fs.ops) {
+        if (fs_journal_self_contained())
+            fs_drop();
+        else
+            fs_replay(FSR_NOTSELF);
+    }
+    s_fs.nwin = 0;
+    s_fs.mode = s_fs.next_mode;
+}
+
+/* Something reads the GPU's work in a SKIP window: draw the journal first. */
+static void fs_observe(void)
+{
+    if (s_fs.on && !s_fs.replaying && s_fs.mode == FS_SKIP && s_fs.ops)
+        fs_replay(FSR_OBSERVED);
+}
+
+static void fs_release(void)
+{
+    free(s_fs.arena);
+    memset(&s_fs, 0, sizeof s_fs);
+}
+
+static void gpu_clear(const Nv2aSurface *s, const Nv2aRenderState *rs,
+                      uint32_t flags, uint32_t argb, uint32_t zs)
+{
+    if (s_fs.on && !s_fs.replaying) {
+        if (s_fs.armed && (flags & 0xF0) == 0xF0 && fs_is_p(s->color_va) && fs_full_rect(s))
+            fs_boundary();
+        if (s_fs.mode == FS_SKIP) {
+            if (fs_log_clear(s, rs, flags, argb, zs))
+                return;
+            fs_replay(FSR_OVERFLOW);
+        }
+        fs_track_clear(s, rs, flags);
+    }
+    exec_clear(s, rs, flags, argb, zs);
+}
+
+static void gpu_draw(const Nv2aSurface *s, const Nv2aBatch *b)
+{
+    if (s_fs.on && !s_fs.replaying) {
+        if (s_fs.armed && fs_is_p(s->color_va) && fs_covers(s, b))
+            fs_boundary();
+        if (s_fs.mode == FS_SKIP) {
+            if (fs_log_draw(s, b))
+                return;
+            fs_replay(FSR_OVERFLOW);
+        }
+        fs_track_draw(s, b);
+    }
+    exec_draw(s, b);
+}
+
 /* ---- sync, reports, flips ----------------------------------------------- */
 
 static void gpu_sync(uint32_t reason)
@@ -2080,6 +2833,13 @@ static void gpu_sync(uint32_t reason)
 
     if (s_compare)
         return;
+    if (reason == NV2A_BACKEND_SYNC_READ || reason == NV2A_BACKEND_SYNC_PRESENT) {
+        fs_observe();
+        if (s_fs.on)
+            for (i = 0; i < MAX_RTS; i++)
+                if (s_rt[i].used && s_rt[i].dirty)
+                    fs_read(FS_RT, s_rt[i].va, rt_end(&s_rt[i]));
+    }
     /* Lazily: guest RAM gets the targets when something reads them there --
      * the presenter at a flip, the executor's dumps -- and, in gpu_draw, when
      * a stage samples one through guest RAM. The scan ends and the methods
@@ -2104,6 +2864,9 @@ static void gpu_sync_surface(uint32_t va, uint32_t bytes)
 
     if (s_compare)
         return;
+    fs_observe();
+    if (s_fs.on)
+        fs_read(FS_RT, va, va + bytes);
     for (i = 0; i < MAX_RTS; i++)
         if (s_rt[i].used && s_rt[i].dirty
             && ranges_overlap(s_rt[i].va, rt_end(&s_rt[i]), va, va + bytes)) {
@@ -2118,6 +2881,9 @@ static uint32_t gpu_report(void)
 
     if (s_compare)
         return 0;
+    /* A count from a draw only logged: draw the journal so it is real. */
+    if (s_fs.on && !s_fs.replaying && s_fs.mode == FS_SKIP && s_fs.zpass)
+        fs_replay(FSR_OBSERVED);
     GPROF_HOST(GPH_REPORTS, 1);
     query_resolve_all();
     n = s_zpass_acc / ((uint64_t)s_sx * s_sy * s_msaa);
@@ -2300,7 +3066,7 @@ static void gpu_flip(void)
     if (!s_st.last_tick)
         s_st.last_tick = now;
     if (now - s_st.last_tick >= 10000) {
-        char line[768];
+        char line[1536];
         TextBlock tb;
         text_block_init(&tb, line, sizeof line, stderr);
         text_block_printf(&tb, "[GPURAST] %.1fs: flips %u, draws %u, writebacks %u (%.1f MB),"
@@ -2314,6 +3080,32 @@ static void gpu_flip(void)
                 s_st.decodes, s_st.bc_uploads, s_st.rt_tex, s_st.presents, s_st.stall_ms,
                 s_st.wb_why[0], s_st.wb_why[1], s_st.wb_why[2], s_st.wb_why[3],
                 s_st.taken);
+        if (s_fs.on) {
+            FsStats d = s_fst, o = s_fst_said;
+            text_block_printf(&tb, "[GPURAST] frame skip: shown %u, skipped %u, not ready %u"
+                            " (presenter %u / gpu %u), logged ops %u (%.1f MB over the"
+                            " period, arena %.1f MB), windows"
+                            " dropped %u, replayed %u (ready %u / observed %u / not"
+                            " self-contained %u / arena full %u), mispredicted %u (shown"
+                            " a skipped window %u, drew a hidden one %u), stale reads %u,"
+                            " stale textures %u\n",
+                    d.shown - o.shown, d.skipped - o.skipped,
+                    d.nr_presenter + d.nr_gpu - o.nr_presenter - o.nr_gpu,
+                    d.nr_presenter - o.nr_presenter, d.nr_gpu - o.nr_gpu,
+                    d.logged - o.logged, (double)(d.logged_bytes - o.logged_bytes) / 1048576.0,
+                    (double)s_fs.cap / 1048576.0,
+                    d.dropped_windows - o.dropped_windows,
+                    d.replayed[0] + d.replayed[1] + d.replayed[2] + d.replayed[3]
+                    - o.replayed[0] - o.replayed[1] - o.replayed[2] - o.replayed[3],
+                    d.replayed[0] - o.replayed[0], d.replayed[1] - o.replayed[1],
+                    d.replayed[2] - o.replayed[2], d.replayed[3] - o.replayed[3],
+                    d.mispredicted_skip + d.mispredicted_show
+                    - o.mispredicted_skip - o.mispredicted_show,
+                    d.mispredicted_skip - o.mispredicted_skip,
+                    d.mispredicted_show - o.mispredicted_show, d.stale - o.stale,
+                    d.tex_changed - o.tex_changed);
+            s_fst_said = s_fst;
+        }
         text_block_flush(&tb);
         memset(&s_st, 0, sizeof s_st);
         s_st.last_tick = now;
@@ -2334,6 +3126,7 @@ static void release_all(void)
     int i;
     nv2a_gprof_release();               /* its queries first: some may be out */
     pscheck_release();
+    fs_release();                       /* the journal: nothing of it is drawn now */
 #ifdef NV2A_GPU_TEST_HOOKS
     s_ps_override = NULL;
     REL(s_ps_ovr_cache);
@@ -2468,35 +3261,29 @@ static int make_ps(const void *code, size_t len, const char *name, ID3D11PixelSh
  * executor's dumps, a texture decoded from it, a target being dropped).
  * RECOMP_GPU_RASTER_PRESENT=0 keeps the window on GDI and guest RAM. The
  * swap chain is created the way upstream gpu_present.c (MIT) creates its
- * own; Present runs on this thread, the window's messages on its own. */
+ * own; Present runs on this thread, the window's messages on its own.
+ *
+ * With RECOMP_FRAME_SKIP=auto the chain is a flip-model one (FLIP_DISCARD,
+ * two buffers) with a frame latency waitable object at latency 2
+ * (RECOMP_GPU_RASTER_FRAME_LATENCY; at 1 a slow GPU frame missed the next
+ * flip's waitable with no limiter at all): pace()
+ * shows a frame only when the waitable is signalled -- the chain takes a
+ * frame without blocking -- and the GPU has finished the last shown one (a
+ * D3D11_QUERY_EVENT after each Present). An outside limiter (gamescope's FIFO
+ * on Steam Deck, NVIDIA's Max Frame Rate, RTSS) then holds back the shows,
+ * not the executor: the frames in between are skipped. No thread of its own:
+ * DXGI must not run beside the immediate context, and DXVK keeps the context
+ * locked through part of Present (stage3 docs-report). GDI cannot draw into a
+ * flip-model window, so a frame that is only in guest RAM (a Bink movie, a
+ * loading screen the CPU drew) goes up into a texture and through the same
+ * shader. Without the flip model or the waitable (an old system, an error)
+ * auto falls back to this bitblt chain and the cadence alone. Frame skip 0
+ * and 1 keep the bitblt chain. */
 #define PRESENT_W 640
 #define PRESENT_H 480
 
-/* The back buffer is the window's client area; the 640x480 frame is drawn
- * into the rectangle xbox_FramebufferWindowFit gives (the display aspect,
- * bars around it), bilinear between the target's texels -- exactly the
- * frame's pixels when the rectangle is the target's size. vp: the rectangle;
- * fs: the frame in texels of what is drawn: the target, or s_ss under SSAA
- * (640x480 times a 2x-wide anti-aliased surface's 2, aa_sy and the scale). */
-static const char s_present_hlsl[] =
-"Texture2DArray<float4> src : register(t0);\n"
-"cbuffer P : register(b2) { float4 pk; float4 vp; float4 fs; };\n"
-"float4 pvs(uint i : SV_VertexID) : SV_Position {\n"
-"    float2 q = float2((i << 1) & 2, i & 2);\n"
-"    return float4(q * float2(2, -2) + float2(-1, 1), 0, 1);\n"
-"}\n"
-"float3 tap(int2 c) {\n"
-"    c = clamp(c, int2(0, 0), int2(fs.xy) - 1);\n"
-"    return src.Load(int4(c, 0, 0)).rgb;\n"
-"}\n"
-"float4 pps(float4 p : SV_Position) : SV_Target {\n"
-"    float2 s = (p.xy - vp.xy) / vp.zw * fs.xy - 0.5;\n"
-"    int2 i = int2(floor(s));\n"
-"    float2 f = s - floor(s);\n"
-"    float3 a = lerp(tap(i), tap(i + int2(1, 0)), f.x);\n"
-"    float3 b = lerp(tap(i + int2(0, 1)), tap(i + int2(1, 1)), f.x);\n"
-"    return float4(lerp(a, b, f.y), 1.0);\n"
-"}\n";
+/* The present shader (pvs/pps in nv2a_gpu_shaders.hlsl, k_pvs/k_pps): the
+ * frame bilinear into the rectangle, as described there. */
 
 static int s_present_on = 1, s_present_failed;
 static void write_bmp(const char *path, const uint32_t *argb, uint32_t w, uint32_t h);
@@ -2550,6 +3337,21 @@ static uint32_t s_bb_w, s_bb_h;          /* back buffer = the client area */
 static ID3D11VertexShader *s_pvs;
 static ID3D11PixelShader *s_pps;
 static ID3D11Buffer *s_cb_present;
+static int s_fs_auto;                    /* RECOMP_FRAME_SKIP=auto: a flip-model chain */
+static int s_flip_model;                 /* the chain is FLIP_DISCARD with a waitable */
+static HANDLE s_waitable;                /* its frame latency waitable object */
+static int s_have_token;                 /* the waitable was taken, nothing presented on it */
+static ID3D11Query *s_present_ev;        /* D3D11_QUERY_EVENT after the last shown frame */
+static int s_present_ev_issued;          /* ... ended at least once: one never issued is ready */
+static ID3D11Texture2D *s_gdi_tex;       /* a guest RAM frame, for the flip-model chain */
+static ID3D11ShaderResourceView *s_gdi_srv;
+static double s_present_hz;              /* RECOMP_GPU_RASTER_PRESENT_HZ: a limiter acted out */
+static double s_hz_slot_now, s_hz_slot_shown = -1.0;   /* its slots: now, the last shown */
+#ifdef NV2A_GPU_TEST_HOOKS
+static int s_test_gate = -1;             /* nv2a_gpu_test_present_gate: -1 the real one */
+static int s_test_gpu_busy;              /* nv2a_gpu_test_gpu_busy */
+static int s_test_present_delay_ms;      /* nv2a_gpu_test_present_delay */
+#endif
 
 static void client_size(HWND hwnd, uint32_t *w, uint32_t *h)
 {
@@ -2563,15 +3365,62 @@ static void client_size(HWND hwnd, uint32_t *w, uint32_t *h)
     *h = (uint32_t)cr.bottom;
 }
 
+/* The flip-model chain with its waitable; 0 (and nothing made) when either
+ * cannot be had. */
+static int present_setup_flip(IDXGIFactory *xf, HWND hwnd)
+{
+    DXGI_SWAP_CHAIN_DESC sd;
+    IDXGISwapChain2 *c2 = NULL;
+    HRESULT hr;
+
+    memset(&sd, 0, sizeof sd);
+    sd.BufferDesc.Width = s_bb_w;
+    sd.BufferDesc.Height = s_bb_h;
+    sd.BufferDesc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    sd.SampleDesc.Count = 1;
+    sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+    sd.BufferCount = 2;
+    sd.OutputWindow = hwnd;
+    sd.Windowed = TRUE;
+    sd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+    sd.Flags = DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
+    hr = IDXGIFactory_CreateSwapChain(xf, (IUnknown *)s_dev, &sd, &s_chain);
+    if (SUCCEEDED(hr))
+        hr = IDXGISwapChain_QueryInterface(s_chain, &IID_IDXGISwapChain2, (void **)&c2);
+    if (SUCCEEDED(hr)) {
+        /* RECOMP_GPU_RASTER_FRAME_LATENCY=<1-3> (default 2): frames the chain may
+         * hold. At 1 a frame whose GPU work plus the compositor's next vblank
+         * outlasts a flip period (6x5 + MSAA 2 in a 143 Hz window: 465-582 of
+         * 600 shown) keeps the waitable unsignalled at the next flip, and auto
+         * skipped frames with no limiter at all; at 2, 593-600 of 600. The
+         * price: a frame more in the queue, only when the GPU is slower than a
+         * flip period; an outside limiter still fills the queue and shows. */
+        const char *fl = getenv("RECOMP_GPU_RASTER_FRAME_LATENCY");
+        UINT lat = fl ? (UINT)atoi(fl) : 2;
+        IDXGISwapChain2_SetMaximumFrameLatency(c2, lat < 1 ? 1 : lat > 3 ? 3 : lat);
+        s_waitable = IDXGISwapChain2_GetFrameLatencyWaitableObject(c2);
+        REL(c2);
+    }
+    if (SUCCEEDED(hr) && s_waitable) {
+        s_flip_model = 1;
+        return 1;
+    }
+    fprintf(stderr, "[GPURAST] frame skip auto: no flip-model swap chain with a waitable"
+                    " (0x%08lX); auto is off, the frames are shown by the cadence alone\n",
+            (unsigned long)hr);
+    REL(s_chain);
+    return 0;
+}
+
 static int present_setup(HWND hwnd)
 {
     DXGI_SWAP_CHAIN_DESC sd;
     D3D11_BUFFER_DESC bd;
+    D3D11_QUERY_DESC qd;
     IDXGIDevice *xd = NULL;
     IDXGIAdapter *xa = NULL;
     IDXGIFactory *xf = NULL;
     ID3D11Texture2D *back = NULL;
-    ID3DBlob *vs = NULL, *ps = NULL;
     int ok = 0;
 
     if (FAILED(ID3D11Device_QueryInterface(s_dev, &IID_IDXGIDevice, (void **)&xd))
@@ -2583,30 +3432,27 @@ static int present_setup(HWND hwnd)
         s_bb_w = PRESENT_W;
         s_bb_h = PRESENT_H;
     }
-    memset(&sd, 0, sizeof sd);
-    sd.BufferDesc.Width = s_bb_w;
-    sd.BufferDesc.Height = s_bb_h;
-    sd.BufferDesc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
-    sd.SampleDesc.Count = 1;
-    sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
-    sd.BufferCount = 1;
-    sd.OutputWindow = hwnd;
-    sd.Windowed = TRUE;
-    sd.SwapEffect = DXGI_SWAP_EFFECT_DISCARD;
-    if (FAILED(IDXGIFactory_CreateSwapChain(xf, (IUnknown *)s_dev, &sd, &s_chain)))
-        goto done;
+    if (!(s_fs_auto && present_setup_flip(xf, hwnd))) {
+        memset(&sd, 0, sizeof sd);
+        sd.BufferDesc.Width = s_bb_w;
+        sd.BufferDesc.Height = s_bb_h;
+        sd.BufferDesc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        sd.SampleDesc.Count = 1;
+        sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+        sd.BufferCount = 1;
+        sd.OutputWindow = hwnd;
+        sd.Windowed = TRUE;
+        sd.SwapEffect = DXGI_SWAP_EFFECT_DISCARD;
+        if (FAILED(IDXGIFactory_CreateSwapChain(xf, (IUnknown *)s_dev, &sd, &s_chain)))
+            goto done;
+    }
     IDXGIFactory_MakeWindowAssociation(xf, hwnd, DXGI_MWA_NO_ALT_ENTER);
     if (FAILED(IDXGISwapChain_GetBuffer(s_chain, 0, &IID_ID3D11Texture2D, (void **)&back))
         || FAILED(ID3D11Device_CreateRenderTargetView(s_dev, (ID3D11Resource *)back, NULL,
                                                       &s_bb_rtv)))
         goto done;
-    vs = compile_src(s_present_hlsl, sizeof s_present_hlsl - 1, "pvs", "vs_4_0");
-    ps = compile_src(s_present_hlsl, sizeof s_present_hlsl - 1, "pps", "ps_4_0");
-    if (!vs || !ps
-        || FAILED(ID3D11Device_CreateVertexShader(s_dev, ID3D10Blob_GetBufferPointer(vs),
-                                                  ID3D10Blob_GetBufferSize(vs), NULL, &s_pvs))
-        || FAILED(ID3D11Device_CreatePixelShader(s_dev, ID3D10Blob_GetBufferPointer(ps),
-                                                 ID3D10Blob_GetBufferSize(ps), NULL, &s_pps)))
+    if (FAILED(ID3D11Device_CreateVertexShader(s_dev, k_pvs, sizeof k_pvs, NULL, &s_pvs))
+        || !make_ps(k_pps, sizeof k_pps, "pps", &s_pps))
         goto done;
     memset(&bd, 0, sizeof bd);
     bd.ByteWidth = 48;
@@ -2615,12 +3461,18 @@ static int present_setup(HWND hwnd)
     bd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
     if (FAILED(ID3D11Device_CreateBuffer(s_dev, &bd, NULL, &s_cb_present)))
         goto done;
+    if (s_fs_auto && !s_present_ev) {   /* only readiness reads it: 0/1 as before */
+        s_present_ev_issued = 0;
+        qd.Query = D3D11_QUERY_EVENT;
+        qd.MiscFlags = 0;
+        if (FAILED(ID3D11Device_CreateQuery(s_dev, &qd, &s_present_ev)))
+            s_present_ev = NULL;
+    }
     ok = 1;
-    fprintf(stderr, "[GPURAST] presenting into the framebuffer window from the GPU\n");
+    fprintf(stderr, "[GPURAST] presenting into the framebuffer window from the GPU%s\n",
+            s_flip_model ? " (flip model, waitable, RECOMP_GPU_RASTER_FRAME_LATENCY frames)" : "");
 done:
     REL(back);
-    REL(vs);
-    REL(ps);
     REL(xf);
     REL(xa);
     REL(xd);
@@ -2629,106 +3481,115 @@ done:
 
 static void present_release(void)
 {
+    REL(s_gdi_srv);
+    REL(s_gdi_tex);
+    REL(s_present_ev);
+    s_present_ev_issued = 0;
     REL(s_cb_present);
     REL(s_pps);
     REL(s_pvs);
     REL(s_bb_rtv);
     REL(s_chain);
+    if (s_waitable)
+        CloseHandle(s_waitable);
+    s_waitable = NULL;
+    s_flip_model = 0;
+    s_have_token = 0;
 }
 
-static int gpu_present(uint32_t va, uint32_t pitch, uint32_t aa_sy)
+/* A frame that is only in guest RAM (640x480 at va: 32-bit, a 2x-wide
+ * anti-aliased 32-bit surface read every other pixel and every aa_sy-th row,
+ * or R5G6B5) into s_gdi_tex, as fb_present.c's GDI path reads it. */
+static int gdi_upload(uint32_t va, uint32_t pitch, uint32_t aa_sy)
+{
+    uint32_t bpp = pitch / PRESENT_W, x, y, rows = PRESENT_H * (bpp == 8 ? aa_sy : 1);
+    uint32_t *buf = scratch((size_t)PRESENT_W * PRESENT_H);
+
+    if (!buf || (bpp != 2 && bpp != 4 && bpp != 8)
+        || !nv2a_backend_surface_ok(va, rows * pitch))
+        return 0;
+    if (!s_gdi_tex) {
+        D3D11_TEXTURE2D_DESC td;
+        D3D11_SHADER_RESOURCE_VIEW_DESC vd;
+        memset(&td, 0, sizeof td);
+        td.Width = PRESENT_W; td.Height = PRESENT_H; td.MipLevels = 1; td.ArraySize = 1;
+        td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        td.SampleDesc.Count = 1;
+        td.Usage = D3D11_USAGE_DEFAULT;
+        td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        memset(&vd, 0, sizeof vd);
+        vd.Format = td.Format;
+        vd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2DARRAY;
+        vd.Texture2DArray.MipLevels = 1;
+        vd.Texture2DArray.ArraySize = 1;
+        if (FAILED(ID3D11Device_CreateTexture2D(s_dev, &td, NULL, &s_gdi_tex))
+            || FAILED(ID3D11Device_CreateShaderResourceView(s_dev, (ID3D11Resource *)s_gdi_tex,
+                                                            &vd, &s_gdi_srv))) {
+            REL(s_gdi_srv);
+            REL(s_gdi_tex);
+            return 0;
+        }
+    }
+    for (y = 0; y < PRESENT_H; y++) {
+        const uint8_t *row = guest(va) + (size_t)y * pitch * (bpp == 8 ? aa_sy : 1);
+        uint32_t *dst = buf + (size_t)y * PRESENT_W;
+        for (x = 0; x < PRESENT_W; x++)
+            dst[x] = bpp == 4 ? ((const uint32_t *)row)[x]
+                   : bpp == 8 ? ((const uint32_t *)row)[x * 2]
+                   : expand565(((const uint16_t *)row)[x]);
+    }
+    ID3D11DeviceContext_UpdateSubresource(s_ctx, (ID3D11Resource *)s_gdi_tex, 0, NULL, buf,
+                                          PRESENT_W * 4, 0);
+    return 1;
+}
+
+/* What the shader shows (`src`, the frame fsw x fsh texels of it) into the
+ * window, and Present. 0: the chain is gone (the guest RAM path takes over). */
+static int present_frame(HWND hwnd, ID3D11ShaderResourceView *src, float fsw, float fsh)
 {
     static const float zero[4] = { 0, 0, 0, 0 };
     D3D11_MAPPED_SUBRESOURCE m;
     D3D11_VIEWPORT vp;
     D3D11_RECT rc;
-    GpuRt *r = NULL;
-    ID3D11ShaderResourceView *src;
-    HWND hwnd;
     float pk[12];
     int32_t fit[4];
-    int i;
+    uint32_t cw, ch;
 
-    if (s_compare || !s_present_on || s_present_failed)
-        return 0;
-    for (i = 0; i < MAX_RTS; i++)
-        if (s_rt[i].used && s_rt[i].va == va && s_rt[i].pitch == pitch) {
-            r = &s_rt[i];
-            break;
-        }
-    if (!r) {                           /* not drawn here: the guest RAM path */
-        if (s_chain)
-            xbox_FramebufferWindowExternal(0);
-        return 0;
-    }
-    hwnd = (HWND)xbox_FramebufferWindowHandle();
-    if (!hwnd) {                        /* headless: nothing to show to */
-        if (getenv("RECOMP_FB_WINDOW"))
-            return 0;
-        if (rt_check(r)) {
-            uint32_t sx = pitch / (PRESENT_W * r->bpp);
-            present_dump(r, sx ? sx : 1, aa_sy ? aa_sy : 1);
-        }
+    /* The back buffer follows the window: resized, maximised, F11. */
+    client_size(hwnd, &cw, &ch);
+    if (!cw)                            /* minimised: nothing to draw into */
         return 1;
-    }
-    if (!s_chain && !present_setup(hwnd)) {
-        fprintf(stderr, "[GPURAST] no swap chain on the window; presenting through"
-                        " guest RAM\n");
-        present_release();
-        s_present_failed = 1;
-        return 0;
-    }
-    if (!rt_check(r))                   /* clean: catch up with CPU writes first */
-        return 0;
-    xbox_FramebufferWindowExternal(1);
-    {
-        /* The back buffer follows the window: resized, maximised, F11. */
-        uint32_t cw, ch;
-        client_size(hwnd, &cw, &ch);
-        if (!cw)                        /* minimised: nothing to draw into */
-            return 1;
-        if (cw != s_bb_w || ch != s_bb_h) {
-            ID3D11Texture2D *back = NULL;
-            ID3D11DeviceContext_OMSetRenderTargets(s_ctx, 0, NULL, NULL);
-            REL(s_bb_rtv);
-            if (FAILED(IDXGISwapChain_ResizeBuffers(s_chain, 0, cw, ch,
-                                                    DXGI_FORMAT_UNKNOWN, 0))
-                || FAILED(IDXGISwapChain_GetBuffer(s_chain, 0, &IID_ID3D11Texture2D,
-                                                   (void **)&back))
-                || FAILED(ID3D11Device_CreateRenderTargetView(s_dev, (ID3D11Resource *)back,
-                                                              NULL, &s_bb_rtv))) {
-                REL(back);
-                fprintf(stderr, "[GPURAST] swap chain resize to %ux%u failed; presenting"
-                                " through guest RAM\n", cw, ch);
-                present_release();
-                s_present_failed = 1;
-                xbox_FramebufferWindowExternal(0);
-                bind_pipeline();
-                return 0;
-            }
+    if (cw != s_bb_w || ch != s_bb_h) {
+        ID3D11Texture2D *back = NULL;
+        ID3D11DeviceContext_OMSetRenderTargets(s_ctx, 0, NULL, NULL);
+        REL(s_bb_rtv);
+        if (s_flip_model)               /* every reference to the buffers gone first */
+            ID3D11DeviceContext_Flush(s_ctx);
+        if (FAILED(IDXGISwapChain_ResizeBuffers(s_chain, 0, cw, ch, DXGI_FORMAT_UNKNOWN,
+                       s_flip_model ? DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT : 0))
+            || FAILED(IDXGISwapChain_GetBuffer(s_chain, 0, &IID_ID3D11Texture2D,
+                                               (void **)&back))
+            || FAILED(ID3D11Device_CreateRenderTargetView(s_dev, (ID3D11Resource *)back,
+                                                          NULL, &s_bb_rtv))) {
             REL(back);
-            s_bb_w = cw;
-            s_bb_h = ch;
+            fprintf(stderr, "[GPURAST] swap chain resize to %ux%u failed; presenting"
+                            " through guest RAM\n", cw, ch);
+            present_release();
+            s_present_failed = 1;
+            xbox_FramebufferWindowExternal(0);
+            bind_pipeline();
+            return 0;
         }
+        REL(back);
+        s_bb_w = cw;
+        s_bb_h = ch;
     }
     xbox_FramebufferWindowFit(s_bb_w, s_bb_h, fit);
-    pk[0] = (float)(pitch / (PRESENT_W * r->bpp) ? pitch / (PRESENT_W * r->bpp) : 1);
-    pk[1] = (float)(aa_sy ? aa_sy : 1);
-    pk[2] = pk[3] = 0.0f;
+    memset(pk, 0, sizeof pk);
     pk[4] = (float)fit[0]; pk[5] = (float)fit[1];
     pk[6] = (float)fit[2]; pk[7] = (float)fit[3];
-    pk[8] = (float)PRESENT_W * pk[0] * (float)s_ox;
-    pk[9] = (float)PRESENT_H * pk[1] * (float)s_oy;
-    rt_resolve(r);
-    src = r->srv;
-    if (s_ssaa > 1) {                   /* before the presenter takes over the pipeline */
-        ssaa_reduce(r, (uint32_t)pk[8], (uint32_t)pk[9]);
-        src = s_ss_srv;
-    }
-    pk[10] = pk[11] = 0.0f;
-    if (g_nv2a_gprof_on)
-        nv2a_gprof_target(r->va, r->W, r->H, r->swizzled);
-    GPROF_MARK(GP_PRESENT, r->va);
+    pk[8] = fsw;
+    pk[9] = fsh;
     if (SUCCEEDED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)s_cb_present, 0,
                                           D3D11_MAP_WRITE_DISCARD, 0, &m))) {
         memcpy(m.pData, pk, sizeof pk);
@@ -2755,13 +3616,270 @@ static int gpu_present(uint32_t va, uint32_t pitch, uint32_t aa_sy)
     GPROF_MARK(GP_SWAP, 0);
     {
         double t0 = g_nv2a_gprof_on ? now_ms() : 0.0;
+        int gated = 0;
+#ifdef NV2A_GPU_TEST_HOOKS
+        gated = s_test_gate >= 0;
+#endif
+        /* Frame skip 0/1 on a flip-model chain (auto without pace, the limit
+         * off): wait for room as the bitblt chain's Present did. pace() took
+         * the waitable already when it showed this frame. */
+        if (s_flip_model && !s_have_token && !gated && s_waitable)
+            WaitForSingleObject(s_waitable, 100);
         IDXGISwapChain_Present(s_chain, 0, 0);
+#ifdef NV2A_GPU_TEST_HOOKS
+        if (s_test_present_delay_ms > 0)    /* a Present that blocks, as RTSS's or a */
+            Sleep((DWORD)s_test_present_delay_ms);   /* driver limiter's does; WARP never */
+#endif
+        s_have_token = 0;
         GPROF_HOST(GPH_PRESENT_MS, now_ms() - t0);
     }
-    present_dump(r, (uint32_t)pk[0], (uint32_t)pk[1]);
+    if (s_present_ev) {                 /* auto only (present_setup) */
+        ID3D11DeviceContext_End(s_ctx, (ID3D11Asynchronous *)s_present_ev);
+        ID3D11DeviceContext_Flush(s_ctx);
+        s_present_ev_issued = 1;
+    }
+    xbox_FramebufferWindowShown();
+    return 1;
+}
+
+static int gpu_present(uint32_t va, uint32_t pitch, uint32_t aa_sy)
+{
+    GpuRt *r = NULL;
+    ID3D11ShaderResourceView *src;
+    HWND hwnd;
+    uint32_t sx, sy;
+    int i;
+
+    if (s_compare || !s_present_on || s_present_failed)
+        return 0;
+    fs_observe();                       /* not in a SKIP window: pace() replays first */
+    for (i = 0; i < MAX_RTS; i++)
+        if (s_rt[i].used && s_rt[i].va == va && s_rt[i].pitch == pitch) {
+            r = &s_rt[i];
+            break;
+        }
+    if (!r) {                           /* not drawn here: the guest RAM path */
+        hwnd = (HWND)xbox_FramebufferWindowHandle();
+        /* auto: the window is the flip-model chain's from the first frame on,
+         * a movie before anything was drawn included -- GDI and a flip-model
+         * chain do not share a window. */
+        if (s_fs_auto && !s_chain && hwnd && !present_setup(hwnd)) {
+            fprintf(stderr, "[GPURAST] no swap chain on the window; presenting through"
+                            " guest RAM\n");
+            present_release();
+            s_present_failed = 1;
+            return 0;
+        }
+        if (s_chain && s_flip_model) {
+            /* GDI cannot draw into a flip-model window: the frame goes up. */
+            if (hwnd && gdi_upload(va, pitch, aa_sy ? aa_sy : 1)) {
+                xbox_FramebufferWindowExternal(1);
+                xbox_FramebufferWindowPresent(va, pitch);   /* the window's own copy (dumps) */
+                if (present_frame(hwnd, s_gdi_srv, (float)PRESENT_W, (float)PRESENT_H)) {
+                    bind_pipeline();
+                    s_st.presents++;
+                    return 1;
+                }
+            }
+            return 0;
+        }
+        if (s_chain)
+            xbox_FramebufferWindowExternal(0);
+        return 0;
+    }
+    hwnd = (HWND)xbox_FramebufferWindowHandle();
+    if (!hwnd) {                        /* headless: nothing to show to */
+        if (getenv("RECOMP_FB_WINDOW"))
+            return 0;
+        if (rt_check(r)) {
+            sx = pitch / (PRESENT_W * r->bpp);
+            present_dump(r, sx ? sx : 1, aa_sy ? aa_sy : 1);
+        }
+        return 1;
+    }
+    if (!s_chain && !present_setup(hwnd)) {
+        fprintf(stderr, "[GPURAST] no swap chain on the window; presenting through"
+                        " guest RAM\n");
+        present_release();
+        s_present_failed = 1;
+        return 0;
+    }
+    if (!rt_check(r))                   /* clean: catch up with CPU writes first */
+        return 0;
+    xbox_FramebufferWindowExternal(1);
+    sx = pitch / (PRESENT_W * r->bpp) ? pitch / (PRESENT_W * r->bpp) : 1;
+    sy = aa_sy ? aa_sy : 1;
+    rt_resolve(r);
+    src = r->srv;
+    if (s_ssaa > 1) {                   /* before the presenter takes over the pipeline */
+        ssaa_reduce(r, PRESENT_W * sx * s_ox, PRESENT_H * sy * s_oy);
+        src = s_ss_srv;
+    }
+    if (g_nv2a_gprof_on)
+        nv2a_gprof_target(r->va, r->W, r->H, r->swizzled);
+    GPROF_MARK(GP_PRESENT, r->va);
+    if (!present_frame(hwnd, src, (float)(PRESENT_W * sx * s_ox), (float)(PRESENT_H * sy * s_oy)))
+        return 0;
+    present_dump(r, sx, sy);
     bind_pipeline();
     s_st.presents++;
     return 1;
+}
+
+/* auto: can the chain take a frame now without anyone waiting? The GPU has
+ * finished the last shown frame (its event) and the waitable is signalled --
+ * taken here, so it is kept (s_have_token) until a Present uses it. why: 1
+ * the presenter, 2 the GPU. */
+static int present_ready(int *why)
+{
+    int busy = 0;
+#ifdef NV2A_GPU_TEST_HOOKS
+    busy = s_test_gpu_busy;
+#endif
+    if (s_chain && !s_flip_model) {     /* the bitblt chain: auto is off */
+        static int said;
+        if (!said++)
+            fprintf(stderr, "[GPURAST] frame skip auto without a flip-model chain: shown by"
+                            " the cadence alone\n");
+        return 1;
+    }
+    /* The presenter first: a waitable taken while the GPU is still busy is
+     * kept for the next try, not lost. A test's gate stands in for the
+     * waitable only. */
+#ifdef NV2A_GPU_TEST_HOOKS
+    if (s_test_gate == 0) {
+        *why = 1;
+        return 0;
+    }
+#endif
+    if (s_present_hz > 0.0) {
+        /* A limiter at hz, acted out: time cut into 1/hz slots of the host's
+         * clock, one show a slot, the slot counted when pace() decides (not
+         * when Present returns, later: that lost a slot in four at 45). */
+        s_hz_slot_now = floor(now_ms() * s_present_hz / 1000.0);
+        if (s_hz_slot_shown >= 0.0 && s_hz_slot_now <= s_hz_slot_shown) {
+            *why = 1;
+            return 0;
+        }
+    }
+#ifdef NV2A_GPU_TEST_HOOKS
+    if (s_test_gate < 0)
+#endif
+    {
+        if (s_waitable && !s_have_token) {
+            if (WaitForSingleObject(s_waitable, 0) != WAIT_OBJECT_0) {
+                *why = 1;
+                return 0;
+            }
+            s_have_token = 1;
+        }
+    }
+    if (busy || (s_present_ev && s_present_ev_issued
+                 && ID3D11DeviceContext_GetData(s_ctx, (ID3D11Asynchronous *)s_present_ev,
+                                                NULL, 0, D3D11_ASYNC_GETDATA_DONOTFLUSH)
+                    != S_OK)) {
+        *why = 2;
+        return 0;
+    }
+    return 1;
+}
+
+/* The executor's frame skip asks at each flip whether it is shown; see
+ * "frame skip" above. Shown: the cadence wants it and (auto) the chain can
+ * take it now. A window that was logged is drawn first. The forecast for the
+ * next window: the cadence, and with auto the presenter as a rate R (shows a
+ * tick over the last 64 flips the cadence wanted shown: 0.75 under a limit
+ * of 45, 1 with none; an average that leans on recent flips swings with 1-1-2) and a credit in its phase -- R a tick accrues, a show spends
+ * one, and a flip it holds back says the credit is just short of one. The next
+ * window is expected shown when the credit by its flip reaches one. An EMA of
+ * the interval between shows forecast this before: at 45 the intervals go
+ * 1-1-2, the EMA swung between them, and a window that was then shown was
+ * often logged and drawn at the flip ("shown a skipped window", 150 in 10 s),
+ * which in turn held the next show back on the GPU. */
+#define FS_CREDIT_EDGE 0.05
+static int gpu_pace(uint32_t va, uint64_t tick, int cad, int cad_next)
+{
+    int ready = 1, why = 0, show, next;
+    uint64_t gap;
+
+    if (!s_fs.on) {
+        const char *e = getenv("RECOMP_GPU_RASTER_PRESENT_HZ");
+        s_fs.on = 1;
+        s_fs.first_pace = 1;
+        s_fs.mode = s_fs.next_mode = FS_SHOW;
+        s_fs.R = 1.0;
+        s_fs.credit = 1.0;
+        s_present_hz = e ? atof(e) : 0.0;
+        fprintf(stderr, "[GPURAST] frame skip on (%s)%s\n",
+                s_fs_auto ? "auto: shown when the chain can take a frame" : "the cadence",
+                s_present_hz > 0.0 ? ", a presenter limited by RECOMP_GPU_RASTER_PRESENT_HZ" : "");
+    }
+    /* P: what this flip showed, and what the one before showed -- the same
+     * surface for a single-buffered title (Fallout), the two buffers in turn
+     * for a double-buffered one. Not the last two different ones: a surface
+     * shown once (Carbon's loading screen) would stay P for good, and the
+     * filter that overwrites it every frame became a second boundary. */
+    s_fs.pva[1] = s_fs.pva[0];
+    s_fs.pva[0] = va;
+    s_fs.armed = 1;
+    gap = s_fs.k_prev && tick > s_fs.k_prev ? tick - s_fs.k_prev : 1;
+    if (cad && s_fs_auto) {
+        ready = present_ready(&why);
+        s_fs.credit += (double)gap * s_fs.R;
+        if (s_fs.credit > 1.0 + s_fs.R)
+            s_fs.credit = 1.0 + s_fs.R;   /* a limiter banks no shows */
+    }
+    show = cad && ready;
+    if (show) {
+        if (s_present_hz > 0.0 && s_fs_auto)
+            s_hz_slot_shown = s_hz_slot_now;
+        if (s_fs.mode == FS_SKIP) {     /* forecast wrong: draw what was logged */
+            s_fst.mispredicted_skip++;
+            fs_replay(FSR_READY);
+        }
+        fs_read(FS_RT, va, va + 1);     /* shown: a read */
+        if (s_fs_auto)                  /* one show spent; sooner than owed: its phase */
+            s_fs.credit = s_fs.credit >= 1.0 ? s_fs.credit - 1.0 : 0.0;
+        s_fs.k_shown = tick;
+        s_fst.shown++;
+    } else {
+        if (s_fs.mode == FS_SHOW && !s_fs.first_pace)
+            s_fst.mispredicted_show++;  /* drawn for nothing */
+        s_fst.skipped++;
+        if (cad && !ready) {
+            /* not owed a show yet after all: just short of one -- below the
+             * forecast's threshold by an edge more, or the flip a whole limiter
+             * cycle later (45: three shows on) lands exactly on the threshold
+             * and is forecast shown (tests/nv2a_gpu_backend s26c, 60 -> 45) */
+            if (s_fs.credit > 1.0 - 2.0 * FS_CREDIT_EDGE)
+                s_fs.credit = 1.0 - 2.0 * FS_CREDIT_EDGE;
+            if (why == 1)
+                s_fst.nr_presenter++;
+            else
+                s_fst.nr_gpu++;
+        }
+    }
+    if (cad && s_fs_auto) {             /* the rate: shows over ticks, the last FS_RATE_N flips */
+        int i;
+        unsigned sh = 0, tk = 0;
+        s_fs.r_shown[s_fs.r_at] = (uint8_t)show;
+        s_fs.r_gap[s_fs.r_at] = (uint8_t)(gap > 255 ? 255 : gap);
+        s_fs.r_at = (s_fs.r_at + 1) % FS_RATE_N;
+        if (s_fs.r_n < FS_RATE_N)
+            s_fs.r_n++;
+        for (i = 0; i < s_fs.r_n; i++) {
+            sh += s_fs.r_shown[i];
+            tk += s_fs.r_gap[i];
+        }
+        s_fs.R = tk ? (double)sh / (double)tk : 1.0;
+    }
+    s_fs.first_pace = 0;
+    next = cad_next;
+    if (next && s_fs_auto)              /* owed a show by the next flip, as far away as this */
+        next = s_fs.credit + (double)gap * s_fs.R >= 1.0 - FS_CREDIT_EDGE;   /* a rate a
+                                                    hair under the limiter's still in phase */
+    s_fs.k_prev = tick;
+    s_fs.next_mode = next ? FS_SHOW : FS_SKIP;    return show;
 }
 
 #ifdef NV2A_GPU_TEST_HOOKS
@@ -2771,6 +3889,84 @@ void nv2a_gpu_test_target_dims(uint32_t *w, uint32_t *h)
 {
     *w = RT_W * s_sx;
     *h = s_gh * s_sy;
+}
+
+/* Frame skip's counters, cumulative: shown, skipped, not ready (presenter),
+ * not ready (gpu), logged ops, windows dropped, replayed ready, observed, not
+ * self-contained, arena full, mispredicted (a skipped window shown), (a
+ * hidden one drawn), stale reads, and the window mode now (1 SKIP), the
+ * forecast interval I x 100, the journal's ops now. */
+void nv2a_gpu_test_skip_stats(uint32_t out[16])
+{
+    out[0] = s_fst.shown; out[1] = s_fst.skipped;
+    out[2] = s_fst.nr_presenter; out[3] = s_fst.nr_gpu;
+    out[4] = s_fst.logged; out[5] = s_fst.dropped_windows;
+    out[6] = s_fst.replayed[0]; out[7] = s_fst.replayed[1];
+    out[8] = s_fst.replayed[2]; out[9] = s_fst.replayed[3];
+    out[10] = s_fst.mispredicted_skip; out[11] = s_fst.mispredicted_show;
+    out[12] = s_fst.stale; out[13] = (uint32_t)s_fs.mode;
+    out[14] = (uint32_t)(100.0 / (s_fs.R > 0.01 ? s_fs.R : 0.01) + 0.5); out[15] = s_fs.ops;
+}
+
+/* The presenter's half of readiness: -1 the real one (the waitable, or
+ * RECOMP_GPU_RASTER_PRESENT_HZ), 0 never ready (an outside limiter holding
+ * every buffer), 1 always. */
+void nv2a_gpu_test_present_gate(int g) { s_test_gate = g; }
+
+/* The GPU's half: 1 the last shown frame's event never completes. */
+void nv2a_gpu_test_gpu_busy(int busy) { s_test_gpu_busy = busy; }
+
+/* Every Present then takes ms longer (0: as it is), as one that blocks in an
+ * outside limiter does -- WARP's never does. */
+void nv2a_gpu_test_present_delay(int ms) { s_test_present_delay_ms = ms; }
+
+/* Whether the chain is the flip-model one; how many frames were Presented;
+ * whether pace() holds a waitable it took and nothing Presented on yet;
+ * stale textures so far; whether the show event exists. */
+int nv2a_gpu_test_flip_model(void) { return s_flip_model; }
+uint32_t nv2a_gpu_test_presents(void) { return s_st.presents; }
+int nv2a_gpu_test_have_token(void) { return s_have_token; }
+uint32_t nv2a_gpu_test_tex_changed(void) { return s_fst.tex_changed; }
+int nv2a_gpu_test_present_event(void) { return s_present_ev != NULL; }
+
+/* Texel (x,y) of the last guest RAM frame the flip-model chain uploaded
+ * (gdi_upload). 0: none. */
+int nv2a_gpu_test_gdi_pixel(uint32_t x, uint32_t y, uint32_t *argb)
+{
+    D3D11_MAPPED_SUBRESOURCE m;
+    D3D11_BOX box;
+    if (!s_gdi_tex || x >= PRESENT_W || y >= PRESENT_H)
+        return 0;
+    box.left = x; box.right = x + 1; box.top = y; box.bottom = y + 1;
+    box.front = 0; box.back = 1;
+    ID3D11DeviceContext_CopySubresourceRegion(s_ctx, (ID3D11Resource *)s_staging, 0, x, y, 0,
+                                              (ID3D11Resource *)s_gdi_tex, 0, &box);
+    if (FAILED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)s_staging, 0,
+                                       D3D11_MAP_READ, 0, &m)))
+        return 0;
+    *argb = ((const uint32_t *)((const uint8_t *)m.pData + (size_t)y * m.RowPitch))[x];
+    ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)s_staging, 0);
+    return 1;
+}
+
+/* Native pixel (x,y) of the target at va as the GPU holds it now (each
+ * s_sx x s_sy block averaged). 0: no such target. */
+int nv2a_gpu_test_rt_pixel(uint32_t va, uint32_t x, uint32_t y, uint32_t *argb)
+{
+    D3D11_MAPPED_SUBRESOURCE m;
+    int i;
+    for (i = 0; i < MAX_RTS; i++)
+        if (s_rt[i].used && s_rt[i].va == va) {
+            rt_resolve(&s_rt[i]);
+            rt_read_native(&s_rt[i], x, y, x + 1, y + 1);
+            if (FAILED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)s_staging, 0,
+                                               D3D11_MAP_READ, 0, &m)))
+                return 0;
+            *argb = ((const uint32_t *)((const uint8_t *)m.pData + (size_t)y * m.RowPitch))[x];
+            ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)s_staging, 0);
+            return 1;
+        }
+    return 0;
 }
 
 /* Every draw and clear through this pixel shader (compiled DXBC, the test's)
@@ -2983,7 +4179,6 @@ static int create_pipeline(void)
         goto done;
 
     if (s_scaled) {
-        ID3DBlob *b;
         D3D11_RENDER_TARGET_VIEW_DESC rv;
         td.Usage = D3D11_USAGE_DEFAULT;
         td.CPUAccessFlags = 0;
@@ -3005,30 +4200,10 @@ static int create_pipeline(void)
             || FAILED(ID3D11Device_CreateRenderTargetView(s_dev, (ID3D11Resource *)s_down,
                                                           &rv, &s_down_rtv)))
             goto done;
-        b = compile_src(s_blit_hlsl, sizeof s_blit_hlsl - 1, "bvs", "vs_4_0");
-        if (!b || FAILED(ID3D11Device_CreateVertexShader(s_dev, ID3D10Blob_GetBufferPointer(b),
-                                                         ID3D10Blob_GetBufferSize(b), NULL,
-                                                         &s_bvs))) {
-            REL(b);
+        if (FAILED(ID3D11Device_CreateVertexShader(s_dev, k_bvs, sizeof k_bvs, NULL, &s_bvs))
+            || !make_ps(k_bps_up, sizeof k_bps_up, "bps_up", &s_bps_up)
+            || !make_ps(k_bps_down, sizeof k_bps_down, "bps_down", &s_bps_down))
             goto done;
-        }
-        REL(b);
-        b = compile_src(s_blit_hlsl, sizeof s_blit_hlsl - 1, "bps_up", "ps_4_0");
-        if (!b || FAILED(ID3D11Device_CreatePixelShader(s_dev, ID3D10Blob_GetBufferPointer(b),
-                                                        ID3D10Blob_GetBufferSize(b), NULL,
-                                                        &s_bps_up))) {
-            REL(b);
-            goto done;
-        }
-        REL(b);
-        b = compile_src(s_blit_hlsl, sizeof s_blit_hlsl - 1, "bps_down", "ps_4_0");
-        if (!b || FAILED(ID3D11Device_CreatePixelShader(s_dev, ID3D10Blob_GetBufferPointer(b),
-                                                        ID3D10Blob_GetBufferSize(b), NULL,
-                                                        &s_bps_down))) {
-            REL(b);
-            goto done;
-        }
-        REL(b);
         bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
         bd.Usage = D3D11_USAGE_DYNAMIC;
         bd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
@@ -3203,6 +4378,16 @@ int nv2a_gpu_d3d11_install(void)
     s_be.shadow = s_compare;
     s_be.sync_surface = s_sync_all ? NULL : gpu_sync_surface;
     s_be.present = gpu_present;
+    /* Frame skip needs the frame's work to be the GPU's alone: compare draws
+     * every frame in software too, SYNC=all writes every one back. */
+    s_be.pace = s_compare || s_sync_all ? NULL : gpu_pace;
+    {
+        const char *fsk = getenv("RECOMP_FRAME_SKIP");
+        const char *lim = getenv("RECOMP_FPS_LIMIT");
+        /* As the executor's frame_skip_active: auto and a limit (L > 0); without
+         * one the flip model, its waitable and the event stay off too. */
+        s_fs_auto = s_be.pace && fsk && strcmp(fsk, "auto") == 0 && (lim ? atoi(lim) : 60) > 0;
+    }
     nv2a_backend_register(&s_be);
     fprintf(stderr, "[GPURAST] D3D11 back end on: %ls, FL %u_%u%s\n", ad.Description,
             ((unsigned)fl >> 12) & 0xF, ((unsigned)fl >> 8) & 0xF,

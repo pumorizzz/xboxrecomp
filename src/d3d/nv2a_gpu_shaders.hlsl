@@ -406,3 +406,53 @@ float4 ps_rc(PSIn i) : SV_Target { /* register combiners */
     ps_atest(col, fl);
     return col;
 }
+
+/* ---- presenting and the internal scale (nv2a_gpu_d3d11.c "presenting from
+ * the GPU" and "rows up, blocks down"); compiled at build time too, so a
+ * title's run compiles nothing but diagnostics (Proton's d3dcompiler_47 is
+ * Wine's, on vkd3d-shader). Both read T0. */
+
+/* The back buffer is the window's client area; the 640x480 frame is drawn
+ * into the rectangle xbox_FramebufferWindowFit gives (the display aspect,
+ * bars around it), bilinear between the target's texels -- exactly the
+ * frame's pixels when the rectangle is the target's size. pvp: the rectangle;
+ * pfs: the frame in texels of what is drawn: the target, or s_ss under SSAA
+ * (640x480 times a 2x-wide anti-aliased surface's 2, aa_sy and the scale). */
+cbuffer PRESENTC : register(b2) { float4 ppk; float4 pvp; float4 pfs; };
+float4 pvs(uint i : SV_VertexID) : SV_Position {
+    float2 q = float2((i << 1) & 2, i & 2);
+    return float4(q * float2(2, -2) + float2(-1, 1), 0, 1);
+}
+float3 ptap(int2 c) {
+    c = clamp(c, int2(0, 0), int2(pfs.xy) - 1);
+    return T0.Load(int4(c, 0, 0)).rgb;
+}
+float4 pps(float4 p : SV_Position) : SV_Target {
+    float2 s = (p.xy - pvp.xy) / pvp.zw * pfs.xy - 0.5;
+    int2 i = int2(floor(s));
+    float2 f = s - floor(s);
+    float3 a = lerp(ptap(i), ptap(i + int2(1, 0)), f.x);
+    float3 b = lerp(ptap(i + int2(0, 1)), ptap(i + int2(1, 1)), f.x);
+    return float4(lerp(a, b, f.y), 1.0);
+}
+
+/* bps_up: a native texel drawn over its s_sx x s_sy block of the target.
+ * bps_down: the block averaged back to one texel -- the anti-aliased colour
+ * guest RAM gets; also the SSAA reduction for the presenter. bbk: the block. */
+cbuffer BLITC : register(b3) { float4 bbk; };
+float4 bvs(uint i : SV_VertexID) : SV_Position {
+    float2 q = float2((i << 1) & 2, i & 2);
+    return float4(q * float2(2, -2) + float2(-1, 1), 0, 1);
+}
+float4 bps_up(float4 p : SV_Position) : SV_Target {
+    return T0.Load(int4(int2(p.xy) / int2(bbk.xy), 0, 0));
+}
+float4 bps_down(float4 p : SV_Position) : SV_Target {
+    int2 s = int2(bbk.xy), b = int2(p.xy) * s;
+    float4 a = float4(0.0, 0.0, 0.0, 0.0);
+    int x, y;
+    [loop] for (y = 0; y < s.y; y++)
+        [loop] for (x = 0; x < s.x; x++)
+            a += T0.Load(int4(b + int2(x, y), 0, 0));
+    return a / (float)(s.x * s.y);
+}

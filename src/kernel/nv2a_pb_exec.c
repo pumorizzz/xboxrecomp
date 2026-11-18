@@ -3786,29 +3786,95 @@ uint64_t nv2a_pb_exec_vblank_tick(void)
  * a flip completes at once, and a title that paces itself on the flip --
  * menus, loading screens -- runs at whatever rate it can draw, which reaches
  * 1000 fps and breaks menu input timing. A late frame does not bank time:
- * the next flip is the first tick after it, not a burst to catch up. */
-static void flip_pace(void)
+ * the next flip is the first tick after it, not a burst to catch up.
+ *
+ * Frame skip (RECOMP_FRAME_SKIP, vblank_grid.h): while it is active the flip
+ * waits for every tick (60) whatever the limit, and the limit only chooses
+ * which flips are shown -- the game's dt stays 16.7 ms.
+ *   0 / unset  as above: the flip waits ceil(60/L) ticks;
+ *   1          the cadence: L shows a second on the grid, Present as before;
+ *   auto       the cadence (when L < 60) and a show only when the back end can
+ *              present without waiting (an outside limiter: Steam Deck's
+ *              gamescope, NVIDIA's Max Frame Rate, RTSS).
+ * Active when the mode is not 0, a back end with pace() is registered, and
+ * 0 < L < 60 (1) or L > 0 (auto). Checked at every flip: after a lost device
+ * the software path paces at L again. */
+static int s_skip_mode = -1;        /* 0 off, 1 cadence, 2 auto */
+static int s_fps_limit = -1;        /* RECOMP_FPS_LIMIT */
+static uint64_t s_last_shown;       /* grid tick of the last shown flip */
+static uint64_t s_flip_prev_tick;   /* grid tick of the previous flip */
+static uint32_t s_flips_shown;
+static int s_pace_hz;               /* the rate flip_pace waited for last */
+
+static void frame_skip_init(void)
+{
+    const char *e;
+    if (s_skip_mode >= 0)
+        return;
+    e = getenv("RECOMP_FPS_LIMIT");
+    s_fps_limit = e ? atoi(e) : 60;
+    e = getenv("RECOMP_FRAME_SKIP");
+    s_skip_mode = !e || !*e ? 0 : strcmp(e, "auto") == 0 ? 2 : atoi(e) ? 1 : 0;
+}
+
+static int frame_skip_active(void)
+{
+    frame_skip_init();
+    if (!s_skip_mode || !s_backend || !s_backend->pace || s_fps_limit <= 0)
+        return 0;
+    return s_skip_mode == 2 || s_fps_limit < VBLANK_GRID_HZ;
+}
+
+/* RECOMP_FRAME_SKIP set but frame skip not active: said once, with why. */
+static void frame_skip_note_inactive(void)
+{
+    static int said;
+    if (said || !s_skip_mode)
+        return;
+    said = 1;
+    fprintf(stderr, "[GPU] RECOMP_FRAME_SKIP=%s is not active: %s\n",
+            s_skip_mode == 2 ? "auto" : "1",
+            !s_backend ? "no back end (the software rasteriser shows every flip)"
+            : !s_backend->pace ? "the back end has no frame pacing (compare or SYNC=all)"
+            : s_fps_limit <= 0 ? "no frame limit (RECOMP_FPS_LIMIT=0)"
+            : "the limit is 60 or more (1 skips only below 60; auto shows on readiness)");
+}
+
+#ifdef NV2A_GPU_TEST_HOOKS
+/* tests/nv2a_gpu_backend: no clock -- each flip lands `step` ticks after the
+ * previous one, or the pacer's gap if that is longer (0: the real clock). */
+static int s_test_step;
+static uint64_t s_test_tick;
+void nv2a_pb_exec_test_tick(int step) { s_test_step = step; }
+int nv2a_pb_exec_test_pace_hz(void) { return s_pace_hz; }
+uint32_t nv2a_pb_exec_test_shown(void) { return s_flips_shown; }
+#endif
+
+/* The flip's wait at hz; s_flip_tick becomes the tick it lands on. */
+static uint64_t s_flip_tick;
+static void flip_wait(int hz)
 {
 #if defined(_WIN32)
-    static int hz = -1;
+    static int init;
     static uint64_t last;          /* grid tick of the previous flip */
     static HANDLE timer;
     int64_t now, freq, base, target;
     LARGE_INTEGER q;
 
-    if (hz < 0) {
-        const char *e = getenv("RECOMP_FPS_LIMIT");
-        hz = e ? atoi(e) : 60;
+    if (!init) {
+        init = 1;
         /* 0x2 = CREATE_WAITABLE_TIMER_HIGH_RESOLUTION (Windows 10 1803+);
          * an older system gets a plain timer and the spin below. */
         timer = CreateWaitableTimerExW(NULL, NULL, 0x2, TIMER_ALL_ACCESS);
         if (!timer)
             timer = CreateWaitableTimerExW(NULL, NULL, 0, TIMER_ALL_ACCESS);
     }
+    s_flip_tick = nv2a_pb_exec_vblank_tick();
     if (hz <= 0)
         return;
     base = vblank_clock(&now, &freq);
     target = vblank_grid_flip_at(now, base, freq, hz, &last);
+    s_flip_tick = last;
     if (timer) {
         int64_t left = target - now - freq / 1000;
         if (left > 0) {
@@ -3822,7 +3888,27 @@ static void flip_pace(void)
         YieldProcessor();
         QueryPerformanceCounter(&q);
     } while (q.QuadPart < target);
+#else
+    (void)hz;
 #endif
+}
+
+/* Waits for the flip's tick and returns it (the tick now without a limit). */
+static uint64_t flip_pace(void)
+{
+    int skip = frame_skip_active(), hz = vblank_grid_pace_hz(s_fps_limit, skip);
+    s_pace_hz = hz;
+#ifdef NV2A_GPU_TEST_HOOKS
+    if (s_test_step > 0) {
+        uint64_t gap = vblank_grid_gap(hz), k = s_test_tick + (uint64_t)s_test_step;
+        if (gap && k < s_test_tick + gap)
+            k = s_test_tick + gap;
+        s_test_tick = k;
+        return k;
+    }
+#endif
+    flip_wait(hz);
+    return s_flip_tick;
 }
 
 /* What a batch actually contains. Before anything can be rasterised, the
@@ -4365,6 +4451,8 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
 {
     static int inited;
     int shown;                     /* FLIP_STALL: the back end showed the frame */
+    int hidden;                    /* FLIP_STALL: frame skip does not show it */
+    uint64_t tick;                 /* FLIP_STALL: the grid tick it lands on */
 
     if (s_pipe.head != s_pipe.drained && pipe_method_syncs(subch, method))
         pipe_drain();
@@ -4690,7 +4778,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
          * There is no scanout here to wait for, so that is the next vblank
          * tick (flip_pace); the swap count and present() below then land on
          * it too. */
-        flip_pace();
+        tick = flip_pace();
         s_gpu.flip_read = s_gpu.flip_write;
         /* And this is a completed swap, which is what a title's own swap
          * counter counts -- see xbox_Nv2aFrameCounterFlip. */
@@ -4698,9 +4786,36 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         /* A back end that draws elsewhere either shows the frame itself
          * (present) or puts it into guest RAM now: the presenter and the flip
          * dumps below read it from there -- the surface the last batches drew
-         * into, as they choose it. */
+         * into, as they choose it.
+         *
+         * Frame skip: the cadence picks the flips that are shown and the back
+         * end has the last word (pace: it can present without waiting). A
+         * flip not shown is not presented, written back, copied to the window
+         * or dumped -- everything else above and below (the semaphore, NOP 5,
+         * the frame counter, flip()) goes on as for any flip. */
         shown = 0;
-        if (s_backend) {
+        hidden = 0;
+        if (frame_skip_active()) {
+            int L = s_skip_mode == 2 && s_fps_limit >= VBLANK_GRID_HZ ? VBLANK_GRID_HZ : s_fps_limit;
+            /* The next flip is expected as far away as this one came after the
+             * previous: a game that cannot hold 60 flips every 2 ticks, and
+             * cadence_next for tick + 1 then said "hidden" for flips that were
+             * shown -- every window logged, then drawn at the show. */
+            uint64_t gap = s_flip_prev_tick && tick > s_flip_prev_tick ? tick - s_flip_prev_tick : 1;
+            int cad = vblank_grid_shown(tick, s_last_shown, L);
+            int cad_next = vblank_grid_shown(tick + gap, cad ? tick : s_last_shown, L);
+            uint32_t done = s_gpu.drawn_offset ? s_gpu.drawn_offset : s_gpu.color_offset;
+            if (s_backend->pace(done ? dma_resolve(done) : 0, tick, cad, cad_next))
+                s_last_shown = tick;
+            else
+                hidden = 1;
+        } else {
+            frame_skip_note_inactive();
+        }
+        s_flip_prev_tick = tick;
+        if (!hidden)
+            s_flips_shown++;
+        if (s_backend && !hidden) {
             uint32_t done = s_gpu.drawn_offset ? s_gpu.drawn_offset : s_gpu.color_offset;
             uint32_t rows = s_gpu.drawn_offset ? s_gpu.drawn_y + s_gpu.drawn_h
                                                : RS.clip_y + RS.clip_h;
@@ -4731,7 +4846,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
             xbox_FramebufferWindowFrameStats(s_gpu.draws - draws_at_flip);
             draws_at_flip = s_gpu.draws;
         }
-        if (RS.pitch) {
+        if (RS.pitch && !hidden) {
             extern void xbox_FramebufferWindowPresent(uint32_t, uint32_t);
             uint32_t done = s_gpu.drawn_offset ? s_gpu.drawn_offset
                                                : s_gpu.color_offset;
@@ -4754,7 +4869,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
             static const char *spec = (const char *)-1;
             if (spec == (const char *)-1)
                 spec = getenv("RECOMP_FB_DUMP_FLIPS");
-            if (spec) {
+            if (spec && !hidden) {
                 int on = strcmp(spec, "1") == 0;
                 if (!on) {
                     FILE *f = fopen(spec, "rb");
@@ -5069,9 +5184,9 @@ void nv2a_pb_exec_report(void)
         static unsigned long last_ms;
         unsigned long now = (unsigned long)(clock() * 1000.0 / CLOCKS_PER_SEC);
         if (last_ms && now > last_ms)
-            text_block_printf(&tb, "[GPU] %.2f fps (%u flips)%c",
+            text_block_printf(&tb, "[GPU] %.2f fps (%u flips, shown %u)%c",
                     (s_gpu.flips - last_flips) * 1000.0 / (now - last_ms),
-                    s_gpu.flips, 10);
+                    s_gpu.flips, s_flips_shown, 10);
         last_flips = s_gpu.flips;
         last_ms = now;
     }

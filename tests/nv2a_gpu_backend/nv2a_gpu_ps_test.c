@@ -41,6 +41,9 @@
  *   (g) The shaders built into the back end (nv2a_gpu_shaders.h, compiled when
  *       the toolkit is built) are what nv2a_gpu_shaders.hlsl compiles to now,
  *       byte for byte: a header left behind by a source change would not be.
+ *       The presenter's and the internal scale's (pvs, pps, bvs, bps_up,
+ *       bps_down) too: at run time only diagnostics compile anything, which
+ *       under Proton is Wine's d3dcompiler on vkd3d-shader.
  *   (e) RECOMP_GPU_RASTER_PSCHECK in the back end itself: against the
  *       reference it counts draws and no 8-bit difference; against a broken
  *       copy (map_out's x * 2.0 made x * 2.5) it finds them. And it leaves
@@ -95,6 +98,7 @@ uint32_t xbox_Nv2aFenceWordVa(void) { return 0; }
 int nv2a_pb_dma_walk(void) { return 1; }
 void xbox_FramebufferWindowStart(void) {}
 void xbox_FramebufferWindowFrameStats(uint32_t draws) { (void)draws; }
+void xbox_FramebufferWindowShown(void) {}
 void xbox_FramebufferWindowPresent(uint32_t va, uint32_t pitch) { (void)va; (void)pitch; }
 void xbox_Nv2aFrameCounterFlip(void) {}
 volatile uint32_t *xbox_Nv2aRegPtr(uint32_t offset) { (void)offset; return NULL; }
@@ -553,6 +557,13 @@ int main(void)
             { "ps_rc", "ps_4_0", "ps_rc", NULL, k_ps_rc, sizeof k_ps_rc },
             { "ps_rc", "ps_4_0", "ps_rc_tex", tex1, k_ps_rc_tex, sizeof k_ps_rc_tex },
             { "ps_rc", "ps_4_0", "ps_rc_rt", tex2, k_ps_rc_rt, sizeof k_ps_rc_rt },
+            /* presenting and the internal scale: compiled at build time too,
+             * so a run on Proton compiles nothing with Wine's d3dcompiler */
+            { "pvs", "vs_4_0", "pvs", NULL, k_pvs, sizeof k_pvs },
+            { "pps", "ps_4_0", "pps", NULL, k_pps, sizeof k_pps },
+            { "bvs", "vs_4_0", "bvs", NULL, k_bvs, sizeof k_bvs },
+            { "bps_up", "ps_4_0", "bps_up", NULL, k_bps_up, sizeof k_bps_up },
+            { "bps_down", "ps_4_0", "bps_down", NULL, k_bps_down, sizeof k_bps_down },
         };
         size_t n = 0, b;
         char *src = read_file(SHADERS_HLSL_PATH, &n);

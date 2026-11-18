@@ -162,6 +162,16 @@ typedef struct {
      * itself, or there is nothing to present to); the executor then neither
      * writes the frame back for the presenter nor copies it to the window. */
     int (*present)(uint32_t va, uint32_t pitch, uint32_t aa_sy);
+    /* Optional: frame skip (RECOMP_FRAME_SKIP, vblank_grid.h). Called at every
+     * FLIP_STALL while frame skip is active, before present(): `va` the
+     * surface the flip shows, `tick` the grid tick it lands on,
+     * cadence_show whether the cadence shows this flip, cadence_next whether
+     * it would show the next one. 0: the flip is not shown -- the executor
+     * then neither presents, writes back nor copies it to the window, and
+     * the back end need not have drawn it (it may log the frame's work and
+     * drop it, or draw it later when something reads it). Without pace
+     * every flip is shown. */
+    int (*pace)(uint32_t va, uint64_t tick, int cadence_show, int cadence_next);
 } Nv2aBackend;
 
 /* Register (or, with NULL, remove) the back end. Call before the title starts

@@ -251,6 +251,15 @@ void xbox_FramebufferWindowFrameStats(uint32_t draws)
     InterlockedExchange(&s_frame_draws, (LONG)draws);
 }
 
+/* A frame actually put on the screen by a back end that presents itself
+ * (nv2a_gpu_d3d11.c). With frame skip the game flips 60 times a second and
+ * fewer are shown: the title then reads "FPS: 45.0 (game 60.0)". */
+static volatile LONG s_shown;
+void xbox_FramebufferWindowShown(void)
+{
+    InterlockedIncrement(&s_shown);
+}
+
 static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
 {
     switch (m) {
@@ -512,17 +521,22 @@ static DWORD WINAPI fb_thread(LPVOID unused)
         }
         {
             static DWORD t0;
-            static LONG f0;
+            static LONG f0, s0;
             DWORD now = GetTickCount();
             if (now - t0 >= 1000) {
-                LONG f = s_flips;
+                LONG f = s_flips, s = s_shown;
+                double game = t0 ? (f - f0) * 1000.0 / (now - t0) : 0.0;
                 wchar_t tb[128];
-                _snwprintf(tb, 127, L"%ls | FPS: %.1f | draws: %ld", s_title,
-                           t0 ? (f - f0) * 1000.0 / (now - t0) : 0.0,
-                           (long)s_frame_draws);
+                if (s != s0 && s - s0 != f - f0)   /* fewer shown than flipped */
+                    _snwprintf(tb, 127, L"%ls | FPS: %.1f (game %.1f) | draws: %ld", s_title,
+                               t0 ? (s - s0) * 1000.0 / (now - t0) : 0.0, game,
+                               (long)s_frame_draws);
+                else
+                    _snwprintf(tb, 127, L"%ls | FPS: %.1f | draws: %ld", s_title, game,
+                               (long)s_frame_draws);
                 tb[127] = 0;
                 SetWindowTextW(hwnd, tb);
-                t0 = now; f0 = f;
+                t0 = now; f0 = f; s0 = s;
             }
         }
         Sleep(16);

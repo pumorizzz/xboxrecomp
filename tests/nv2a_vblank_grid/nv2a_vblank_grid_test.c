@@ -30,6 +30,17 @@
  *   - The base set a moment after another thread read the counter (a time
  *     before the base) is tick 0 and the next flip is tick 1.
  *   - The gap for {-1, 0, 1, 20, 29, 30, 31, 45, 59, 60, 61, 120}.
+ *   - Frame skip: the game flips on every tick and L flips a second are
+ *     shown. For L in {20, 30, 40, 45, 50, 59, 60, 0, 120}: L*m shows in
+ *     60*m ticks, every interval floor or ceil of 60/L (45 -> 1-1-2, 30 ->
+ *     the even ticks), every flip at 0 and at 60 or more. Got wrong, the
+ *     game's logic at 45 runs at a cadence the display does not keep, or a
+ *     shown frame repeats.
+ *   - Late flips: a flip is shown when it crossed into a new slot, never
+ *     twice in one slot.
+ *   - The slot does not overflow out to ten years; the pacer waits for 60
+ *     while frame skip is active (the game's dt stays 16.7 ms -- the
+ *     Tutorial charge does not count at 22 or 33 ms).
  *
  * Standalone: only vblank_grid.h, no runtime. CHECK as tests/nv2a_points. */
 #include <stdint.h>
@@ -211,6 +222,90 @@ static void run(int64_t freq, int64_t base)
     }
 }
 
+/* Frame-skip cadence (P13-P17), against plain floor(k*L/60). */
+static int ref_shown(uint64_t k, uint64_t last, int L)
+{
+    if (L <= 0 || L >= 60) return 1;
+    return (k * (uint64_t)L) / 60 > (last * (uint64_t)L) / 60;
+}
+
+static void cadence(void)
+{
+    static const int Ls[9] = { 20, 30, 40, 45, 50, 59, 60, 0, 120 };
+    int li;
+    for (li = 0; li < 9; li++) {
+        int L = Ls[li], m = 7, shows = 0;
+        uint64_t k, last = 0, prev_show = 0;
+        int every = (L <= 0 || L >= 60);
+        uint64_t lo = every ? 1 : 60 / (uint64_t)L, hi = every ? 1 : (60 + (uint64_t)L - 1) / (uint64_t)L;
+        int seq[16], ns = 0;
+        /* P13: one flip per tick from tick 1: L*m shows in 60*m ticks, every
+         * interval floor or ceil of 60/L. */
+        for (k = 1; k <= 60ull * (uint64_t)m; k++) {
+            int s = vblank_grid_shown(k, last, L);
+            CHECK(s == ref_shown(k, last, L));
+            if (s) {
+                if (prev_show) {
+                    uint64_t gap = k - prev_show;
+                    CHECK(gap == lo || gap == hi);
+                    if (ns < 16) seq[ns++] = (int)gap;
+                }
+                prev_show = k;
+                last = k;
+                shows++;
+            }
+        }
+        CHECK(shows == (every ? 60 * m : L * m));
+        /* P14: 45 -> 1-1-2 repeating; 30 -> the even ticks. */
+        if (L == 45) {
+            int i;
+            for (i = 0; i + 2 < ns; i += 3) {
+                int a = seq[i], b = seq[i + 1], c = seq[i + 2];
+                /* one 2 in every 3 intervals */
+                CHECK(a + b + c == 4);
+            }
+        }
+        if (L == 30) {
+            last = 0;
+            for (k = 1; k <= 120; k++)
+                if (vblank_grid_shown(k, last, 30)) { CHECK(k % 2 == 0); last = k; }
+        }
+    }
+
+    /* P15: late flips -- flips land on ticks 1,2,5,6,7,15,16 (gaps of 1..8).
+     * A flip is shown when its slot is past the last shown one, so never two
+     * in one slot, and a flip that crossed a slot boundary is shown. */
+    {
+        static const uint64_t ticks[] = { 1, 2, 5, 6, 7, 15, 16, 17, 18, 26, 27 };
+        static const int Ls2[3] = { 30, 45, 20 };
+        int li2, i;
+        for (li2 = 0; li2 < 3; li2++) {
+            int L = Ls2[li2];
+            uint64_t last = 0;
+            for (i = 0; i < (int)(sizeof ticks / sizeof ticks[0]); i++) {
+                uint64_t k = ticks[i];
+                int s = vblank_grid_shown(k, last, L);
+                int crossed = vblank_grid_slot(k, L) != vblank_grid_slot(last, L);
+                CHECK(s == crossed);
+                if (s) last = k;
+            }
+        }
+    }
+
+    /* P16: slot has no overflow out to ten years of ticks. */
+    {
+        uint64_t k = 60ull * 86400 * 365 * 10 + 59;
+        CHECK(vblank_grid_slot(k, 45) == (k / 60) * 45 + (59 * 45) / 60);
+        CHECK(vblank_grid_slot(k, 0) == k);
+    }
+
+    /* P17: the pacer waits for 60 while frame skip is active. */
+    CHECK(vblank_grid_pace_hz(30, 1) == 60);
+    CHECK(vblank_grid_pace_hz(45, 1) == 60);
+    CHECK(vblank_grid_pace_hz(30, 0) == 30);
+    CHECK(vblank_grid_pace_hz(0, 0) == 0);
+}
+
 int main(void)
 {
     static const int64_t freqs[] = { 10000000, 3579545, 2400000000LL };
@@ -226,6 +321,8 @@ int main(void)
     /* P12 */
     for (i = 0; i < 12; i++)
         CHECK(vblank_grid_gap(gin[i]) == (uint64_t)gout[i]);
+
+    cadence();
 
     printf("nv2a_vblank_grid: %s\n", s_fail ? "FAILED" : "OK");
     return s_fail;

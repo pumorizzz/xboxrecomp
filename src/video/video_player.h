@@ -67,6 +67,7 @@ int  xbox_FramebufferDumpBmp(const char *path);
  * UTF-16 title (40 chars max); the stats come from each flip. */
 void xbox_FramebufferWindowSetTitle(const uint16_t *name, int max_chars);
 void xbox_FramebufferWindowFrameStats(uint32_t draws);
+void xbox_FramebufferWindowShown(void);
 /* The window for a presenter that draws into it itself (the D3D11 back end
  * puts a swap chain on it): its HWND while it runs, else NULL; while
  * External is on, the window thread keeps title, keys and close button and
