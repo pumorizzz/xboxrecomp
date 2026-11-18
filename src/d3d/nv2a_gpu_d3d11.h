@@ -32,6 +32,9 @@
  * RECOMP_GPU_RASTER_PSCHECK=<ref.hlsl>[,<every>] -- every <every>-th
  *   (default 30) frame each draw's pixel shader against ps_main of a
  *   reference shader, float and 8-bit differences counted.
+ * RECOMP_GPU_RASTER_RC_STATS=1 -- every combiner state (nv2a_gpu_rc_key.h) with
+ *   its draws and pixels, in the 10 s report (cumulative, top 32 by pixels);
+ *   RECOMP_GPU_RASTER_RC_GENERIC=1 -- only the general combiner shader.
  * RECOMP_FRAME_SKIP=1|auto (the executor's frame skip): a frame the cadence
  *   or, with auto, the swap chain (a flip-model one with a waitable) cannot
  *   show is not drawn -- its work is logged and dropped, or drawn when

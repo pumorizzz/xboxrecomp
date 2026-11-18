@@ -17,6 +17,10 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
+#ifdef _WIN32
+#include <windows.h>
+#endif
 
 /* The runtime links against the title's dispatch; nothing here calls it. */
 void *recomp_lookup(unsigned long address) { (void)address; abort(); }
@@ -112,6 +116,57 @@ int main(void)
           (reg(d, NV_PAPU_FECTL) & NV_PAPU_FECTL_FEMETHMODE)
               == NV_PAPU_FECTL_FEMETHMODE_FREE_RUNNING);
     CHECK("unarmed: line low", !line(d));
+
+#ifdef _WIN32
+    /* The VEH path of the title's DirectSound polling (sub_000DED51 reads the APU
+     * position at every cli/sti): a trapped read of a register is serviced each
+     * time, and after the first it calls no getenv -- RECOMP_APU_TRACE was read
+     * with getenv on every trapped access, which walks the whole environment
+     * (long under Proton) several times a frame. The instruction is mov eax,
+     * [rcx]; the fault address is the APU's NV_PAPU_ISTS page in the guest
+     * window. */
+    {
+        extern MCPXAPUState *g_apu_state;
+        extern int xbox_VehMmioFault(void *exception_pointers);
+        extern ptrdiff_t xbox_GetMemoryOffset(void);
+        extern int crt_count_hook(const char *name);
+        extern long crt_count(const char *name);
+        static uint8_t code[16] = { 0x8B, 0x01 };
+        EXCEPTION_RECORD er;
+        CONTEXT cx;
+        EXCEPTION_POINTERS ep;
+        int hooked, i, served = 0, moved = 0;
+        long before = 0;
+
+        g_apu_state = d;
+        memset(&er, 0, sizeof er);
+        er.ExceptionCode = EXCEPTION_ACCESS_VIOLATION;
+        er.NumberParameters = 2;
+        er.ExceptionInformation[0] = 0;                 /* a read */
+        er.ExceptionInformation[1] = (ULONG_PTR)((uintptr_t)xbox_GetMemoryOffset() + 0xFE80200Cu);
+        ep.ExceptionRecord = &er;
+        ep.ContextRecord = &cx;
+        hooked = crt_count_hook("getenv");
+        for (i = 0; i < 100; i++) {
+            memset(&cx, 0, sizeof cx);
+            cx.Rip = (DWORD64)(uintptr_t)code;
+            if (i == 1)
+                before = crt_count("getenv");           /* the first call may read it */
+            served += xbox_VehMmioFault(&ep) == 1;
+            moved += cx.Rip == (DWORD64)(uintptr_t)code + 2;
+        }
+        printf("apu_irq: %d of 100 trapped reads served, %d moved past the instruction;"
+               " getenv calls after the first: %ld (%d import entries hooked)\n", served, moved,
+               crt_count("getenv") - before, hooked);
+        CHECK("trapped reads served", served == 100);
+        CHECK("Rip moved past mov eax,[rcx]", moved == 100);
+        if (hooked > 0)
+            CHECK("no getenv per trapped access", crt_count("getenv") - before == 0);
+        else
+            printf("apu_irq: no getenv import entry found -- not checked\n");
+        g_apu_state = NULL;
+    }
+#endif
 
     if (failures) { printf("apu_irq: %d failure(s)\n", failures); return 1; }
     printf("apu_irq: all passed\n");

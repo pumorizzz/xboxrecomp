@@ -4,12 +4,25 @@
 # for byte -- writes nv2a_gpu_shaders.h, which nv2a_gpu_d3d11.c includes.
 # Rebuilt only when the shader source (or the tool) changes.
 #
+# NV2A_GPU_RC_KEYS (set before the include, optional): a file of register
+# combiner states (nv2a_gpu_rc_key.h text, one `rc ...` line each). For each
+# one nv2a_gpu_shaderc compiles a ps_rc of its own, which the back end draws
+# that state with (see "Pixels" in nv2a_gpu_d3d11.c); a state not in the file
+# is drawn by the general ps_rc. Unset or empty: no such shaders, as before.
+# An own shader matches the general one bit for bit on WARP; on NVIDIA the
+# driver's compiler can move an 8-bit channel by 1 in a few pixels (accepted;
+# RECOMP_GPU_RASTER_RC_GENERIC=1 draws the general one).
+# The file and nv2a_gpu_rc_key.h are dependencies of the header.
+#
 #   include(<toolkit>/src/d3d/nv2a_gpu_shaders.cmake)
 #   nv2a_gpu_shaders(<target that compiles nv2a_gpu_d3d11.c>)
 #
 # Windows only (Direct3D 11).
 
 set(NV2A_GPU_SHADERS_SRC_DIR ${CMAKE_CURRENT_LIST_DIR})
+if(NOT DEFINED NV2A_GPU_RC_KEYS)
+    set(NV2A_GPU_RC_KEYS "")
+endif()
 
 # <entry>:<target>:<symbol>[:NAME=value,...] for each shader nv2a_gpu_d3d11.c uses.
 set(NV2A_GPU_SHADERS_SPECS
@@ -50,9 +63,15 @@ function(nv2a_gpu_shaders target)
         if(MSVC)
             target_compile_definitions(nv2a-gpu-shaderc PRIVATE _CRT_SECURE_NO_WARNINGS)
         endif()
+        set(rck_args "")
+        set(rck_deps "")
+        if(NV2A_GPU_RC_KEYS)
+            set(rck_args --rc-keys ${NV2A_GPU_RC_KEYS})
+            set(rck_deps ${NV2A_GPU_RC_KEYS} ${NV2A_GPU_SHADERS_SRC_DIR}/nv2a_gpu_rc_key.h)
+        endif()
         add_custom_command(OUTPUT ${out}
-            COMMAND nv2a-gpu-shaderc ${hlsl} ${out} ${NV2A_GPU_SHADERS_SPECS}
-            DEPENDS nv2a-gpu-shaderc ${hlsl}
+            COMMAND nv2a-gpu-shaderc ${hlsl} ${out} ${rck_args} ${NV2A_GPU_SHADERS_SPECS}
+            DEPENDS nv2a-gpu-shaderc ${hlsl} ${rck_deps}
             COMMENT "nv2a_gpu_shaders.h: compiling the D3D11 back end's shaders"
             VERBATIM)
         add_custom_target(nv2a-gpu-shaders DEPENDS ${out})

@@ -22,6 +22,44 @@ Texture2DArray<float4> T1 : register(t1);
 Texture2DArray<float4> T2 : register(t2);
 Texture2DArray<float4> T3 : register(t3);
 #define W8(a, i) a[(i) >> 2][(i) & 3]
+/* The combiner shader of one state (nv2a_gpu_rc_key.h; nv2a_gpu_shaderc --rc-keys
+ * defines RCK and the RCK_* values of the key): the combiner words, the stage
+ * program, the final combiner, the number of stages and what each stage samples
+ * are literals, so the compiler leaves out every path the state does not take
+ * and the registers it never touches. Without RCK the same names are the
+ * cbuffer reads of the general shader: the code of ps_rc is the same text. */
+/* RC_PRECISE: with the words as literals the compiler fuses a multiply and an
+ * add of the alpha path (a*b + c*d) where the general shader, behind its
+ * selects, keeps them apart; over eight stages that moved the float result of
+ * a state by an ulp, so the alpha products and sums are `precise` in a state's
+ * own shader (the RGB ones match the general shader's as they are). Empty for
+ * the general shader: its code is untouched. On WARP every own shader matches
+ * the general one bit for bit; on NVIDIA the main Fallout state's differs by 1
+ * in an 8-bit channel in tens of pixels a frame (fxc flags and optimisation
+ * levels give the same code; the driver's compiler does it) -- a known,
+ * accepted difference; RECOMP_GPU_RASTER_RC_GENERIC=1 draws the general one. */
+#ifdef RCK
+#define RC_PRECISE precise
+#define RC_NSTAGES RCK_N
+#define RC_CONTROL RCK_CTL
+#define RC_PROG RCK_PROG
+#define RC_FIN0 RCK_F0
+#define RC_FIN1 RCK_F1
+#define RC_LOOP [unroll]
+#define RC_WORD(a, k, s) (((s) == 0) ? k##0 : ((s) == 1) ? k##1 : ((s) == 2) ? k##2 : ((s) == 3) ? k##3 : ((s) == 4) ? k##4 : ((s) == 5) ? k##5 : ((s) == 6) ? k##6 : k##7)
+#define RC_TXK(st) ((RCK_TEX >> ((st) * 8)) & 0xFF) /* TXF_VALID|BILIN|SWZ|RT|CUBE of the stage */
+#define RC_SWZ(st) ((RC_TXK(st) & 32) != 0)
+#else
+#define RC_PRECISE
+#define RC_NSTAGES min(ctl.x & 0xFF, 8u)
+#define RC_CONTROL ctl.x
+#define RC_PROG ctl.y
+#define RC_FIN0 fin.x
+#define RC_FIN1 fin.y
+#define RC_LOOP [loop]
+#define RC_WORD(a, k, s) W8(a, s)
+#define RC_SWZ(st) (p.z & 32)
+#endif
 struct VSIn {
     float4 pos : POSITION; float4 d0 : COLOR0; float4 d1 : COLOR1;
     float fog : FOG;
@@ -94,7 +132,7 @@ float4 texel_at(uint st, int x, int y, uint face) {
     int w = (int)(p.x & 0xFFFF), h = (int)(p.x >> 16);
     int u = wrapc(x, w, p.y & 0xFF), v = wrapc(y, h, (p.y >> 8) & 0xFF);
     float4 c;
-    if (p.z & 32) { /* a render target read as a swizzled texture */
+    if (RC_SWZ(st)) { /* a render target read as a swizzled texture */
         uint i = swz((uint)u, (uint)v, (uint)w, (uint)h);
         int2 s = int2(rsc.xy); /* the centre of the texel at the internal scale */
         c = load_st(st, (int)(i % p.w) * s.x + s.x / 2, (int)(i / p.w) * s.y + s.y / 2, face);
@@ -141,6 +179,25 @@ float4 rt_texel(uint st, float u, float v, uint face, bool bil) {
 #endif
 float4 rc_texel(uint st, float u, float v, uint face) {
     uint4 p = tex[st];
+#ifdef RCK
+    /* The state's class of this stage (RC_TXK): valid, bilinear, a render target
+     * read linearly or as swizzled; only the size and the normalised flag stay
+     * in the constants. */
+    uint k = RC_TXK(st);
+    if (!(k & 8)) return float4(1.0, 1.0, 1.0, 1.0);
+    if (p.z & 1) { u *= (float)(p.x & 0xFFFF); v *= (float)(p.x >> 16); }
+    if ((k & 64) && !(k & 32)) return rt_texel(st, u, v, face, (k & 2) != 0);
+    if (k & 2) {
+        float fu = u - 0.5, fv = v - 0.5;
+        float iu = floor(fu), iv = floor(fv);
+        float wu = fu - iu, wv = fv - iv;
+        int x = (int)iu, y = (int)iv;
+        float4 c0 = texel_at(st, x, y, face), c1 = texel_at(st, x + 1, y, face);
+        float4 c2 = texel_at(st, x, y + 1, face), c3 = texel_at(st, x + 1, y + 1, face);
+        return (c0 * (1.0 - wu) + c1 * wu) * (1.0 - wv) + (c2 * (1.0 - wu) + c3 * wu) * wv;
+    }
+    return texel_at(st, (int)floor(u), (int)floor(v), face);
+#else
     if (!(p.z & 8)) return float4(1.0, 1.0, 1.0, 1.0);
     if (p.z & 1) { u *= (float)(p.x & 0xFFFF); v *= (float)(p.x >> 16); }
 #if RC_TEX == 2
@@ -160,10 +217,11 @@ float4 rc_texel(uint st, float u, float v, uint face) {
     }
     return texel_at(st, (int)floor(u), (int)floor(v), face);
 #endif
+#endif
 }
 /* rc_stage_fetch: false when a clip-plane stage kills the pixel. */
 bool stage_fetch(uint st, float4 c, out float4 o) {
-    uint mode = (ctl.y >> (st * 5)) & 0x1F;
+    uint mode = (RC_PROG >> (st * 5)) & 0x1F;
     float q = c.w != 0.0 ? c.w : 1.0;
     o = float4(0.0, 0.0, 0.0, 0.0);
     if (mode == 0) { o = float4(0.0, 0.0, 0.0, 1.0); return true; }
@@ -171,7 +229,11 @@ bool stage_fetch(uint st, float4 c, out float4 o) {
     if (mode == 3) {
         float x = c.x, y = c.y, z = c.z, ax = abs(x), ay = abs(y), az = abs(z);
         float ma, sc, tc; uint face;
+#ifdef RCK
+        if (!(RC_TXK(st) & 4)) { o = rc_texel(st, c.x, c.y, 0); return true; }
+#else
         if (!(tex[st].z & 4)) { o = rc_texel(st, c.x, c.y, 0); return true; }
+#endif
         if (ax >= ay && ax >= az) {
             face = x > 0.0 ? 0 : 1; ma = ax; sc = x > 0.0 ? -z : z; tc = -y;
         } else if (ay >= az) {
@@ -269,17 +331,19 @@ float4 rc_eval(float4 v0, float4 v1, float4 fog, float4 t0, float4 t1,
     float4 R1 = 0.0, R2 = 0.0, R3 = 0.0, R4 = 0.0, R5 = 0.0, R6 = 0.0, R7 = 0.0;
     float4 R8 = 0.0, R9 = 0.0, R10 = 0.0, R11 = 0.0, R12 = 0.0, R13 = 0.0, R14 = 0.0;
     float4 R15 = 0.0;
-    uint n = min(ctl.x & 0xFF, 8u), flags = ctl.x >> 8, s;
+    uint n = RC_NSTAGES, flags = RC_CONTROL >> 8, s;
     R3 = fog; R4 = v0; R5 = v1;
     R8 = t0; R9 = t1; R10 = t2; R11 = t3;
-    R12.a = (ctl.y & 0x1F) ? t0.a : 1.0;
-    [loop] for (s = 0; s < n; s++) {
-        uint icw = W8(cicw, s), ocw = W8(cocw, s);
-        uint ai = W8(aicw, s), ao = W8(aocw, s);
+    R12.a = (RC_PROG & 0x1F) ? t0.a : 1.0;
+    RC_LOOP for (s = 0; s < n; s++) {
+        uint icw = RC_WORD(cicw, RCK_C, s), ocw = RC_WORD(cocw, RCK_O, s);
+        uint ai = RC_WORD(aicw, RCK_A, s), ao = RC_WORD(aocw, RCK_P, s);
         uint fl = ocw >> 12, afl = ao >> 12, d;
         bool mux;
-        float3 A, B, C, D, pab, pcd, sum, ab, cd, ms;
-        float aA, aB, aC, aD, sab, scd, ssum, aab, acd, ams;
+        float3 A, B, C, D;
+        float3 pab, pcd, sum, ab, cd, ms;
+        float aA, aB, aC, aD;
+        RC_PRECISE float sab, scd, ssum, aab, acd, ams;
         R1 = unpack(W8(fac0, (flags & 0x010) ? s : 0));
         R2 = unpack(W8(fac1, (flags & 0x100) ? s : 0));
         mux = (flags & 1) ? R12.a >= 0.5 : ((((int)(R12.a * 255.0)) & 1) != 0);
@@ -316,8 +380,8 @@ float4 rc_eval(float4 v0, float4 v1, float4 fog, float4 t0, float4 t1,
         if (d != 0) rset_a(d, ams, RREGS);
     }
     float4 o;
-    if (fin.x != 0 || fin.y != 0) {
-        uint f0 = fin.x, f1 = fin.y, ff = f1 & 0xFF;
+    if (RC_FIN0 != 0 || RC_FIN1 != 0) {
+        uint f0 = RC_FIN0, f1 = RC_FIN1, ff = f1 & 0xFF;
         float3 a, b, E, F, A, B, C, D;
         R1 = unpack(fin.z); R2 = unpack(fin.w);
         a = (ff & 0x40) ? 1.0 - R5.rgb : R5.rgb;

@@ -157,15 +157,31 @@ static void fb_toggle_fullscreen(HWND h)
 static uint32_t     *s_present[2];
 static volatile LONG s_present_idx = -1;   /* -1 until the first flip */
 
+/* RECOMP_FB_VA, read once: both calls below run at every flip, and getenv
+ * walks the whole environment (long under Proton) each time. */
+static int fb_va_pin(uint32_t *va)
+{
+    static int pinned = -1;                /* -1: not read yet */
+    static uint32_t pin_va;
+    if (pinned < 0) {
+        const char *s = getenv("RECOMP_FB_VA");
+        pin_va = s ? (uint32_t)strtoul(s, NULL, 0) : 0;
+        pinned = s != NULL;
+    }
+    *va = pin_va;
+    return pinned;
+}
+
 void xbox_FramebufferWindowSet(uint32_t fb_va, uint32_t pitch)
 {
     /* RECOMP_FB_VA pins the window to one guest address instead of following
      * whichever surface is being drawn into. A black window cannot distinguish
      * "the read path is broken" from "the title rendered black", and pointing
      * it at memory known to have content settles that. */
-    const char *pin = getenv("RECOMP_FB_VA");
+    uint32_t pin_va;
+    int pinned = fb_va_pin(&pin_va);
 
-    s_fb_va = pin ? (uint32_t)strtoul(pin, NULL, 0) : fb_va;
+    s_fb_va = pinned ? pin_va : fb_va;
     if (pitch)
         s_fb_pitch = pitch;
 }
@@ -185,11 +201,11 @@ void xbox_FramebufferWindowPresent(uint32_t fb_va, uint32_t pitch)
 {
     const uint8_t *src;
     LONG next;
-    uint32_t bpp, x, y;
+    uint32_t bpp, x, y, pin_va;
 
     if (!s_fb_running || !fb_va || !pitch)
         return;
-    if (getenv("RECOMP_FB_VA"))
+    if (fb_va_pin(&pin_va))
         return;                       /* pinned: leave the old path alone */
     next = (s_present_idx == 0) ? 1 : 0;
     if (!s_present[next]) {

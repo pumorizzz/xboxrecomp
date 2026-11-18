@@ -495,7 +495,9 @@ The runtime libraries (C) use:
 - MSVC (Visual Studio 2022) or MinGW-w64 on Windows; Clang or GCC on Linux/macOS
 - Windows SDK (D3D11, DXGI, XInput, XAudio2, waveOut, Media Foundation); the
   D3D11 back end's shaders are compiled during the build by a host tool on
-  D3DCompile (`src/d3d/nv2a_gpu_shaders.cmake`); a MinGW cross build from
+  D3DCompile (`src/d3d/nv2a_gpu_shaders.cmake`; a title may set
+  `NV2A_GPU_RC_KEYS` to a file of register-combiner states, each compiled into
+  a pixel shader of its own); a MinGW cross build from
   Linux needs `CMAKE_CROSSCOMPILING_EMULATOR` (e.g. `tests/proton_run.sh`) to
   run it, and stops at configure without one
 - Linux/macOS: SDL2, libepoxy, pkg-config

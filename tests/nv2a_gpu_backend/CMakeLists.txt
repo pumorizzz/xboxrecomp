@@ -117,9 +117,66 @@ foreach(s s1 s1b s2 s4 s5 s13 s14 s22 s22b s23)
         ENVIRONMENT "RECOMP_GPU_RASTER_SCALE=3;RECOMP_GPU_RASTER_MSAA=4")
 endforeach()
 
+# The shaders of combiner states (nv2a_gpu_shaderc --rc-keys): rc_keys_test.txt lists
+# the states; the back end draws each with a ps_rc of its own, and the tests above
+# draw through them too. nv2a-gpu-rckey checks each against the frozen reference
+# (ps_reference.hlsl), the general ps_rc (PSCHECK) and the source (see the head of
+# nv2a_gpu_rckey_test.c); -scaled at 3x3 with 4x MSAA, -generic with
+# RECOMP_GPU_RASTER_RC_GENERIC=1 (no own shader draws, the same pixels).
+add_executable(nv2a-gpu-rckey-test nv2a_gpu_rckey_test.c
+    ../../src/kernel/nv2a_pb_exec.c
+    ../../src/kernel/nv2a_vsh_interp.c
+    ../../src/kernel/nv2a_combiner.c
+    ../../src/d3d/nv2a_gpu_d3d11.c
+    ../../src/d3d/nv2a_gpu_prof.c)
+target_include_directories(nv2a-gpu-rckey-test PRIVATE ../../src/kernel ../../src)
+target_link_libraries(nv2a-gpu-rckey-test PRIVATE d3d11 dxgi dxguid d3dcompiler)
+target_compile_definitions(nv2a-gpu-rckey-test PRIVATE NV2A_GPU_TEST_HOOKS
+    PS_REF_PATH="${CMAKE_CURRENT_SOURCE_DIR}/ps_reference.hlsl"
+    SHADERS_HLSL_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../../src/d3d/nv2a_gpu_shaders.hlsl"
+    RC_KEYS_PATH="${CMAKE_CURRENT_SOURCE_DIR}/rc_keys_test.txt")
+if(MSVC)
+    target_compile_definitions(nv2a-gpu-rckey-test PRIVATE _CRT_SECURE_NO_WARNINGS)
+endif()
+add_test(NAME nv2a-gpu-rckey COMMAND nv2a-gpu-rckey-test)
+add_test(NAME nv2a-gpu-rckey-scaled COMMAND nv2a-gpu-rckey-test)
+set_tests_properties(nv2a-gpu-rckey-scaled PROPERTIES
+    ENVIRONMENT "RECOMP_GPU_RASTER_SCALE=3;RECOMP_GPU_RASTER_MSAA=4")
+add_test(NAME nv2a-gpu-rckey-generic COMMAND nv2a-gpu-rckey-test)
+set_tests_properties(nv2a-gpu-rckey-generic PROPERTIES
+    ENVIRONMENT "RECOMP_GPU_RASTER_RC_GENERIC=1")
+
+set(NV2A_GPU_RC_KEYS ${CMAKE_CURRENT_SOURCE_DIR}/rc_keys_test.txt)
 # nv2a_gpu_d3d11.c's shaders, compiled at build time (src/d3d/nv2a_gpu_shaders.cmake).
 include(${CMAKE_CURRENT_SOURCE_DIR}/../../src/d3d/nv2a_gpu_shaders.cmake)
 nv2a_gpu_shaders(nv2a-gpu-backend-test)
 nv2a_gpu_shaders(nv2a-gpu-prof-test)
 nv2a_gpu_shaders(nv2a-gpu-ps-test)
 nv2a_gpu_shaders(nv2a-gpu-skip-test)
+nv2a_gpu_shaders(nv2a-gpu-rckey-test)
+
+# The generator's two edges the tests above never reach, as every one of them builds
+# with NV2A_GPU_RC_KEYS set:
+# - nv2a-gpu-rckey-none: the header with NO --rc-keys (any title without a state
+#   file) is built here beside the others, and a small TU includes it
+#   (nv2a_gpu_rckey_none_test.c);
+# - nv2a-gpu-rckey-keyfile: a state line nv2a_rc_key_make would not build is refused
+#   with its line number (rckey_shaderc_check.cmake).
+set(rckey_none_dir ${CMAKE_CURRENT_BINARY_DIR}/rckey_none)
+file(MAKE_DIRECTORY ${rckey_none_dir})
+add_custom_command(OUTPUT ${rckey_none_dir}/nv2a_gpu_shaders_none.h
+    COMMAND nv2a-gpu-shaderc ${CMAKE_CURRENT_SOURCE_DIR}/../../src/d3d/nv2a_gpu_shaders.hlsl
+            ${rckey_none_dir}/nv2a_gpu_shaders_none.h vs_main:vs_4_0:k_vs_main
+    DEPENDS nv2a-gpu-shaderc ${CMAKE_CURRENT_SOURCE_DIR}/../../src/d3d/nv2a_gpu_shaders.hlsl
+    COMMENT "nv2a_gpu_shaders_none.h: the header without combiner states"
+    VERBATIM)
+add_executable(nv2a-gpu-rckey-none-test nv2a_gpu_rckey_none_test.c
+    ${rckey_none_dir}/nv2a_gpu_shaders_none.h)
+target_include_directories(nv2a-gpu-rckey-none-test PRIVATE ${rckey_none_dir})
+add_test(NAME nv2a-gpu-rckey-none COMMAND nv2a-gpu-rckey-none-test)
+add_test(NAME nv2a-gpu-rckey-keyfile
+    COMMAND ${CMAKE_COMMAND}
+        -DSHADERC=$<TARGET_FILE:nv2a-gpu-shaderc>
+        -DHLSL=${CMAKE_CURRENT_SOURCE_DIR}/../../src/d3d/nv2a_gpu_shaders.hlsl
+        -DDIR=${CMAKE_CURRENT_BINARY_DIR}/rckey_keyfile
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/rckey_shaderc_check.cmake)

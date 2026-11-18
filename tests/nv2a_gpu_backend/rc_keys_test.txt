@@ -1,0 +1,81 @@
+# Combiner states for tests/nv2a_gpu_backend nv2a-gpu-rckey*: nv2a_gpu_shaderc compiles a
+# pixel shader of its own for each (src/d3d/nv2a_gpu_shaders.cmake, NV2A_GPU_RC_KEYS) and
+# the tests check each against the frozen reference and the general shader. Format:
+# src/d3d/nv2a_gpu_rc_key.h. Generated 2026-11-18 (the curated programs of nv2a_gpu_ps_test.c (c),
+# the Fallout states of the port's config/gpu_rc_keys.txt, and synthetic ones);
+# at most 40 lines (checked in nv2a_gpu_rckey_test.c). Every line added to the port's
+# config/gpu_rc_keys.txt is copied here too, so its shader is proved bit for bit on WARP.
+
+# ---- Fallout (all 9 lines of the port's config/gpu_rc_keys.txt, 2026-11-18) ----
+# 48.2 % px: Ruby's bar, Carbon boot route, live pass, Tutorial
+rc n=2 ctl=00011102 prog=00001 fin=0000000C:00001C80 tex=0000000A s0=C8C40000:D8D41010:000100C0:000100C0 s1=CC3C0000:38301010:000000C0:000000C0
+# 19.0 % px: Ruby's bar, Carbon boot route, live pass, Tutorial
+rc n=1 ctl=00000001 prog=00001 fin=0000000C:00001C80 tex=00000048 s0=08200000:14200000:00000C00:00000C00
+# 15.6 % px: Ruby's bar, Carbon boot route, live pass, Tutorial
+rc n=1 ctl=00011101 prog=00001 fin=0000000C:00001C80 tex=00000008 s0=C8C40000:D8D41010:000100C0:000100C0
+# 8.5 % px: Ruby's bar, Carbon boot route, live pass, Tutorial
+rc n=1 ctl=00011101 prog=00001 fin=0000000C:00001C80 tex=0000000A s0=C8C40000:D8D41010:000100C0:000100C0
+# 3.5 % px: Ruby's bar, Carbon boot route, live pass, Tutorial
+rc n=1 ctl=00011101 prog=08000 fin=0000000C:00001C80 tex=08000000 s0=CBC40000:DBD41010:000100C0:000100C0
+# 2.3 % px: Ruby's bar, Carbon boot route, live pass, Tutorial
+rc n=1 ctl=00011101 prog=00001 fin=0000000C:00001C80 tex=0000004A s0=C8C40000:D8D41010:000100C0:000100C0
+# 1.5 % px: Ruby's bar, Carbon boot route, live pass, Tutorial
+rc n=1 ctl=00011101 prog=00000 fin=0000000C:00001C80 tex=00000000 s0=C4200000:D4301010:000000C0:000000C0
+# 0.9 % px: Ruby's bar, Carbon boot route, live pass, Tutorial
+rc n=2 ctl=00011102 prog=00021 fin=0000000C:00001C80 tex=00000A0A s0=D8C920C8:D8D930D8:00000C00:00000C00 s1=CCC40000:DCD41010:000100C0:000100C0
+# 0.4 % px: Ruby's bar, Carbon boot route, live pass, Tutorial
+rc n=2 ctl=00011102 prog=00021 fin=0000000C:00001C80 tex=00000A0A s0=38C920C8:38D930D8:00000C00:00000C00 s1=CCC40000:DCD41010:000100C0:000100C0
+
+# ---- the curated programs, textures point (class 0x08) and bilinear (0x0A) ----
+# modulate, point
+rc n=1 ctl=00000001 prog=00021 fin=0000000C:00001C00 tex=00000808 s0=08040000:18140000:00000C00:00000C00
+# modulate, bilinear (base of the one-field pairs below)
+rc n=1 ctl=00000001 prog=00021 fin=0000000C:00001C00 tex=00000A0A s0=08040000:18140000:00000C00:00000C00
+# modulate 2x
+rc n=1 ctl=00000001 prog=00021 fin=0000000C:00001C00 tex=00000808 s0=08040000:18140000:000100C0:00000C00
+# modulate 4x
+rc n=1 ctl=00000001 prog=00021 fin=0000000C:00001C00 tex=0000080A s0=08040000:18140000:000200C0:00000C00
+# addsigned
+rc n=1 ctl=00000001 prog=00021 fin=0000000C:00001C00 tex=00000808 s0=08200420:18140000:00008C00:00000C00
+# dot3 expand
+rc n=1 ctl=00000001 prog=00021 fin=0000000C:00001C00 tex=0000080A s0=48440000:18140000:000020C0:00000C00
+# lerp in the final combiner
+rc n=0 ctl=00000000 prog=00021 fin=11080900:00001800 tex=00000A08
+# E*F
+rc n=0 ctl=00000000 prog=00021 fin=0000000F:08041900 tex=00000808
+# two stages through r1
+rc n=2 ctl=00000002 prog=00021 fin=0000000C:00001C00 tex=00000A0A s0=08040000:18140000:000000D0:00000C00 s1=0D090000:00000000:000000C0:00000000
+# blue to alpha
+rc n=1 ctl=00000001 prog=00021 fin=0000000C:00001C00 tex=00000808 s0=08040000:18140000:000800C0:00000000
+# constants per stage
+rc n=2 ctl=00001002 prog=00021 fin=0000000C:00001C00 tex=00000808 s0=01080000:18140000:000000C0:00000C00 s1=010C0000:00000000:000000C0:00000000
+
+# ---- synthetic ----
+# eight stages
+rc n=8 ctl=00000008 prog=00421 fin=0000000C:00001C00 tex=00080A08 s0=08040000:18140000:000000C0:00000C00 s1=0C040905:1C140000:000100C0:00000C00 s2=0C040000:1C140000:000300C0:00000C00 s3=0C040905:1C140000:000000C0:00000C00 s4=0C040000:1C140000:000100C0:00000C00 s5=0C040905:1C140000:000300C0:00000C00 s6=0C040000:1C140000:000000C0:00000C00 s7=0C040905:1C140000:000100C0:00000C00
+# mux on the sum, MSB mode
+rc n=1 ctl=00000101 prog=00021 fin=0000000C:00001C00 tex=00000808 s0=08040905:18141915:00004C00:00004C00
+# output scales 0x08 0x10 0x18 0x20 0x30 0x38
+rc n=6 ctl=00000006 prog=00021 fin=0000000C:00001C00 tex=00000808 s0=08040000:18140000:000080C0:00000C00 s1=0C040000:00000000:000100C0:00000000 s2=0C040000:00000000:000180C0:00000000 s3=0C040000:00000000:000200C0:00000000 s4=0C040000:00000000:000300C0:00000000 s5=0C040000:00000000:000380C0:00000000
+# no final combiner
+rc n=1 ctl=00000001 prog=00021 fin=00000000:00000000 tex=00000808 s0=08040000:18140000:00000C00:00000C00
+# stage mode 3, a cube
+rc n=1 ctl=00000001 prog=00003 fin=0000000C:00001C00 tex=0000000C s0=08040000:18140000:00000C00:00000C00
+# stage mode 3, not a cube
+rc n=1 ctl=00000001 prog=00003 fin=0000000C:00001C00 tex=00000008 s0=08040000:18140000:00000C00:00000C00
+# stage mode 4 (coordinates as colour), then a texture
+rc n=1 ctl=00000001 prog=00024 fin=0000000C:00001C00 tex=00000800 s0=08040905:18140000:00000C00:00000C00
+# stage mode 5 (clip planes), then a texture
+rc n=1 ctl=00000001 prog=00025 fin=0000000C:00001C00 tex=00000800 s0=08040905:18140000:00000C00:00000C00
+# stages with no usable texture (white)
+rc n=1 ctl=00000001 prog=00021 fin=0000000C:00001C00 tex=00000000 s0=08040000:18140000:00000C00:00000C00
+# a render target read swizzled, point
+rc n=1 ctl=00000001 prog=00001 fin=0000000C:00001C00 tex=00000068 s0=08040000:18140000:00000C00:00000C00
+# a render target read swizzled, bilinear
+rc n=1 ctl=00000001 prog=00001 fin=0000000C:00001C00 tex=0000006A s0=08040000:18140000:00000C00:00000C00
+# pair: the bilinear modulate, only aicw differs
+rc n=1 ctl=00000001 prog=00021 fin=0000000C:00001C00 tex=00000A0A s0=08040000:18140020:00000C00:00000C00
+# pair: the bilinear modulate, only final1 differs
+rc n=1 ctl=00000001 prog=00021 fin=0000000C:00001800 tex=00000A0A s0=08040000:18140000:00000C00:00000C00
+# pair: the bilinear modulate, only the mux bit of the control differs
+rc n=1 ctl=00000101 prog=00021 fin=0000000C:00001C00 tex=00000A0A s0=08040000:18140000:00000C00:00000C00

@@ -61,6 +61,10 @@
  *     by hooking WriteFile in the C runtime's import table (crt_writes.c,
  *     Windows only; the count is skipped when no entry is found); the text is
  *     read back. text_block.h, which does it, is checked byte for byte.
+ *   - The draw path calls no getenv: after a warm-up, 50 draws and a flip make
+ *     none (RECOMP_PB_EXEC_VERBOSE was read at every draw, and getenv walks the
+ *     whole environment, long under Proton). Counted by hooking getenv in the
+ *     exe's import table (crt_writes.c, /MD only).
  *
  * Harness as tests/nv2a_near_clip. */
 #include <math.h>
@@ -512,6 +516,41 @@ int main(void)
     /* No dump, no download: not for the draws above, not for the report. */
     nv2a_pb_exec_report();
     CHECK(s_read_syncs == 0);
+    /* No getenv on the draw path: after a warm-up (the first draws and a flip
+     * read what they read once), 50 more draws and a flip make no call. The
+     * executor's RECOMP_PB_EXEC_VERBOSE was read at every draw, and getenv
+     * walks the whole environment, long under Proton; the executor's report is
+     * not called. */
+    {
+        extern int crt_count_hook(const char *name);
+        extern long crt_count(const char *name);
+        int hooked = crt_count_hook("getenv"), c, rep;
+        long before = 0, calls = 0;
+        for (rep = 0; rep < 51; rep++) {
+            if (rep == 1)
+                before = crt_count("getenv");
+            m(0x17FC, 8);                                /* BEGIN_END: quads */
+            for (c = 0; c < 4; c++) {
+                static const float CX[4] = { 0, 40, 40, 0 }, CY[4] = { 0, 0, 40, 40 };
+                mf(0x1518, 10.0f + CX[c]);               /* SET_VERTEX4F */
+                mf(0x151C, 10.0f + CY[c]);
+                mf(0x1520, 100.0f);
+                mf(0x1524, 1.0f);
+            }
+            m(0x17FC, 0);
+            nv2a_pb_exec_sync();
+            if (rep == 0)
+                m(0x0130, 0);                            /* the warm-up flip */
+        }
+        m(0x0130, 0);
+        calls = crt_count("getenv") - before;
+        printf("draw path: %ld getenv calls over 50 draws and a flip (%d import entries hooked)\n",
+               calls, hooked);
+        if (hooked > 0)
+            CHECK(calls == 0);
+        else
+            printf("draw path: no getenv import entry found -- not checked\n");
+    }
     /* A dump (into a directory that is not there) still gets one. */
 #ifdef _WIN32
     _putenv("RECOMP_FB_DUMP=nv2a_points_no_such_dir/f_");

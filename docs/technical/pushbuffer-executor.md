@@ -466,6 +466,65 @@ Two more steps took the readback out of the frame altogether:
   prints every 10 s how many pixels differ (`[PSCHECK] ... float differ k,
   8-bit differ j`); by the bar both were 0. Diagnostics only: it reads back
   per draw.
+  **A shader for each combiner state.** On the Steam Deck (RDNA, Proton) the
+  general `ps_rc` was still far from the flat shader: `draw.rc` 22-24 ms of a
+  24 ms span at 1280x800 against 0.54 ms of a 1 ms span with `flatps`, ~45x
+  where NVIDIA showed 3-4x. Registers on RDNA are assigned to the whole shader
+  by its worst path (fifteen `float4`s, four texels, A to D, every mapping,
+  dot, mux and texture mode compiled in), and the occupancy left does not hide
+  a `Load`'s latency; the branches are uniform and cost little themselves.
+  A game uses a handful of programs (Fallout: nine states in the boot route,
+  Ruby's bar and the Tutorial; the four largest draw 91 % of the pixels), so
+  each state gets a `ps_rc` of its own, compiled when the toolkit is built.
+  - The state is a key (`nv2a_gpu_rc_key.h`, header-only, shared by the back
+    end, `nv2a_gpu_shaderc` and the tests): the combiner words of the stages
+    in use, the stage program, the final combiner, the control bits that
+    change the code, and a class of each stage's texture (valid, bilinear,
+    swizzled view of a target, render target, cube). Factors, final constants,
+    fog, alpha test, clip range, size and wrap modes stay in the cbuffer.
+    Text form: `rc n=2 ctl=00011102 prog=00001 fin=... tex=... s0=... s1=...`.
+  - The port lists its states in a file (Fallout: `config/gpu_rc_keys.txt`)
+    and sets `NV2A_GPU_RC_KEYS` before including `nv2a_gpu_shaders.cmake`;
+    `nv2a_gpu_shaderc --rc-keys <file>` compiles `ps_rc` once per line with
+    the key's words as macros (`RCK`, `RCK_N`, `RCK_C0`...), so the compiler
+    folds the register selects, the stage loop and the texture paths away:
+    `TempRegisterCount` 4-10 against 33 of the general shader, no `switch`,
+    no indexable temp, a loop only for a swizzled target. The shaders add
+    ~0.1 s each to the build and ~90 KB to the exe for nine states. Unset:
+    no own shaders, as before. The general shader's DXBC is byte-identical
+    to what it was.
+  - A state not in the file is drawn by the general `ps_rc`; the 10 s
+    `[GPURAST]` line gives `combiners: own N, generic M draws (K states
+    without a shader)` and the first 64 such states are logged once as
+    `[GPURAST] combiner state with no shader of its own (the generic one
+    draws it): rc n=...`; a line to paste into the file. At worst the state
+    costs what it did.
+  - Tests (`tests/nv2a_gpu_backend`, `rc_keys_test.txt`, 32 states): `nv2a-gpu-rckey`,
+    `-scaled` and `-generic` draw three random quads per state (everything
+    outside the key at random) through the frozen reference and through the
+    back end, byte for byte; PSCHECK against the general shader; a state
+    outside the file is drawn generically; the embedded DXBC is what the
+    source compiles to; each own shader has no indexable temp and fewer
+    temporary registers than the general one.
+  - Not exactly bit for bit on NVIDIA. On WARP every own shader matches the
+    general one (and the reference) in the float target and in 8 bits. On an
+    RTX 3080 Ti, `RECOMP_GPU_RASTER_PSCHECK` shows the main Fallout state
+    (~48 % of the pixels) differing by 1 in an 8-bit channel in 18-100 pixels
+    a frame (float: millions of pixels differ in the last bits). The compiler
+    flags do not change it (IEEE strictness, optimisation levels 0-3 give
+    the same DXBC for the state, `skipopt` another with the same result),
+    nor does `precise`, a loop instead of the unrolled stages, or the
+    general texture path: the driver's compiler orders or fuses the
+    literal-folded arithmetic its own way. Accepted as a known difference
+    (the check for an own shader on a real GPU: worst 1 LSB, 8-bit
+    differ small); `RECOMP_GPU_RASTER_RC_GENERIC=1` draws everything with the
+    general shader. `RC_PRECISE` (`precise` on the alpha products and sums of
+    the own shaders) is what makes the own shaders float-exact on WARP.
+  - Numbers, PC (RTX 3080 Ti, Ruby's bar, 6x5 + MSAA 2, 30 fps limit): the
+    span 6.5 -> 2.6-3.0 ms, `draw.rc` 5.0-5.4 -> 0.85-0.94 ms. At the Deck's
+    settings (1x, MSAA 2, 60, skip auto) the spawn span 1.81 -> 1.18 ms;
+    by the bar 1.80 -> 1.92 ms (the scene had 30 % more pixels; ns per 1000
+    invocations 973 -> 943). Steam Deck after: awaiting a measurement.
 - **Texture decodes off the frame.** A texture new to the back end's cache is
   decoded on the executor's thread mid-frame. Texel by texel through the
   executor's sampler that ran at ~19 Mtexel/s: Fallout's first street in
@@ -555,6 +614,8 @@ frames Carbon compares at 0.00–0.02%.
 | `RECOMP_GPU_RASTER_RTTEX=0` | the D3D11 back end reads every texture through guest RAM, render targets included |
 | `RECOMP_GPU_RASTER_PSCHECK=<ref.hlsl>[,<every>]` | every `<every>`-th (default 30) frame the D3D11 back end draws each draw again through its pixel shader and through `ps_main` of the reference file (`tests/nv2a_gpu_backend/ps_reference.hlsl`) and prints every 10 s a `[PSCHECK]` line: draws, pixels, float and 8-bit differences, the first that differs; diagnostics only (reads back per draw); see "Pixel shader cost" above. Unset: off |
 | `RECOMP_GPU_RASTER_LOSE_AT=<flip>` | act out a lost D3D11 device at that flip: the software rasteriser takes over from the next frame, as after a driver reset |
+| `RECOMP_GPU_RASTER_RC_STATS=1` | the D3D11 back end's 10 s report lists the register-combiner states (`nv2a_gpu_rc_key.h`) with draws and pixels, cumulative, top 32 by pixels, own shader or general; states without a shader of their own are counted in the `[GPURAST]` line either way; see "Pixel shader cost" above. Unset: off |
+| `RECOMP_GPU_RASTER_RC_GENERIC=1` | every combiner state is drawn by the general `ps_rc`, the shaders of `NV2A_GPU_RC_KEYS` unused (A/B, and the way out of the 1 LSB difference on NVIDIA). Unset: own shaders |
 | `RECOMP_GPU_PROF=<secs>[,stats][,flatps]` | every `<secs>` (at least 0.5) a `[GPUPROF]` block: the D3D11 back end's GPU time per frame by pass and render target, from timestamp queries; `stats` adds pixel shader invocations, `flatps` a flat pixel shader for transformed draws (wrong picture, diagnostics only); see "GPU profile" above. Unset or `0`: off |
 | `RECOMP_FPS_LIMIT=<hz>` | the flip stall completes on a tick of the 60 Hz vblank grid (the host's performance counter from the first flip or vblank), at least ceil(60/hz) ticks after the previous flip; a frame that misses its tick waits for the next one, as on a vsynced console, so frame times are whole 1/60 s (39 fps shows as 30, never 4 + 28 ms pairs). Default 60; a limit above 60 counts as 60; `0` off — the flip completes at once and a title pacing itself on the flip runs its menus at hundreds of fps. With `RECOMP_VBLANK` the guest's vblank count follows the same grid |
 | `RECOMP_FRAME_SKIP=0\|1\|auto` | frame skip (see [Frame Skip](#frame-skip)): the flip waits for every tick of the grid whatever the limit, and only some flips are shown. `1`: L shows a second on the grid (`RECOMP_FPS_LIMIT` = L, active below 60), Present as before; `auto`: the same cadence, and a frame is shown only when the back end can present it without waiting (an outside limiter), on a flip-model swap chain. Needs a back end with `pace` (the D3D11 one, not with `compare` or `SYNC=all`); otherwise one `[GPU] RECOMP_FRAME_SKIP=… is not active: …` line. Unset or `0`: off, the flip waits ceil(60/L) ticks |
