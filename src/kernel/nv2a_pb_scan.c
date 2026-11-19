@@ -155,7 +155,18 @@ static const char *nv097_name(uint32_t m)
     return "";
 }
 
+extern uint64_t nv2a_pb_exec_clock(void);
+extern void nv2a_pb_exec_note_scan(uint64_t ticks);
+static void pb_scan_report_body(void);
+
 void nv2a_pb_scan_report(void)
+{
+    uint64_t t0 = nv2a_pb_exec_clock();
+    pb_scan_report_body();
+    nv2a_pb_exec_note_scan(nv2a_pb_exec_clock() - t0);
+}
+
+static void pb_scan_report_body(void)
 {
     int i;
 
@@ -308,7 +319,17 @@ static void pb_consume(const uint8_t *mem, uint32_t put, uint32_t *words)
     }
 }
 
+static void pb_scan_body(uint32_t put_phys);
+
+/* A scan is the executor thread's work (what `[GPU] executor:` reports). */
 void nv2a_pb_scan(uint32_t put_phys)
+{
+    uint64_t t0 = nv2a_pb_exec_clock();
+    pb_scan_body(put_phys);
+    nv2a_pb_exec_note_scan(nv2a_pb_exec_clock() - t0);
+}
+
+static void pb_scan_body(uint32_t put_phys)
 {
     const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
     uint32_t put = put_phys & PB_PHYS_MASK;
@@ -531,7 +552,16 @@ static uint32_t pb_walk_segment(uint32_t va, uint32_t end_va, int in_call,
     return words;
 }
 
+static void pb_scan_segment_body(uint32_t start_va, uint32_t end_va);
+
 void nv2a_pb_scan_segment(uint32_t start_va, uint32_t end_va)
+{
+    uint64_t t0 = nv2a_pb_exec_clock();
+    pb_scan_segment_body(start_va, end_va);
+    nv2a_pb_exec_note_scan(nv2a_pb_exec_clock() - t0);
+}
+
+static void pb_scan_segment_body(uint32_t start_va, uint32_t end_va)
 {
     uint32_t words, jumps = 0, unknown = 0;
 

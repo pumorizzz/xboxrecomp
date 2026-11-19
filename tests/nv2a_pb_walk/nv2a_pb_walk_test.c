@@ -48,6 +48,9 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
 }
 void nv2a_pb_exec_report(void) {}
 void nv2a_pb_exec_sync(void) {}
+/* The scan's executor-cost metric (nv2a_pb_scan.c times itself with these). */
+uint64_t nv2a_pb_exec_clock(void) { return 0; }
+void nv2a_pb_exec_note_scan(uint64_t t) { (void)t; }
 void xbox_Nv2aAckBusyBits(void) {}
 
 void nv2a_pb_resync(uint32_t get_phys);

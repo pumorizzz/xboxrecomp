@@ -146,6 +146,34 @@ add_test(NAME nv2a-gpu-rckey-generic COMMAND nv2a-gpu-rckey-test)
 set_tests_properties(nv2a-gpu-rckey-generic PROPERTIES
     ENVIRONMENT "RECOMP_GPU_RASTER_RC_GENERIC=1")
 
+# The texture hash sees every byte, and the back end's epochs (see the head of
+# nv2a_gpu_epoch_test.c): its own exe, one scenario a run.
+add_executable(nv2a-gpu-epoch-test nv2a_gpu_epoch_test.c
+    ../../src/kernel/nv2a_pb_exec.c
+    ../../src/kernel/nv2a_vsh_interp.c
+    ../../src/kernel/nv2a_combiner.c
+    ../../src/d3d/nv2a_gpu_d3d11.c
+    ../../src/d3d/nv2a_gpu_prof.c)
+target_include_directories(nv2a-gpu-epoch-test PRIVATE ../../src/kernel ../../src)
+target_link_libraries(nv2a-gpu-epoch-test PRIVATE d3d11 dxgi dxguid d3dcompiler)
+target_compile_definitions(nv2a-gpu-epoch-test PRIVATE NV2A_GPU_TEST_HOOKS)
+if(MSVC)
+    target_compile_definitions(nv2a-gpu-epoch-test PRIVATE _CRT_SECURE_NO_WARNINGS)
+endif()
+add_test(NAME nv2a-gpu-epoch COMMAND nv2a-gpu-epoch-test)
+set_tests_properties(nv2a-gpu-epoch PROPERTIES TIMEOUT 300)
+# The same exe, one switch each: the old rule (every method ends an epoch), the
+# rule's check, and write-back at every sync.
+add_test(NAME nv2a-gpu-epoch-method COMMAND nv2a-gpu-epoch-test)
+set_tests_properties(nv2a-gpu-epoch-method PROPERTIES TIMEOUT 300
+    ENVIRONMENT "RECOMP_GPU_RASTER_EPOCH=method")
+add_test(NAME nv2a-gpu-epoch-verify COMMAND nv2a-gpu-epoch-test)
+set_tests_properties(nv2a-gpu-epoch-verify PROPERTIES TIMEOUT 300
+    ENVIRONMENT "RECOMP_GPU_RASTER_EPOCH_VERIFY=1")
+add_test(NAME nv2a-gpu-epoch-syncall COMMAND nv2a-gpu-epoch-test)
+set_tests_properties(nv2a-gpu-epoch-syncall PROPERTIES TIMEOUT 300
+    ENVIRONMENT "RECOMP_GPU_RASTER_SYNC=all")
+
 set(NV2A_GPU_RC_KEYS ${CMAKE_CURRENT_SOURCE_DIR}/rc_keys_test.txt)
 # nv2a_gpu_d3d11.c's shaders, compiled at build time (src/d3d/nv2a_gpu_shaders.cmake).
 include(${CMAKE_CURRENT_SOURCE_DIR}/../../src/d3d/nv2a_gpu_shaders.cmake)
@@ -154,6 +182,7 @@ nv2a_gpu_shaders(nv2a-gpu-prof-test)
 nv2a_gpu_shaders(nv2a-gpu-ps-test)
 nv2a_gpu_shaders(nv2a-gpu-skip-test)
 nv2a_gpu_shaders(nv2a-gpu-rckey-test)
+nv2a_gpu_shaders(nv2a-gpu-epoch-test)
 
 # The generator's two edges the tests above never reach, as every one of them builds
 # with NV2A_GPU_RC_KEYS set:

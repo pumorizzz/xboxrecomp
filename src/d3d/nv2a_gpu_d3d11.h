@@ -18,6 +18,12 @@
  * RECOMP_GPU_RASTER_SYNC=all -- write back at every executor sync (for a
  *   title whose CPU reads what the GPU drew); RECOMP_GPU_RASTER_RTTEX=0 --
  *   read every texture through guest RAM.
+ * RECOMP_GPU_RASTER_EPOCH=method -- every executor method that drains the
+ *   GPU ends an epoch (the rule before the epochs followed what the title can
+ *   see; see nv2a_gpu_d3d11.c);
+ *   RECOMP_GPU_RASTER_EPOCH_VERIFY=1 -- a diagnostic: what the epoch rule
+ *   says is unchanged in guest RAM is looked at again, and a change is
+ *   counted in the `[GPURAST] epochs` line (stale ...) and named once.
  * RECOMP_GPU_RASTER_SCALE=<n>|<x>x<y> -- render at n (1-8) times the surface
  *   each way, the title still sees its own size in guest RAM;
  *   RECOMP_GPU_RASTER_MSAA=<2|4|8> -- samples, lowered to what the device has;

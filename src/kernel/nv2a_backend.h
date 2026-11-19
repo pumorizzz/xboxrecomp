@@ -133,10 +133,18 @@ typedef struct {
 } Nv2aBatch;
 
 /* sync() reasons. */
-#define NV2A_BACKEND_SYNC_METHOD   0   /* a method that reads or orders the GPU */
+#define NV2A_BACKEND_SYNC_METHOD   0   /* a method that tells the title how far the GPU has got (or reads it) */
 #define NV2A_BACKEND_SYNC_SCAN_END 1   /* a pushbuffer scan ends (before DMA_GET) */
 #define NV2A_BACKEND_SYNC_READ     2   /* the executor reads a surface (dumps) */
 #define NV2A_BACKEND_SYNC_PRESENT  3   /* FLIP_STALL: the frame is presented from guest RAM */
+/* A method that orders or drains the GPU but tells the title nothing: whatever
+ * the back end checked against guest RAM this epoch stays checked. The rule is
+ * what the title can learn: it frees or rewrites a texture or a target only
+ * after it has seen the GPU finish with it, and it sees that through the
+ * fence semaphore, NOP 5, reports, flips and DMA_GET (a scan ends). A method
+ * that none of those follows (NOP with another value, WAIT_FOR_IDLE, surface
+ * and clear state) cannot let guest RAM change between two draws of a kick. */
+#define NV2A_BACKEND_SYNC_ORDER    4
 
 typedef struct {
     /* flags: CLEAR_SURFACE bits (Z 0x1, stencil 0x2, colour 0xF0).

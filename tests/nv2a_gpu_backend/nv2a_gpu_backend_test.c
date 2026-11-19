@@ -177,7 +177,7 @@ static void draw_quad(uint32_t va, uint32_t tex, uint32_t fmt, int sync)
 
     fixed_state(tex, fmt, P, 6);
     if (sync)
-        m(0x0210, va);                       /* SET_SURFACE_COLOR_OFFSET (a new epoch) */
+        m(0x0210, va);                       /* SET_SURFACE_COLOR_OFFSET (no epoch ends; nv2a_pb_exec_sync() below does) */
     m(0x17FC, 5);                            /* BEGIN_END: triangles */
     m(0x1810, (5u << 24) | 0);               /* DRAW_ARRAYS 6 from 0 */
     m(0x17FC, 0);
@@ -194,7 +194,7 @@ static void draw_rect(uint32_t va, uint32_t tex, uint32_t fmt, uint32_t lg,
     const float P[6][3] = { {x0,y0,0},{x1,y0,0},{x0,y1,0},{x1,y0,0},{x1,y1,0},{x0,y1,0} };
 
     fixed_state_lg(tex, fmt, P, 6, lg);
-    m(0x0210, va);                           /* SET_SURFACE_COLOR_OFFSET (a new epoch) */
+    m(0x0210, va);                           /* SET_SURFACE_COLOR_OFFSET (no epoch ends; nv2a_pb_exec_sync() below does) */
     m(0x17FC, 5);                            /* BEGIN_END: triangles */
     m(0x1810, (5u << 24) | 0);               /* DRAW_ARRAYS 6 from 0 */
     m(0x17FC, 0);

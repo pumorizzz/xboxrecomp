@@ -12,7 +12,13 @@
  * Colour surfaces. One BGRA8 render target per (guest address,
  * pitch, bytes per pixel; size: see "Internal resolution" below), with a CPU
  * copy (the shadow) of what guest RAM held when the target last matched it. The first time a target is used in
- * an epoch -- epochs end at every executor sync and every flip -- the guest
+ * an epoch -- epochs end at every flip, every scan end and every method the
+ * title can see the effect of (the fence semaphore, NOP 5, the kickoff
+ * marker, reports, notifies; the methods that only order the GPU -- NOP with
+ * another value, WAIT_FOR_IDLE, surface and clear state -- sync with
+ * NV2A_BACKEND_SYNC_ORDER and leave it alone; RECOMP_GPU_RASTER_EPOCH=method
+ * ends one at each, and RECOMP_GPU_RASTER_EPOCH_VERIFY=1 re-checks what an
+ * epoch skipped and counts a change) -- the guest
  * rows are compared with the shadow and the rows the title (or the CPU) has
  * changed are uploaded. A target goes back into guest RAM (and the shadow)
  * only when something reads it there: the flip's present (sync_surface, the
@@ -311,11 +317,22 @@ static ID3D11PixelShader *s_bps_up, *s_bps_down;
 static ID3D11Buffer *s_cb_blit;
 
 static uint32_t s_epoch = 1, s_use_clock, s_flip_no;
+static int s_epoch_every;               /* RECOMP_GPU_RASTER_EPOCH=method: every method ends one */
+static int s_epoch_verify;              /* RECOMP_GPU_RASTER_EPOCH_VERIFY=1: check the rule */
 static uint32_t *s_scratch;             /* RT_W*RT_H texels: conversions, decodes */
 static size_t s_scratch_n;
 
 static struct {
     uint32_t flips, draws, writebacks, uploads, decodes, bc_uploads, rt_tex, presents, taken;
+    /* The epoch rule, for the `[GPURAST] epochs` line: epochs by what ended them, and the
+     * bytes compared against the shadow copies (rt_taken, rt_check) and hashed (texture
+     * resolves, the frame skip's texture hashes). */
+    uint32_t epochs_method, epochs_scan, epochs_flip, taken_n, check_n, hash_n, hash_n_fs;
+    uint64_t taken_bytes, check_bytes, hash_bytes_res, hash_bytes_fs;
+    /* ORDER syncs that left the epoch alone; and, with the verify switch, what changed in
+     * guest RAM inside an epoch although the rule said it could not (textures, targets,
+     * dirty targets taken). */
+    uint32_t syncs_kept, stale_tex, stale_rt, stale_taken;
     uint32_t rc_own, rc_generic;        /* combiner draws by a shader of their own / the general one */
     uint32_t wb_why[4];                 /* texture, dropped target, sync, present */
     uint64_t wb_bytes, up_bytes;
@@ -525,6 +542,36 @@ static void rt_upload_rows(GpuRt *r, uint32_t y0, uint32_t y1)
     s_st.up_bytes += (uint64_t)(y1 - y0) * rb;
 }
 
+/* RECOMP_GPU_RASTER_EPOCH_VERIFY: a look at guest RAM the epoch rule says is
+ * unchanged. Said once per kind and address. */
+static void epoch_verify_said(const char *what, uint32_t va)
+{
+    static struct { const char *what; uint32_t va; } seen[32];
+    static int n;
+    int i;
+
+    for (i = 0; i < n; i++)
+        if (seen[i].what == what && seen[i].va == va)
+            return;
+    if (n < 32) {
+        seen[n].what = what;
+        seen[n++].va = va;
+    }
+    fprintf(stderr, "[GPURAST] epoch verify: %s 0x%08X changed inside an epoch\n", what, va);
+}
+
+/* Do the target's guest rows differ from its shadow? (verify only) */
+static int rt_rows_differ(const GpuRt *r)
+{
+    const uint8_t *g = guest(r->va);
+    uint32_t rb = rt_row_bytes(r), y;
+
+    for (y = 0; y < r->H; y++)
+        if (memcmp(g + (size_t)y * r->pitch, r->shadow + (size_t)y * rb, rb) != 0)
+            return 1;
+    return 0;
+}
+
 /* First use in an epoch: upload the rows guest RAM changed. */
 static int rt_check(GpuRt *r)
 {
@@ -532,8 +579,14 @@ static int rt_check(GpuRt *r)
     uint32_t rb = rt_row_bytes(r), y, run = 0;
     int in_run = 0;
 
-    if (r->epoch_checked == s_epoch && !r->need_full)
+    if (r->epoch_checked == s_epoch && !r->need_full) {
+        if (s_epoch_verify && !s_compare && !r->dirty
+            && nv2a_backend_surface_ok(r->va, r->H * r->pitch) && rt_rows_differ(r)) {
+            s_st.stale_rt++;
+            epoch_verify_said("target", r->va);
+        }
         return 1;
+    }
     /* Dirty: the target is newer than guest RAM until it is written back
      * (sync does that before an epoch ends), so guest rows must not be
      * uploaded over it. */
@@ -548,6 +601,8 @@ static int rt_check(GpuRt *r)
         return 1;
     }
     g = guest(r->va);
+    s_st.check_n++;
+    s_st.check_bytes += (uint64_t)rb * r->H;
     for (y = 0; y < r->H; y++) {
         int differs = memcmp(g + (size_t)y * r->pitch, r->shadow + (size_t)y * rb, rb) != 0;
         if (differs && !in_run) {
@@ -630,15 +685,35 @@ static int rt_taken(GpuRt *r, int every_time)
     uint32_t rb = rt_row_bytes(r), y, x0, x1, y1;
     const uint8_t *g = guest(r->va);
 
-    if (!r->dirty || r->need_full || s_compare || (!every_time && r->taken_epoch == s_epoch))
+    int look = 0;                       /* verify: this epoch's look, again */
+
+    if (!r->dirty || r->need_full || s_compare)
         return 0;
-    r->taken_epoch = s_epoch;
+    if (!every_time && r->taken_epoch == s_epoch) {
+        if (!s_epoch_verify)
+            return 0;
+        look = 1;
+    }
     x0 = r->dx0;
     x1 = r->dx1 < r->W ? r->dx1 : r->W;
     y1 = r->dy1 < r->H ? r->dy1 : r->H;
+    if (!look)
+        r->taken_epoch = s_epoch;
     if (x0 >= x1 || r->dy0 >= y1
         || !nv2a_backend_surface_ok(r->va + r->dy0 * r->pitch, (y1 - r->dy0) * r->pitch))
         return 0;
+    if (look) {
+        for (y = r->dy0; y < y1; y++)
+            if (memcmp(g + (size_t)y * r->pitch + x0 * r->bpp,
+                       r->shadow + (size_t)y * rb + x0 * r->bpp, (x1 - x0) * r->bpp) != 0) {
+                s_st.stale_taken++;
+                epoch_verify_said("dirty target taken", r->va);
+                break;
+            }
+        return 0;
+    }
+    s_st.taken_n++;
+    s_st.taken_bytes += (uint64_t)(y1 - r->dy0) * (x1 - x0) * r->bpp;
     for (y = r->dy0; y < y1; y++)
         if (memcmp(g + (size_t)y * r->pitch + x0 * r->bpp,
                    r->shadow + (size_t)y * rb + x0 * r->bpp, (x1 - x0) * r->bpp) != 0) {
@@ -932,13 +1007,41 @@ static GpuZ *z_acquire(uint32_t va)
 
 /* ---- textures ---------------------------------------------------------- */
 
+/* Four independent chains, 8 bytes each, 32 bytes a step: one chain is
+ * bound by the latency of its multiply (about 1.5 bytes a cycle), and a
+ * texture is hashed once an epoch, thousands of times a second in a heavy
+ * scene. The chains start apart and are folded into one by a mixing step
+ * each, not xor-ed, so equal lines do not cancel. Whatever is left (< 32
+ * bytes) goes by 8 bytes and then by byte. The hash lives only in memory
+ * (the texture cache, the frame skip's stale check), never on disk. */
 static uint64_t hash_bytes(uint64_t h, const uint8_t *p, uint32_t n)
 {
-    uint32_t i;
-    for (i = 0; i + 8 <= n; i += 8) {
+    static const uint64_t K = 0x9E3779B97F4A7C15ull;
+    uint32_t i = 0;
+
+    if (n >= 32) {
+        uint64_t h0 = h, h1 = h ^ 0xC2B2AE3D27D4EB4Full, h2 = h ^ 0x165667B19E3779F9ull,
+                 h3 = h ^ 0x27D4EB2F165667C5ull;
+        for (; i + 32 <= n; i += 32) {
+            uint64_t w0, w1, w2, w3;
+            memcpy(&w0, p + i, 8);
+            memcpy(&w1, p + i + 8, 8);
+            memcpy(&w2, p + i + 16, 8);
+            memcpy(&w3, p + i + 24, 8);
+            h0 = (h0 ^ w0) * K; h0 ^= h0 >> 31;
+            h1 = (h1 ^ w1) * K; h1 ^= h1 >> 31;
+            h2 = (h2 ^ w2) * K; h2 ^= h2 >> 31;
+            h3 = (h3 ^ w3) * K; h3 ^= h3 >> 31;
+        }
+        h = h0;
+        h = (h ^ h1) * K; h ^= h >> 31;
+        h = (h ^ h2) * K; h ^= h >> 31;
+        h = (h ^ h3) * K; h ^= h >> 31;
+    }
+    for (; i + 8 <= n; i += 8) {
         uint64_t w;
         memcpy(&w, p + i, 8);
-        h = (h ^ w) * 0x9E3779B97F4A7C15ull;
+        h = (h ^ w) * K;
         h ^= h >> 31;
     }
     for (; i < n; i++)
@@ -1076,9 +1179,16 @@ static ID3D11ShaderResourceView *tex_resolve(const Nv2aTexture *d)
     }
     if (t) {
         t->last_flip = s_flip_no;
-        if (t->epoch_checked == s_epoch)
-            return t->ok ? t->srv : NULL;
         bytes = t->hi - t->lo;
+        if (t->epoch_checked == s_epoch) {
+            if (s_epoch_verify && !s_compare && t->ok
+                && nv2a_backend_surface_ok(d->offset, bytes)
+                && tex_hash(d, bytes) != t->hash) {
+                s_st.stale_tex++;
+                epoch_verify_said("texture", d->offset);
+            }
+            return t->ok ? t->srv : NULL;
+        }
         if (!nv2a_backend_surface_ok(d->offset, bytes)) {
             t->epoch_checked = s_epoch;
             t->ok = 0;
@@ -1086,6 +1196,8 @@ static ID3D11ShaderResourceView *tex_resolve(const Nv2aTexture *d)
         }
         {
             uint64_t h = tex_hash(d, bytes);
+            s_st.hash_n++;
+            s_st.hash_bytes_res += bytes;
             t->epoch_checked = s_epoch;
             if (h != t->hash || !t->ok) {
                 t->hash = h;
@@ -1115,6 +1227,8 @@ static ID3D11ShaderResourceView *tex_resolve(const Nv2aTexture *d)
         return NULL;
     }
     t->hash = tex_hash(d, bytes);
+    s_st.hash_n++;
+    s_st.hash_bytes_res += bytes;
     t->ok = tex_decode(t, d);
     return t->ok ? t->srv : NULL;
 }
@@ -2706,6 +2820,8 @@ static uint64_t fs_tex_hash(const Nv2aTexture *t, int *ok)
             && s_fs.hc[i].palette == t->palette && s_fs.hc[i].color == t->color)
             return s_fs.hc[i].h;
     h = tex_hash(t, bytes);
+    s_st.hash_n_fs++;
+    s_st.hash_bytes_fs += bytes;
     if (s_fs.nhc < FS_HCACHE) {
         FsHash *e = &s_fs.hc[s_fs.nhc++];
         e->off = t->offset; e->bytes = bytes; e->palette = t->palette; e->color = t->color;
@@ -2997,6 +3113,15 @@ static void gpu_sync(uint32_t reason)
 
     if (s_compare)
         return;
+    /* A method that orders the GPU but tells the title nothing (see
+     * method_tells_title in nv2a_pb_exec.c): the epoch goes on, and so does
+     * what it has checked against guest RAM. */
+    if (reason == NV2A_BACKEND_SYNC_ORDER && !s_sync_all && !s_epoch_every) {
+        s_st.syncs_kept++;
+        return;
+    }
+    if (reason == NV2A_BACKEND_SYNC_ORDER)
+        reason = NV2A_BACKEND_SYNC_METHOD;      /* the old rule: every method ends one */
     if (reason == NV2A_BACKEND_SYNC_READ || reason == NV2A_BACKEND_SYNC_PRESENT) {
         fs_observe();
         if (s_fs.on)
@@ -3017,8 +3142,13 @@ static void gpu_sync(uint32_t reason)
                 s_st.wb_why[2]++;
                 rt_writeback(&s_rt[i]);
             }
-    if (reason == NV2A_BACKEND_SYNC_SCAN_END || reason == NV2A_BACKEND_SYNC_METHOD)
+    if (reason == NV2A_BACKEND_SYNC_SCAN_END || reason == NV2A_BACKEND_SYNC_METHOD) {
+        if (reason == NV2A_BACKEND_SYNC_METHOD)
+            s_st.epochs_method++;
+        else
+            s_st.epochs_scan++;
         s_epoch++;
+    }
 }
 
 /* The flip's present: only the targets over the surface it reads. */
@@ -3224,13 +3354,14 @@ static void gpu_flip(void)
     if (s_compare)
         compare_flip();
     s_epoch++;
+    s_st.epochs_flip++;
     s_flip_no++;
     s_st.flips++;
     tex_evict();
     if (!s_st.last_tick)
         s_st.last_tick = now;
     if (now - s_st.last_tick >= 10000) {
-        char line[1536];
+        char line[2048];
         TextBlock tb;
         text_block_init(&tb, line, sizeof line, stderr);
         text_block_printf(&tb, "[GPURAST] %.1fs: flips %u, draws %u, writebacks %u (%.1f MB),"
@@ -3245,6 +3376,19 @@ static void gpu_flip(void)
                 s_st.decodes, s_st.bc_uploads, s_st.rt_tex, s_st.presents, s_st.stall_ms,
                 s_st.wb_why[0], s_st.wb_why[1], s_st.wb_why[2], s_st.wb_why[3],
                 s_st.taken, s_st.rc_own, s_st.rc_generic, s_rc_nmiss);
+        text_block_printf(&tb, "[GPURAST] epochs %u (methods %u, scan ends %u, flips %u);"
+                        " compared: taken %u (%.1f MB), check %u (%.1f MB);"
+                        " hashed: textures %u (%.1f MB), frame skip %u (%.1f MB);"
+                        " order syncs kept %u; stale (verify %s): textures %u, targets %u,"
+                        " taken %u\n",
+                s_st.epochs_method + s_st.epochs_scan + s_st.epochs_flip, s_st.epochs_method,
+                s_st.epochs_scan, s_st.epochs_flip,
+                s_st.taken_n, (double)s_st.taken_bytes / 1048576.0,
+                s_st.check_n, (double)s_st.check_bytes / 1048576.0,
+                s_st.hash_n, (double)s_st.hash_bytes_res / 1048576.0,
+                s_st.hash_n_fs, (double)s_st.hash_bytes_fs / 1048576.0,
+                s_st.syncs_kept, s_epoch_verify ? "on" : "off",
+                s_st.stale_tex, s_st.stale_rt, s_st.stale_taken);
         if (s_fs.on) {
             FsStats d = s_fst, o = s_fst_said;
             text_block_printf(&tb, "[GPURAST] frame skip: shown %u, skipped %u, not ready %u"
@@ -4056,6 +4200,25 @@ static int gpu_pace(uint32_t va, uint64_t tick, int cad, int cad_next)
 }
 
 #ifdef NV2A_GPU_TEST_HOOKS
+/* tests/nv2a_gpu_backend (nv2a_gpu_epoch_test.c): texture hashes so far, the
+ * resolves' count and bytes, the frame skip's count and bytes. The counters
+ * restart at every [GPURAST] report, which a test does not reach. */
+void nv2a_gpu_test_hash_stats(uint64_t out[4])
+{
+    out[0] = s_st.hash_n; out[1] = s_st.hash_bytes_res;
+    out[2] = s_st.hash_n_fs; out[3] = s_st.hash_bytes_fs;
+}
+
+/* tests/nv2a_gpu_backend (nv2a_gpu_epoch_test.c): the epochs by what ended
+ * them (methods, scan ends, flips), the texture hashes, the dirty-target
+ * comparisons, and the verify switch's finds (textures, targets, taken). */
+void nv2a_gpu_test_epoch_stats(uint32_t out[8])
+{
+    out[0] = s_st.epochs_method; out[1] = s_st.epochs_scan; out[2] = s_st.epochs_flip;
+    out[3] = s_st.hash_n; out[4] = s_st.taken_n;
+    out[5] = s_st.stale_tex; out[6] = s_st.stale_rt; out[7] = s_st.stale_taken;
+}
+
 /* tests/nv2a_gpu_backend: every target's size at the internal scale (the
  * profile's whole-buffer clears and resolves cover it). */
 void nv2a_gpu_test_target_dims(uint32_t *w, uint32_t *h)
@@ -4520,7 +4683,17 @@ int nv2a_gpu_d3d11_install(void)
         const char *rt = getenv("RECOMP_GPU_RASTER_RTTEX");
         const char *sy = getenv("RECOMP_GPU_RASTER_SYNC");
         s_rt_tex = !(rt && strcmp(rt, "0") == 0);
+        const char *ep = getenv("RECOMP_GPU_RASTER_EPOCH");
+        const char *ev = getenv("RECOMP_GPU_RASTER_EPOCH_VERIFY");
         s_sync_all = sy && strcmp(sy, "all") == 0;
+        s_epoch_every = ep && strcmp(ep, "method") == 0;
+        s_epoch_verify = ev && *ev && strcmp(ev, "0") != 0;
+        if (s_epoch_every)
+            fprintf(stderr, "[GPURAST] epochs: every executor method ends one"
+                            " (RECOMP_GPU_RASTER_EPOCH=method)\n");
+        if (s_epoch_verify)
+            fprintf(stderr, "[GPURAST] epochs: verifying the rule against guest RAM"
+                            " (RECOMP_GPU_RASTER_EPOCH_VERIFY)\n");
         s_present_on = !(getenv("RECOMP_GPU_RASTER_PRESENT")
                          && strcmp(getenv("RECOMP_GPU_RASTER_PRESENT"), "0") == 0);
     }

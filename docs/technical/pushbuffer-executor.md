@@ -276,7 +276,12 @@ let a back end draw somewhere other than guest RAM:
   executor's own surface dumps (`NV2A_BACKEND_SYNC_READ`).
   `nv2a_backend_surface_ok` says whether a range may be written. A back end
   may treat the method and scan-end reasons as ordering points only and write
-  back lazily, as the toolkit's does.
+  back lazily, as the toolkit's does. The method calls come in two reasons:
+  `NV2A_BACKEND_SYNC_METHOD` for a method that tells the title how far the GPU
+  has got (the fence semaphore, NOP 5, reports, flips and notifies, the
+  kickoff marker and other classes), `NV2A_BACKEND_SYNC_ORDER` for one that
+  only orders it (NOP with another value, WAIT_FOR_IDLE, surface state,
+  clears). The number of calls is the same either way.
 - `sync_surface(va, bytes)`: at `FLIP_STALL`, just before the presenter reads
   guest RAM, the surface it presents. Without it the executor calls
   `sync(NV2A_BACKEND_SYNC_PRESENT)`.
@@ -385,6 +390,54 @@ Two more steps took the readback out of the frame altogether:
   averages the whole block, and MSAA is resolved first.
   `tests/nv2a_gpu_backend` runs a second time at 3x3 + 4x MSAA and a third at 2x
   with 3x3 SSAA; each also reads a linear target and a swizzled one as swizzled textures.
+- **Epochs.** The back end looks at guest RAM again for what it has cached
+  (a texture's hash, a target's rows against its shadow, a dirty target against
+  the CPU taking its bytes: `tex_resolve`, `rt_check`, `rt_taken`) once an
+  *epoch*, and an epoch ends where the title can learn how far the GPU has
+  got: a scan's end, `NV2A_BACKEND_SYNC_METHOD`, a flip. The title learns it
+  only through what the executor publishes: the fence semaphore (`0x1D70`,
+  what BlockOnFence polls), NOP 5, the reports, flips and notifies, `DMA_GET`.
+  The executor handles only what has been kicked, and every kick of XDK D3D
+  ends with the marker (`0x0310` on subchannel 5) and the semaphore, every scan
+  with `SCAN_END`; so commands of two kicks never share an epoch, while inside
+  one kick every CPU write made before the kick is seen by all its draws (a
+  write after it into what it reads is a race on hardware too). The older rule
+  ended an epoch at every method that drains the executor's pipeline (NOP,
+  WAIT_FOR_IDLE, each surface change, each clear): ~240 epochs a flip at the
+  bar, against ~19 now, and `rt_taken` compared 11.6 MB a flip against 10.4.
+  A texture's hash count hardly changed (68 a flip): a texture is new in most
+  epochs either way. On the route to the trader on a Deck imitation executor
+  work went 2.53 -> 2.25 ms a flip, and in the whole Tutorial played by hand 5.87
+  -> 5.76 ms a flip (the busiest 10 s window 7.20 -> 7.00), with the stale
+  counters below at 0 all the way.
+  - `RECOMP_GPU_RASTER_EPOCH=method` puts the old rule back (an ordering
+    method ends an epoch).
+  - `RECOMP_GPU_RASTER_EPOCH_VERIFY=1` checks the rule against guest RAM and
+    changes nothing: where an epoch's earlier look is trusted (a texture hash,
+    a clean target's rows, a dirty target's rectangle) it looks again and
+    counts a difference, `stale textures / targets / taken`, in the
+    `[GPURAST] epochs` line (and says it once for each address,
+    `[GPURAST] epoch verify: ... changed inside an epoch`). Non-zero is a
+    title that rewrites a resource the GPU has not finished with, or a missing
+    boundary; run `EPOCH=method` beside it to tell.
+  - `RECOMP_GPU_RASTER_SYNC=all` still writes a dirty target back at an
+    ordering method.
+  The rule and the VSH cut-off of 64 are verified on Fallout: BoS only (the bar,
+  the route to the trader, the whole Tutorial: stale 0 in all). For a new title
+  run it once with `RECOMP_GPU_RASTER_EPOCH_VERIFY=1` before trusting it, and
+  set `RECOMP_GPU_RASTER_EPOCH=method` if it counts anything.
+- **Executor cost report.** Every 10 s, `[GPU] executor: <ms> ms work a flip
+  (<%> of the time), flip wait <ms> a flip, at <s> s (<n> flips); vertex runs
+  on the executor X of Y; batches by vertices run (batches/runs): <=32 ... >512;
+  backend syncs a flip: N (would end the epoch: semaphore, NOP 5, other class,
+  reports, flip/notify; order only: M; NOP params 0/5/other), scan ends a flip
+  K (without a semaphore or marker: Z)`. The work is the time in scans (QPC)
+  minus the flip's own wait, so it compares across frame limits and machines;
+  `at` is seconds since the process started, to line a window up with a log's
+  other marks. The line after `[GPURAST]`, `[GPURAST] epochs N (methods, scan
+  ends, flips); compared: taken ... check ... ; hashed: textures ... frame skip
+  ...; order syncs kept N; stale (verify on|off): textures, targets, taken`,
+  counts per 10 s window. `[GPU] ... fps` is unchanged.
 - **GPU profile.** `RECOMP_GPU_PROF=<secs>[,stats][,flatps]` (`nv2a_gpu_prof.c`,
   off by default: then each hook is one test of a flag and no query is made)
   prints every `<secs>` where the GPU's time per frame goes. The back end marks
@@ -577,10 +630,37 @@ result, the runs go in chunks to the executor and its helpers, then the
 repeats are copied. Each helper takes the executor's MXCSR, so the results
 are the same bit for bit (`tests/nv2a_vsh_threads`, flush-to-zero included).
 A program that writes constants (CXT_WRITE_EN) still runs its vertices one by
-one, in order, and a batch with 256 or fewer to run stays on the executor.
-Same point by the bar, no frame limit: 66 fps on one thread, 130 on eight;
-about three quarters of the vertices ran threaded, none in programs that write
-constants.
+one, in order, and a batch with `RECOMP_VSH_MIN_PARALLEL` (default 64) or fewer
+to run stays on the executor. Same point by the bar, no frame limit: 66 fps on
+one thread, 130 on eight; about three quarters of the vertices ran threaded,
+none in programs that write constants.
+
+The first cut-off was 256, and on a four-core machine with SMT (the Steam Deck)
+the executor's own thread, not the GPU, held a heavy scene below 60 fps: the
+profile put a quarter of the vertex runs, the batches of 256 or fewer, on it.
+Three changes, each bit for bit (`tests/nv2a_vsh_threads`, t1-t9, the vertices
+the back end gets compared with one thread and with eight):
+- the cut-off is `RECOMP_VSH_MIN_PARALLEL`, read once (default 64, chosen by
+  measurement: 256/128/64/32 on the bar with four threads and the affinity of a
+  4C/8T machine, 8.5-9.0 / 7.8 / 7.5-7.8 / 7.3-7.7 ms of executor work a flip),
+  and the chunk a thread takes is adaptive, `ceil(unique / (4 x threads))`
+  clamped to 8..32, so a small batch is still shared out;
+- what the back end gets for a vertex (`xf_to_backend`: the 32-byte vertex and
+  the 128-byte extra block, the texture scale, the colour packing, fog) is made
+  once for each unique vertex right after its program, on the thread that ran
+  it (`s_xbv`/`s_xbe`), and a triangle copies it instead of converting each
+  corner; copies made by clipping, the polygon offset or points are converted
+  as before;
+- the 360-byte triangle record is cleared only on the software rasteriser's
+  path (on the GPU path ~35 thousand clears a frame in a heavy scene).
+Executor work a flip (`[GPU] executor:`, below) on the bar at the same
+scale, executor on four threads with the 4C/8T affinity: 9.4 / 9.55 ms before,
+7.0 / 7.3 after the three; on the full PC (8 threads) 9.2 -> 5.4 ms. On the
+route from the Carbon spawn to the trader, with four threads: 2.75 -> 2.42 ms
+a flip, the busiest window 7.3 -> 5.8 ms. These are a PC imitating the Deck.
+On a Steam Deck (Proton, the whole Tutorial of Fallout: BoS): executor work
+9.0 ms a flip (p90 12.4, the busiest window 13.6) against ~15.8 before, 10 s
+windows below 58 fps 25 of 55 -> 1 of 55; the helpers 34-36 % busy each.
 
 **Compare and far-reaching triangles.** The executor clips at the near plane
 at w = 1e-3 and hands over screen positions, so a triangle that crosses the
@@ -603,6 +683,9 @@ frames Carbon compares at 0.00–0.02%.
 | `RECOMP_PB_WALK=dma` | walk the pushbuffer like the DMA engine (JUMPs, wraps, GET per command, the `0x0310` latch) instead of scanning each submitted segment; see [The DMA Walk Is Opt-In](#the-dma-walk-is-opt-in); when the title registered the fence event (`xbox_Nv2aFenceWakeEvent`), kickoffs are answered by a thread of their own and the fence event is set only by `NO_OPERATION 5` (plus the 2 s heartbeat while `DMA_PUT` stands) |
 | `RECOMP_PB_EXEC_VERBOSE` | per-batch trace |
 | `RECOMP_VSH_THREADS=<n>` | threads that run a batch's vertex programs, the executor included (default half the logical processors, at most 16); `1` runs every vertex on the executor thread |
+| `RECOMP_VSH_MIN_PARALLEL=<n>` | a batch with more than `n` unique vertices to run is shared out over the threads, a smaller one stays on the executor (default 64; `256` is the old cut-off) |
+| `RECOMP_GPU_RASTER_EPOCH=method` | the D3D11 back end ends an epoch at every executor method that drains the pipeline, as before the epoch rule (see "Epochs"); unset: only where the title can see the GPU's progress |
+| `RECOMP_GPU_RASTER_EPOCH_VERIFY=1` | diagnostics: the back end looks again at guest RAM it trusts within an epoch and counts a texture, a clean target or a dirty target that changed (`stale textures / targets / taken` in `[GPURAST] epochs`); it changes nothing. Unset: off |
 | `RECOMP_FFP_TRACE` | composite matrix and sample vertices of the first fixed-function batches |
 | `RECOMP_GPU_RASTER` | rasterise on the GPU through the D3D11 back end (`src/d3d/nv2a_gpu_d3d11.c`), once the game project calls `nv2a_gpu_d3d11_install()`: `1` a hardware adapter (WARP if none), `warp` the WARP adapter, `compare` the software path draws and the GPU draws alongside, printing per flip how far they differ and how many far-reaching triangles the frame had (`<RECOMP_FB_DUMP>gpu_/sw_<flip>_<surface>.bmp` for the first frames that differ by more than 1%). Unset or `0`: off |
 | `RECOMP_GPU_RASTER_SYNC=all` | the D3D11 back end writes its surfaces back at every executor sync, not only when they are read (for a title whose CPU reads what the GPU drew) |

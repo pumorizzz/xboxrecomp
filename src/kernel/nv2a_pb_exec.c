@@ -340,6 +340,18 @@ static struct {
     /* Vertices run (not reused), of them on several threads, and vertices of
      * batches whose program writes constants (run one by one, in order). */
     uint32_t verts_run, verts_threaded, verts_cxt;
+    /* What the executor thread itself costs (the `[GPU] executor:` line):
+     * QPC ticks of a scan (work_qpc, the flip's wait in it counted again in
+     * wait_qpc), the vertices it ran itself, batches by the vertices they
+     * ran (<=32 <=64 <=128 <=256 <=512 >512) and why the back end was synced:
+     * by the old list (bsync_all), by what would tell the title how far the
+     * GPU has got (bsync_tell: semaphore, NOP 5, other class, reports,
+     * flip/notify) and by what only orders it (bsync_order). */
+    uint64_t work_qpc, wait_qpc;
+    uint32_t verts_exec;
+    uint32_t nu_batches[6], nu_runs[6];
+    uint32_t bsync_all, bsync_tell[5], bsync_order, scan_ends, nop_param[3];
+    uint32_t scan_notell;               /* scan ends after no semaphore and no marker */
     /* Where program-path triangles go, so "nothing drew" has a reason. */
     uint32_t xf_degenerate, xf_offscreen, xf_drawn;
     uint64_t xf_depth_fail, xf_pixels;
@@ -2107,16 +2119,16 @@ static Nv2aVertex *backend_slot(void)
 
 static float fog_factor(float d);
 
-static void backend_from_xf(const Nv2aVshOutput *v, Nv2aVertex *o)
+/* A transformed vertex as the back end gets it. A pure function of the
+ * vertex, the stage 0 texture's size (su, sv: 1 for a texture with texel
+ * coordinates) and the fog state, which a batch leaves alone -- so the
+ * vertex threads can run it right after the vertex program, once for each
+ * different vertex rather than once for each triangle corner (see s_xbv). */
+static void xf_to_backend(const Nv2aVshOutput *v, float su, float sv,
+                          Nv2aVertex *o, Nv2aVertexEx *e)
 {
-    Nv2aVertexEx *e = &s_bverts_ex[o - s_bverts];
-    float su = 1.0f, sv = 1.0f;
     int st, j;
 
-    if (tex_size_from_format(RS.texs[0].color)) {
-        su = (float)RS.texs[0].width;
-        sv = (float)RS.texs[0].height;
-    }
     o->x = v->pos[0];
     o->y = v->pos[1];
     o->z = v->pos[2];
@@ -2138,6 +2150,24 @@ static void backend_from_xf(const Nv2aVshOutput *v, Nv2aVertex *o)
     for (st = 0; st < 4; st++)
         for (j = 0; j < 4; j++)
             e->tex[st][j] = v->tex[st][j];
+}
+
+/* Stage 0's size for xf_to_backend. */
+static void backend_tex_scale(float *su, float *sv)
+{
+    *su = *sv = 1.0f;
+    if (tex_size_from_format(RS.texs[0].color)) {
+        *su = (float)RS.texs[0].width;
+        *sv = (float)RS.texs[0].height;
+    }
+}
+
+static void backend_from_xf(const Nv2aVshOutput *v, Nv2aVertex *o)
+{
+    float su, sv;
+
+    backend_tex_scale(&su, &sv);
+    xf_to_backend(v, su, sv, o, &s_bverts_ex[o - s_bverts]);
 }
 
 /* A back end's view of texture stage `st`. */
@@ -2829,6 +2859,63 @@ static int pipe_method_syncs(uint32_t subch, uint32_t method)
         || (method >= 0x1D6C && method <= 0x1D9C);  /* semaphore, clears */
 }
 
+/* The one classification of the methods pipe_method_syncs() lets through:
+ * the classes that tell the title how far the GPU has got (0 semaphore,
+ * 1 NOP 5, 2 other class/kickoff marker, 3 reports, 4 flip/notify/context),
+ * or BSYNC_ORDER for those that only order it (NOP with another value,
+ * WAIT_FOR_IDLE, surfaces, clears, anything else in subchannel 0).
+ * method_tells_title() is derived from it, so the `[GPU] executor:` line and
+ * the epoch rule cannot disagree. */
+#define BSYNC_ORDER 5
+static int bsync_class(uint32_t subch, uint32_t method, uint32_t param)
+{
+    if (subch != 0)
+        return 2;
+    if (method == 0x0100)
+        return param == 5 ? 1 : BSYNC_ORDER;
+    if (method == 0x0110 || (method >= 0x0200 && method <= 0x021C)
+        || (method >= 0x1D74 && method <= 0x1D9C))
+        return BSYNC_ORDER;
+    if (method >= 0x1D6C && method <= 0x1D70)
+        return 0;
+    if (method >= 0x17C8 && method <= 0x17D0)
+        return 3;
+    if (method >= 0x0104 && method <= 0x01A8)
+        return 4;
+    return BSYNC_ORDER;
+}
+
+/* Does this method, once the executor has reached it, let the title learn how
+ * far the GPU has got -- and so free, rewrite or reuse what the back end has
+ * cached from guest RAM (textures, render targets)?
+ *
+ * The title learns it only through what the executor publishes: the fence
+ * semaphore (0x1D70, what BlockOnFence polls), NOP 5 (the interrupt that wakes
+ * it), the reports, the flips and notifies, and DMA_GET. DMA_GET is published
+ * at every command, but the executor only processes what has been kicked, and
+ * every kick of XDK D3D ends with the marker (0x0310 on subchannel 5) and the
+ * semaphore, and every scan with sync(SCAN_END). So two commands of different
+ * kicks never share an epoch, while inside one kick every CPU write made
+ * before the kick is seen by all its draws; a write after the kick into what
+ * the same kick reads is a race on hardware too. That is what the list below
+ * keeps: the methods the title can observe. The list pipe_method_syncs() used
+ * to hand the back end was made for draining the rasteriser's workers (NOP,
+ * WAIT_FOR_IDLE, every surface change, every clear) and ended the epoch
+ * ~100 times a frame for nothing the title could see.
+ *
+ * The clear and surface handlers (0x0200-0x021C, 0x1D74-0x1D9C) set state or
+ * clear a render target through the back end, which keeps its copy; none
+ * writes guest RAM the title reads. RECOMP_GPU_RASTER_EPOCH=method in the
+ * back end puts the old rule back, RECOMP_GPU_RASTER_EPOCH_VERIFY=1 checks
+ * this one against guest RAM. */
+static int method_tells_title(uint32_t subch, uint32_t method, uint32_t param)
+{
+    /* The marker and other classes, NOP 5, notify/flips/context DMAs, reports
+     * and the semaphore tell; WAIT_FOR_IDLE, surfaces, clears and the rest of
+     * subchannel 0 only order (see bsync_class). */
+    return bsync_class(subch, method, param) != BSYNC_ORDER;
+}
+
 static void xf_queue_flush(void)
 {
     RasterJob *J = &s_pipe.job[s_pipe.head % NV_PIPE_JOBS];
@@ -2886,11 +2973,39 @@ static void xf_queue_push(const XfTri *T)
  * commands are consumed. */
 void nv2a_pb_exec_sync(void)
 {
+    {
+        /* A scan that ended with neither a semaphore nor a kick marker since the
+         * last one: the epoch rule needs every kick to end in one of them. */
+        static uint32_t last_tell;
+        uint32_t tell = s_gpu.bsync_tell[0] + s_gpu.bsync_tell[2];
+        if (tell == last_tell)
+            s_gpu.scan_notell++;
+        last_tell = tell;
+    }
+    s_gpu.scan_ends++;
     xf_queue_flush();
     pipe_drain();
     if (s_backend && s_backend->sync)
         s_backend->sync(NV2A_BACKEND_SYNC_SCAN_END);
 }
+
+/* What the back end gets for each vertex a batch runs (xf_to_backend), made
+ * right after its vertex program, on the thread that ran it: s_xbv/s_xbe at
+ * the position of the first use of a vertex, as s_xf. s_xb_on while a batch
+ * for a back end is being shared out; s_xb_n entries are good. The triangles
+ * then copy 160 bytes a corner instead of converting it. */
+static Nv2aVshOutput *s_xf;     /* about 7 MB, so allocated by the first batch that
+                                 * transforms rather than carried in every build that
+                                 * never turns the executor on */
+static uint32_t *s_xsrc;        /* for each position, whose result it takes */
+static Nv2aVertex *s_xbv;
+static Nv2aVertexEx *s_xbe;
+static int s_xb_on;
+static uint32_t s_xb_n;
+static float s_xb_su, s_xb_sv;
+static uint32_t s_xb_hits;            /* corners taken from the cache, for tests */
+
+uint32_t nv2a_pb_exec_xb_hits(void) { return s_xb_hits; }
 
 /* Set while raster_xf_triangle draws a triangle it has already moved by the
  * polygon offset, so the copy is not offset again. */
@@ -2904,19 +3019,12 @@ static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
     const Nv2aVshOutput *v[3];
     const float *a, *b, *c;
     float area, su = 1.0f, sv = 1.0f;
-    int k;
+    int k, bpp;
 
-    memset(&T, 0, sizeof T);
-    T.mem = (uint8_t *)xbox_GetMemoryOffset();
-    T.bpp = surface_bpp();
-    T.textured = RS.texs[0].valid && !s_xf_no_tex;
-    T.use_rc = rc_enabled();
-    T.va = va; T.vb = vb; T.vc = vc;
-
+    bpp = surface_bpp();
     v[0] = va; v[1] = vb; v[2] = vc;
     a = va->pos; b = vb->pos; c = vc->pos;
-    T.a = a; T.b = b; T.c = c;
-    if (T.bpp != 4 && T.bpp != 2)
+    if (bpp != 4 && bpp != 2)
         return;
     if (a[3] <= 0.0f || b[3] <= 0.0f || c[3] <= 0.0f) {
         s_gpu.tris_behind++;
@@ -2955,14 +3063,39 @@ static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
     if (backend_draws()) {                     /* a back end rasterises */
         Nv2aVertex *o = backend_slot();
         if (o) {
-            backend_from_xf(va, &o[0]);
-            backend_from_xf(vb, &o[1]);
-            backend_from_xf(vc, &o[2]);
+            int j;
+            for (j = 0; j < 3; j++) {
+                /* A corner that is one of the batch's own vertices (not a copy
+                 * made by near-plane clipping or the polygon offset) was
+                 * converted already, by the thread that ran it. */
+                uintptr_t d = (uintptr_t)v[j] - (uintptr_t)s_xf;
+                uint32_t i = (uint32_t)(d / sizeof *s_xf);
+
+                if (s_xb_on && s_xf && (uintptr_t)v[j] >= (uintptr_t)s_xf
+                    && d % sizeof *s_xf == 0 && i < s_xb_n) {
+                    uint32_t src = s_xsrc[i];
+                    o[j] = s_xbv[src];
+                    s_bverts_ex[&o[j] - s_bverts] = s_xbe[src];
+                    s_xb_hits++;
+                } else {
+                    backend_from_xf(v[j], &o[j]);
+                }
+            }
             s_bcount += 3;
         }
         if (!backend_shadow())
             return;
     }
+    /* The triangle record (360 bytes) only for the software rasteriser: on the
+     * GPU path every triangle returns above, and clearing it first cost ~35
+     * thousand memsets a frame in a heavy scene. */
+    memset(&T, 0, sizeof T);
+    T.mem = (uint8_t *)xbox_GetMemoryOffset();
+    T.bpp = bpp;
+    T.textured = RS.texs[0].valid && !s_xf_no_tex;
+    T.use_rc = rc_enabled();
+    T.va = va; T.vb = vb; T.vc = vc;
+    T.a = a; T.b = b; T.c = c;
     for (k = 0; k < 3; k++) {
         if (!s_gpu.xf_seeded)
             s_gpu.xf_min[k] = s_gpu.xf_max[k] = a[k];
@@ -3149,10 +3282,6 @@ static void raster_xf_clipped(const Nv2aVshOutput *a, const Nv2aVshOutput *b,
         raster_xf_triangle(&buf[cur][0], &buf[cur][i], &buf[cur][i + 1]);
 }
 
-/* About 7 MB, so allocated by the first batch that transforms rather than
- * carried in every build that never turns the executor on. */
-static Nv2aVshOutput *s_xf;
-
 /* Does this batch run the title's vertex program? RECOMP_NO_VSH turns the
  * interpreter off (the batch then falls to the screen-space heuristics). */
 static int batch_uses_program(void)
@@ -3216,15 +3345,28 @@ static int transform_vertex(uint32_t index, Nv2aVshOutput *out)
  *
  * RECOMP_VSH_THREADS=<n> threads in all, the executor included (default half
  * the logical processors, at most 16); 1 runs every vertex on the executor
- * as before. A batch with fewer than NV_VSH_MIN_PARALLEL vertices to run is
- * not worth the hand-over. */
+ * as before. A batch with up to RECOMP_VSH_MIN_PARALLEL (default 64) vertices
+ * to run stays on the executor: the hand-over costs a wake-up and a wait for
+ * the helpers to leave. It was 256; Fallout's heavy scenes run thousands of
+ * smaller batches a frame (about 4.7 thousand runs, ~4 ms on a Steam Deck's
+ * executor), and measured by Ruby's bar with 4 threads on 8 logical
+ * processors (the Deck's shape) 64 took the executor's work from 8.5-9.0 to
+ * 7.5-7.8 ms a flip, 128 to 7.8, 32 to 7.3-7.7 (within the run-to-run noise
+ * of 64). A chunk is about a quarter of a thread's share (8 to 32 entries),
+ * so a small batch is spread over all the threads too. */
 #define NV_VSH_MAX_THREADS 16
-#define NV_VSH_CHUNK 32
-#define NV_VSH_MIN_PARALLEL 256
+#define NV_VSH_MIN_PARALLEL_DEFAULT 64
 
 static int s_vsh_threads = -1;
+static int s_vsh_min_par = -1;
 static uint32_t *s_xu;          /* positions in the batch whose vertex runs */
-static uint32_t *s_xsrc;        /* for each position, whose result it takes */
+
+/* The back end's form of the vertex just run at position p (see s_xbv). */
+static void xb_convert(uint32_t p)
+{
+    if (s_xb_on)
+        xf_to_backend(&s_xf[p], s_xb_su, s_xb_sv, &s_xbv[p], &s_xbe[p]);
+}
 
 static int vsh_threads(void)
 {
@@ -3243,6 +3385,26 @@ static int vsh_threads(void)
     return s_vsh_threads;
 }
 
+/* RECOMP_VSH_MIN_PARALLEL=<n>: a batch with more than n vertices to run is
+ * shared out (read once). */
+static int vsh_min_parallel(void)
+{
+    if (s_vsh_min_par < 0) {
+        const char *e = getenv("RECOMP_VSH_MIN_PARALLEL");
+        int n = NV_VSH_MIN_PARALLEL_DEFAULT;
+        if (e)
+            n = atoi(e);
+        s_vsh_min_par = n < 0 ? 0 : n;
+    }
+    return s_vsh_min_par;
+}
+
+/* For tests: the threshold, as RECOMP_VSH_MIN_PARALLEL (-1: read it again). */
+void nv2a_pb_exec_set_vsh_min_parallel(int n)
+{
+    s_vsh_min_par = n < 0 ? -1 : n;
+}
+
 /* For tests and game projects: the thread count, as RECOMP_VSH_THREADS. */
 void nv2a_pb_exec_set_vsh_threads(int n)
 {
@@ -3251,6 +3413,17 @@ void nv2a_pb_exec_set_vsh_threads(int n)
 
 /* For tests: how many vertices have run on several threads. */
 uint32_t nv2a_pb_exec_vsh_threaded(void) { return s_gpu.verts_threaded; }
+
+/* For tests: batches and vertices run by size, out[0..5] batches and
+ * out[6..11] vertices of <=32 <=64 <=128 <=256 <=512 >512 unique vertices. */
+void nv2a_pb_exec_vsh_buckets(uint32_t out[12])
+{
+    int i;
+    for (i = 0; i < 6; i++) {
+        out[i] = s_gpu.nu_batches[i];
+        out[6 + i] = s_gpu.nu_runs[i];
+    }
+}
 
 #if defined(_WIN32) && (defined(_M_X64) || defined(_M_IX86) || defined(__x86_64__) || defined(__i386__))
 #include <xmmintrin.h>
@@ -3263,21 +3436,28 @@ static struct {
     volatile LONG active;       /* helpers inside the job */
     volatile LONG failed;       /* a vertex could not be run */
     uint32_t count;             /* entries of s_xu */
+    uint32_t chunk;             /* entries a thread takes at a time (set with the job) */
     unsigned int csr;           /* the executor's MXCSR */
 } s_vp;
 
-static void vp_run(void)
+/* on_exec: the executor is the caller (it alone counts the vertices it runs). */
+static void vp_run(int on_exec)
 {
     LONG c;
+    LONG chunk = (LONG)s_vp.chunk;
 
-    while ((c = InterlockedExchangeAdd(&s_vp.next, NV_VSH_CHUNK)) < (LONG)s_vp.count) {
-        uint32_t k, e = (uint32_t)c + NV_VSH_CHUNK;
+    while ((c = InterlockedExchangeAdd(&s_vp.next, chunk)) < (LONG)s_vp.count) {
+        uint32_t k, e = (uint32_t)c + (uint32_t)chunk;
         if (e > s_vp.count)
             e = s_vp.count;
+        if (on_exec)
+            s_gpu.verts_exec += e - (uint32_t)c;
         for (k = (uint32_t)c; k < e; k++) {
             uint32_t p = s_xu[k];
             if (!transform_vertex(s_gpu.idx[p], &s_xf[p]))
                 s_vp.failed = 1;
+            else
+                xb_convert(p);
         }
     }
 }
@@ -3301,7 +3481,7 @@ static DWORD WINAPI vsh_worker(LPVOID arg)
         if (s_vp.gen == g) {
             if (_mm_getcsr() != s_vp.csr)
                 _mm_setcsr(s_vp.csr);
-            vp_run();
+            vp_run(0);
         }
         InterlockedDecrement(&s_vp.active);
         last = g;
@@ -3328,9 +3508,16 @@ static int transform_batch(uint32_t nu)
      * whether there is one to run at all is answered once. */
     if (!transform_vertex(s_gpu.idx[s_xu[0]], &s_xf[s_xu[0]]))
         return 0;
+    xb_convert(s_xu[0]);
     s_gpu.verts_run += nu;
+    {
+        int b = nu <= 32 ? 0 : nu <= 64 ? 1 : nu <= 128 ? 2 : nu <= 256 ? 3 : nu <= 512 ? 4 : 5;
+        s_gpu.nu_batches[b]++;
+        s_gpu.nu_runs[b] += nu;
+    }
+    s_gpu.verts_exec++;                                 /* the first, above */
 #if defined(NV_VSH_POOL)
-    if (nu > NV_VSH_MIN_PARALLEL) {
+    if (nu > (uint32_t)vsh_min_parallel()) {
         while (s_vp.started < vsh_threads() - 1) {
             HANDLE h = CreateThread(NULL, 0, vsh_worker, NULL, 0, NULL);
             if (!h)
@@ -3339,24 +3526,31 @@ static int transform_batch(uint32_t nu)
             s_vp.started++;
         }
     }
-    if (nu > NV_VSH_MIN_PARALLEL && s_vp.started) {
+    if (nu > (uint32_t)vsh_min_parallel() && s_vp.started) {
+        uint32_t ch = (nu + 4u * (uint32_t)vsh_threads() - 1u) / (4u * (uint32_t)vsh_threads());
         InterlockedIncrement(&s_vp.gen);                /* odd: setting up */
         vp_quiet();
         s_vp.count = nu;
+        /* About four chunks a thread, so a small batch is shared too: a fixed
+         * 32 would give a 64-vertex batch to two threads. */
+        s_vp.chunk = ch < 8 ? 8 : ch > 32 ? 32 : ch;
         s_vp.next = 1;                                  /* s_xu[0] is done */
         s_vp.failed = 0;
         s_vp.csr = _mm_getcsr();
         InterlockedIncrement(&s_vp.gen);                /* even: open */
         WakeByAddressAll((PVOID)&s_vp.gen);
-        vp_run();
+        vp_run(1);
         vp_quiet();
         s_gpu.verts_threaded += nu;
         return !s_vp.failed;
     }
 #endif
-    for (k = 1; k < nu; k++)
+    s_gpu.verts_exec += nu - 1;
+    for (k = 1; k < nu; k++) {
         if (!transform_vertex(s_gpu.idx[s_xu[k]], &s_xf[s_xu[k]]))
             return 0;
+        xb_convert(s_xu[k]);
+    }
     return 1;
 }
 
@@ -3487,8 +3681,17 @@ static void raster_batch_program(void)
                 vc[slot].pos = i;
                 vc[slot].gen = gen;
             }
-            if (!transform_batch(nu))
+            /* The back end's form of each vertex made along the way. */
+            if (backend_draws() && (s_xbv || (s_xbv = (Nv2aVertex *)calloc(NV_MAX_INDICES, sizeof *s_xbv)))
+                && (s_xbe || (s_xbe = (Nv2aVertexEx *)calloc(NV_MAX_INDICES, sizeof *s_xbe)))) {
+                backend_tex_scale(&s_xb_su, &s_xb_sv);
+                s_xb_n = n;
+                s_xb_on = 1;
+            }
+            if (!transform_batch(nu)) {
+                s_xb_on = 0;
                 return;                                /* no program loaded */
+            }
             for (i = 0; i < n; i++)
                 if (s_xsrc[i] != i)
                     s_xf[i] = s_xf[s_xsrc[i]];
@@ -3504,6 +3707,7 @@ static void raster_batch_program(void)
             if (!transform_vertex(ix, &s_xf[i]))
                 return;                                /* no program loaded */
             s_gpu.verts_run++;
+            s_gpu.verts_exec++;
             vc[slot].idx = ix;
             vc[slot].pos = i;
             vc[slot].gen = gen;
@@ -3651,6 +3855,7 @@ transformed:
     xf_queue_flush();
     if (backend_draws())
         backend_flush(!s_xf_no_tex, NV2A_BATCH_XF);
+    s_xb_on = 0;
 }
 
 static void raster_batch(void)
@@ -3850,6 +4055,28 @@ int nv2a_pb_exec_test_pace_hz(void) { return s_pace_hz; }
 uint32_t nv2a_pb_exec_test_shown(void) { return s_flips_shown; }
 #endif
 
+/* The executor's own cost, for the `[GPU] executor:` line: nv2a_pb_scan.c
+ * brackets each scan with the clock and adds its length; the flip's wait is
+ * counted again in wait_qpc, so work is the scan minus the wait. */
+static uint64_t s_clock_first;
+uint64_t nv2a_pb_exec_clock(void)
+{
+#if defined(_WIN32)
+    LARGE_INTEGER q;
+    QueryPerformanceCounter(&q);
+    if (!s_clock_first)
+        s_clock_first = (uint64_t)q.QuadPart;
+    return (uint64_t)q.QuadPart;
+#else
+    return 0;
+#endif
+}
+
+void nv2a_pb_exec_note_scan(uint64_t ticks)
+{
+    s_gpu.work_qpc += ticks;
+}
+
 /* The flip's wait at hz; s_flip_tick becomes the tick it lands on. */
 static uint64_t s_flip_tick;
 static void flip_wait(int hz)
@@ -3907,7 +4134,11 @@ static uint64_t flip_pace(void)
         return k;
     }
 #endif
-    flip_wait(hz);
+    {
+        uint64_t t0 = nv2a_pb_exec_clock();
+        flip_wait(hz);
+        s_gpu.wait_qpc += nv2a_pb_exec_clock() - t0;
+    }
     return s_flip_tick;
 }
 
@@ -4466,8 +4697,21 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
 
     if (s_pipe.head != s_pipe.drained && pipe_method_syncs(subch, method))
         pipe_drain();
-    if (s_backend && s_backend->sync && pipe_method_syncs(subch, method))
-        s_backend->sync(NV2A_BACKEND_SYNC_METHOD);
+    if (subch == 0 && method == 0x0100)
+        s_gpu.nop_param[param == 0 ? 0 : param == 5 ? 1 : 2]++;
+    if (pipe_method_syncs(subch, method)) {
+        /* Counted with or without a back end: the `[GPU] executor:` line's
+         * scan_notell reads these on the programmatic path too. */
+        int bc = bsync_class(subch, method, param);
+        s_gpu.bsync_all++;
+        if (bc == BSYNC_ORDER)
+            s_gpu.bsync_order++;
+        else
+            s_gpu.bsync_tell[bc]++;
+        if (s_backend && s_backend->sync)
+            s_backend->sync(method_tells_title(subch, method, param)
+                            ? NV2A_BACKEND_SYNC_METHOD : NV2A_BACKEND_SYNC_ORDER);
+    }
     /* BACK_END_WRITE_SEMAPHORE_RELEASE. The title's pointer already names the
      * semaphore word; SET_SEMAPHORE_OFFSET is not added (in X-Men Legends it
      * held 0xFF000000 at times, which put the write outside guest memory). */
@@ -5239,6 +5483,84 @@ void nv2a_pb_exec_report(void)
     text_block_printf(&tb, "[GPU] vertex transform: %u run, %u of them on %d threads;"
                     " %u in batches that write constants\n",
             s_gpu.verts_run, s_gpu.verts_threaded, vsh_threads(), s_gpu.verts_cxt);
+#if defined(_WIN32)
+    {
+        /* The executor's cost since the previous report: time in scans minus
+         * the flip's wait, per flip, and what it did. `at` is seconds since the
+         * process started, to line a window up with a log's other marks. */
+        static uint64_t l_qpc, l_work, l_wait;
+        static uint32_t l_flips, l_vexec, l_vrun, l_ball, l_order, l_scan, l_notell;
+        static uint32_t l_nb[6], l_nr[6], l_tell[5], l_nop[3];
+        LARGE_INTEGER fq, nq;
+        uint32_t fl = s_gpu.flips - l_flips;
+        uint64_t work, wait;
+        double ms_tick, span, f, at_s = 0.0;
+        int b;
+        FILETIME ct, xt, kt, ut, nt;
+
+        if (GetProcessTimes(GetCurrentProcess(), &ct, &xt, &kt, &ut)) {
+            ULARGE_INTEGER c, n;
+            GetSystemTimeAsFileTime(&nt);
+            c.LowPart = ct.dwLowDateTime; c.HighPart = ct.dwHighDateTime;
+            n.LowPart = nt.dwLowDateTime; n.HighPart = nt.dwHighDateTime;
+            at_s = (double)(n.QuadPart - c.QuadPart) / 1e7;
+        }
+        QueryPerformanceFrequency(&fq);
+        QueryPerformanceCounter(&nq);
+        ms_tick = 1000.0 / (double)fq.QuadPart;
+        wait = s_gpu.wait_qpc - l_wait;
+        work = s_gpu.work_qpc - l_work;
+        work = work > wait ? work - wait : 0;
+        span = l_qpc ? (double)((uint64_t)nq.QuadPart - l_qpc) : 0.0;
+        f = fl ? (double)fl : 1.0;
+        if (fl && s_clock_first) {
+            text_block_printf(&tb, "[GPU] executor: %.2f ms work a flip (%.1f%% of the time), flip wait %.2f ms a flip,"
+                            " at %.1f s (%u flips); vertex runs on the executor %u of %u;"
+                            " batches by vertices run (batches/runs): <=32 %u/%u, <=64 %u/%u, <=128 %u/%u,"
+                            " <=256 %u/%u, <=512 %u/%u, >512 %u/%u;"
+                            " backend syncs a flip: %.1f (would end the epoch: semaphore %.1f, NOP 5 %.1f,"
+                            " other class %.1f, reports %.1f, flip/notify %.1f; order only: %.1f;"
+                            " NOP params 0/5/other %u/%u/%u), scan ends a flip %.1f"
+                            " (without a semaphore or marker: %u)\n",
+                    work * ms_tick / f, span > 0 ? 100.0 * (double)work / span : 0.0,
+                    (s_gpu.wait_qpc - l_wait) * ms_tick / f,
+                    at_s, fl,
+                    s_gpu.verts_exec - l_vexec, s_gpu.verts_run - l_vrun,
+                    s_gpu.nu_batches[0] - l_nb[0], s_gpu.nu_runs[0] - l_nr[0],
+                    s_gpu.nu_batches[1] - l_nb[1], s_gpu.nu_runs[1] - l_nr[1],
+                    s_gpu.nu_batches[2] - l_nb[2], s_gpu.nu_runs[2] - l_nr[2],
+                    s_gpu.nu_batches[3] - l_nb[3], s_gpu.nu_runs[3] - l_nr[3],
+                    s_gpu.nu_batches[4] - l_nb[4], s_gpu.nu_runs[4] - l_nr[4],
+                    s_gpu.nu_batches[5] - l_nb[5], s_gpu.nu_runs[5] - l_nr[5],
+                    (s_gpu.bsync_all - l_ball) / f,
+                    (s_gpu.bsync_tell[0] - l_tell[0]) / f, (s_gpu.bsync_tell[1] - l_tell[1]) / f,
+                    (s_gpu.bsync_tell[2] - l_tell[2]) / f, (s_gpu.bsync_tell[3] - l_tell[3]) / f,
+                    (s_gpu.bsync_tell[4] - l_tell[4]) / f,
+                    (s_gpu.bsync_order - l_order) / f,
+                    s_gpu.nop_param[0] - l_nop[0], s_gpu.nop_param[1] - l_nop[1],
+                    s_gpu.nop_param[2] - l_nop[2], (s_gpu.scan_ends - l_scan) / f,
+                    s_gpu.scan_notell - l_notell);
+        }
+        l_qpc = (uint64_t)nq.QuadPart;
+        l_work = s_gpu.work_qpc;
+        l_wait = s_gpu.wait_qpc;
+        l_flips = s_gpu.flips;
+        l_vexec = s_gpu.verts_exec;
+        l_vrun = s_gpu.verts_run;
+        l_ball = s_gpu.bsync_all;
+        l_order = s_gpu.bsync_order;
+        l_scan = s_gpu.scan_ends;
+        l_notell = s_gpu.scan_notell;
+        for (b = 0; b < 6; b++) {
+            l_nb[b] = s_gpu.nu_batches[b];
+            l_nr[b] = s_gpu.nu_runs[b];
+        }
+        for (b = 0; b < 5; b++)
+            l_tell[b] = s_gpu.bsync_tell[b];
+        for (b = 0; b < 3; b++)
+            l_nop[b] = s_gpu.nop_param[b];
+    }
+#endif
     if (s_gpu.batches_ffp)
         text_block_printf(&tb, "[GPU] fixed-function transform: %u batches\n",
                 s_gpu.batches_ffp);

@@ -109,4 +109,5 @@ Where to look when a title does something and says nothing about why.
 | has flips on the vblank grid but frame times in pairs (4 + 29 ms) | [Answering the Title While It Runs](technical/pushbuffer-executor.md#answering-the-title-while-it-runs) |
 | runs slow or loses timed input at a frame limit below 60 (or under an outside limiter) | [Frame Skip](technical/pushbuffer-executor.md#frame-skip) |
 | draws a frame slowly on AMD / the Steam Deck, with `[GPURAST] combiner state with no shader` in the log | [Pixel shader cost](technical/pushbuffer-executor.md#render-back-ends) (a combiner state without a shader of its own) |
+| shows a texture or render target stale after the CPU rewrote it (D3D11 back end) | `RECOMP_GPU_RASTER_EPOCH_VERIFY=1` counts it (`[GPURAST] epochs`), `RECOMP_GPU_RASTER_EPOCH=method` puts the old rule back: [Epochs](technical/pushbuffer-executor.md#render-back-ends) |
 | stalls 80 ms (console) to 400 ms (output redirected) exactly every 10 s | [The Report Is One Write](technical/pushbuffer-executor.md#the-report-is-one-write) |
